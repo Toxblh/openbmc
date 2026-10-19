@@ -1,18 +1,23 @@
 #!/bin/bash
 # Builds the REIMU web devkit: the new web UI plus the BMC-side programs it
 # needs (patched bmcweb, nbd-proxy, reimu-serial, reimu-pnsd), cross-compiled for the
-# AST2500 (ARM1176JZ-S, soft float, glibc 2.32 as in REIMU's Yocto 3.2),
+# AST2500 (ARM1176JZ-S, soft float, glibc 2.33 as in REIMU 1.0.1/1.0.2),
 # packed to run from tmpfs on a BMC with the stock REIMU firmware. Nothing
 # on the BMC flash is changed: see reimu-webdev (the control script).
 #
 # Usage: build.sh [work dir]      (default: ./webdev-work)
 #   -> <work>/reimu-webdev-<version>.tar.gz
 #
+# BMC_ROOTFS=<unpacked rofs of the BMC firmware> (e.g. unsquashfs of
+# image-rofs from the release's .mtd.tar): link stubs are made from its
+# libraries and every imported symbol is checked against them. Without it
+# the stubs come from Ubuntu's libraries and only libgcc helpers are checked.
+#
 # TARGET=x86_64 STUB_LIBS=<dir with libsystemd.so.0, libudev.so.1,
 # libpam.so.0> builds the same package for the x86 test VM
 # (meta-mcst/tests/testvm), to test the devkit there.
 #
-# Needs: git, curl, python3 + pip, ninja, readelf/strip for ARM
+# Needs: git, curl, python3 + pip, ninja, pkg-config, cmake, readelf/strip for ARM
 # (binutils-arm-linux-gnueabi), dpkg-deb. No Yocto: the compiler is zig
 # (from PyPI), which links against any glibc version; libsystemd, libudev
 # and libpam are linked as stubs with the real symbol versions (the BMC's
@@ -45,12 +50,13 @@ s/systemd/libudev1_245.4-4ubuntu3_armhf.deb 557a2bbf182c52712e7f36a48998258bb440
 "
 TARGET=${TARGET:-arm}
 case "$TARGET" in
-    arm)    ZTARGET=arm-linux-gnueabi.2.32; ZFLAGS="-mcpu=arm1176jz_s -mfloat-abi=soft"  # = Yocto tune arm1176jzs (no VFP)
+    arm)    ZTARGET=arm-linux-gnueabi.2.33; ZFLAGS="-mcpu=arm1176jz_s -mfloat-abi=soft"  # = Yocto tune arm1176jzs (no VFP). Not older than 2.33: zig's stat() shim for older glibc passes the x86 _STAT_VER to __xstat, which fails with EINVAL on ARM
             SSLTARGET=linux-armv4; MCPU=arm; STRIP=arm-linux-gnueabi-strip ;;
     x86_64) ZTARGET=x86_64-linux-gnu.2.31; ZFLAGS=""; SSLTARGET=linux-x86_64; MCPU=x86_64; STRIP=strip ;;
     *) echo "TARGET: arm or x86_64" >&2; exit 1 ;;
 esac
-STUB_LIBS=${STUB_LIBS:-}
+BMC_ROOTFS=${BMC_ROOTFS:-}
+STUB_LIBS=${STUB_LIBS:-${BMC_ROOTFS:+$BMC_ROOTFS/lib}}
 
 step() { echo "== $*"; }
 gitat() # url dir rev
@@ -196,7 +202,7 @@ if [ ! -d "$S/boost_1_75_0" ]; then
 fi
 (cd "$SRC/bmcweb" &&
     "$MESON" setup build --cross-file "$W/arm-zig.cross" --buildtype=minsize -Db_lto=false -Dwerror=false \
-        -Ddefault_library=static -Dtests=disabled -Dyocto-deps=disabled \
+        -Ddefault_library=static -Db_pie=true -Dtests=disabled -Dyocto-deps=disabled \
         -Dreimu-serial-socket=enabled -Dvm-websocket=enabled -Dhttp-body-limit=64 >/dev/null &&
     ninja -C build bmcweb >/dev/null)
 
@@ -205,12 +211,17 @@ step "nbd-proxy $JSNBD_REV + REIMU patch, reimu-serial, reimu-pnsd"
 gitat https://github.com/openbmc/jsnbd.git "$SRC/jsnbd" "$JSNBD_REV"
 for p in "$MCST"/meta-common/recipes-connectivity/jsnbd/files/*.patch; do patch -s -d "$SRC/jsnbd" -p1 < "$p"; done
 mkdir -p "$W/obj"
+# All programs are built as PIE (here and bmcweb's -Db_pie=true): zig 0.13's
+# glibc link stub puts every data object (environ, stderr, optarg...) at one
+# address, so a non-PIE executable gets one copy relocation for all of them
+# and they overwrite each other (getopt() crashed in getenv()). A PIE reaches
+# libc's data through the GOT and needs no copy relocations.
 # configuration and state hook: /run/reimu-webdev/etc (set up by reimu-webdev)
 printf '#define HAVE_SPLICE 1\n#define PACKAGE "nbd-proxy"\n#define SYSCONFDIR "/run/reimu-webdev/etc"\n#define RUNSTATEDIR "/run"\n' > "$W/obj/config.h"
-$CC -O2 -Wall -I"$W/obj" -isystem "$SYS/usr/include" -isystem "$SYS/usr/include/json-c" \
+$CC -O2 -Wall -fPIE -pie -I"$W/obj" -isystem "$SYS/usr/include" -isystem "$SYS/usr/include/json-c" \
     -o "$W/obj/nbd-proxy" "$SRC/jsnbd/nbd-proxy.c" -L"$SYS/usr/lib" -ljson-c -ludev
-$CC -O2 -Wall -o "$W/obj/reimu-serial" "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c"
-$CC -O2 -Wall -isystem "$SYS/usr/include" -o "$W/obj/reimu-pnsd" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c" \
+$CC -O2 -Wall -fPIE -pie -o "$W/obj/reimu-serial" "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c"
+$CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-pnsd" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c" \
     -L"$SYS/usr/lib" -lsystemd
 
 # ---------------------------------------------------------------- package
@@ -238,11 +249,22 @@ for b in "$P"/bin/*; do
     v=$(readelf -W -V "$b" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
     printf '   %-14s %6s KiB  needs %s, %s\n' "${b##*/}" $(($(stat -c %s "$b") / 1024)) "${v:-?}" \
         "$(readelf -d "$b" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"
-    case "$v" in GLIBC_2.3[3-9]*|GLIBC_2.[4-9]*) echo "   ERROR: $b needs $v, REIMU has glibc 2.32"; exit 1 ;; esac
+    case "$v" in GLIBC_2.3[4-9]*|GLIBC_2.[4-9]*) echo "   ERROR: $b needs $v, REIMU has glibc 2.33"; exit 1 ;; esac
     if [ "$TARGET" = arm ] && readelf -A "$b" | grep -q 'Tag_FP_arch'; then
         echo "   ERROR: $b uses VFP, the REIMU tune is arm1176jzs"; exit 1
     fi
+    if readelf -W -r "$b" | grep -q '_COPY '; then
+        echo "   ERROR: $b has copy relocations (must be PIE, see above)"; exit 1
+    fi
+    # libgcc helpers must be linked in statically: no BMC library exports them
+    if readelf -W --dyn-syms "$b" | awk '$7 == "UND" && $5 == "GLOBAL"' | grep -qE ' __(aeabi|gnu)_'; then
+        echo "   ERROR: $b imports libgcc helpers (__aeabi_*/__gnu_*) from a shared library"; exit 1
+    fi
 done
+if [ -n "$BMC_ROOTFS" ]; then
+    python3 "$HERE/checkimports.py" "$BMC_ROOTFS" "$P"/bin/* || { echo "   ERROR: symbols missing on the BMC"; exit 1; }
+    echo "   imports checked against $BMC_ROOTFS"
+fi
 PKG=$W/reimu-webdev-$VERSION$([ "$TARGET" = arm ] || echo "-$TARGET").tar.gz
 tar czf "$PKG" -C "$OUT" reimu-webdev
 echo "== $PKG: $(($(stat -c %s "$PKG") / 1024)) KiB, unpacked $(du -sk "$P" | cut -f1) KiB"

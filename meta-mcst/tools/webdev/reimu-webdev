@@ -160,7 +160,7 @@ do_status()
         printf '  %-22s %s\n' $u "$(systemctl is-active $u 2>/dev/null)"
     done
     [ -s $R/stopped ] && { echo "stopped stock units:"; sed 's/^/  /' $R/stopped; }
-    echo "memory: $(du -sh "$(cat $R/dir)" | cut -f1) in $(cat $R/dir), $(free -m | awk '/^Mem/{print $7 " MiB available"}')"
+    echo "memory: $(du -sh "$(cat $R/dir)" | cut -f1) in $(cat $R/dir), $(awk '/^MemAvailable:/{print int($2 / 1024) " MiB available"}' /proc/meminfo)"
 }
 
 case "${1:-}" in

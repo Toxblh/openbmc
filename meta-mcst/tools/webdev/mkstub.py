@@ -19,6 +19,11 @@ for line in dyn.splitlines():
     if f[3] not in ("FUNC", "OBJECT", "IFUNC"):
         continue
     name = f[7]
+    # libgcc helpers some distro libraries re-export (Ubuntu armhf libsystemd
+    # exports __aeabi_uldivmod...): the binary must take them from the static
+    # compiler-rt, the BMC's libraries don't have them
+    if re.match(r"__(aeabi|gnu)_", name):
+        continue
     m = re.match(r"([^@]+)(@@?)(.*)", name)
     sym, ver = (m.group(1), m.group(3)) if m else (name, None)
     if not m or m.group(2) == "@@" or ver not in versions.get(sym, {}):
@@ -36,7 +41,10 @@ with tempfile.TemporaryDirectory() as d:
     script, prev = [], None
     for v in names:
         body = "".join(f"  {s};\n" for s in vs[v])
-        script.append(f"{v} {{\n global:\n{body}}}{' ' + prev if prev else ''};")
+        # local: everything else, i.e. the compiler-rt that zig links into
+        # every shared object (otherwise the stub "exports" __aeabi_* helpers)
+        local = "" if prev else " local: *;\n"
+        script.append(f"{v} {{\n global:\n{body}{local}}}{' ' + prev if prev else ''};")
         prev = v
     open(f"{d}/v.map", "w").write("\n".join(script) + "\n" if script else "{ global: *; };\n")
     os.makedirs(out, exist_ok=True)

@@ -9,8 +9,17 @@ back the stock firmware.
 
 ## Build (on any x86_64 Linux, no Yocto)
 
-    meta-mcst/tools/webdev/build.sh /tmp/webdev
-    # -> /tmp/webdev/reimu-webdev-<git describe>.tar.gz (~4 MiB)
+    # the rootfs of the firmware the BMC runs (here the 1.0.2 release):
+    tar xf obmc-phosphor-image-reimu-5564.static.mtd.tar image-rofs
+    unsquashfs -d /tmp/stock-rofs image-rofs
+    BMC_ROOTFS=/tmp/stock-rofs meta-mcst/tools/webdev/build.sh /tmp/webdev
+    # -> /tmp/webdev/reimu-webdev-<git describe>.tar.gz (~3.3 MiB)
+
+Needs `git curl python3 python3-venv cmake ninja-build pkg-config dpkg-dev
+binutils-arm-linux-gnueabi squashfs-tools`. `BMC_ROOTFS` is optional but
+recommended: the link stubs are then made from the BMC's own libraries and
+every symbol the binaries import is checked against them
+(`checkimports.py`), which is what the dynamic linker on the BMC does.
 
 Contents:
 
@@ -18,7 +27,7 @@ Contents:
 |------|------|
 | `www/` | the web UI (gzip, as installed by the reimu-webui recipe) |
 | `bin/bmcweb` | bmcweb of the REIMU revision with REIMU's patches and the patches of this tree (`/reimu/serial` consoles, read-write media, CD-ROM, CSP, timer queue, firmware upload) |
-| `bin/nbd-proxy` | jsnbd with the netlink fix; its configuration and state hook are in `etc/nbd-proxy` |
+| `bin/nbd-proxy` | jsnbd; `-L` (no netlink) only for an nbd-client built with netlink, REIMU's has none; its configuration and state hook are in `etc/nbd-proxy` |
 | `bin/reimu-serial` | consoles with a 20000-line timestamped history |
 | `bin/reimu-pnsd`, `libexec/reimu-pns-scan` | ПНС information |
 | `reimu-webdev` | the control script |
@@ -26,19 +35,29 @@ Contents:
 Cross-compilation without the BMC's sysroot:
 
 * the compiler is [zig](https://ziglang.org) from PyPI (`ziglang`). It targets
-  `arm-linux-gnueabi` with **glibc 2.32** (the REIMU Yocto 3.2 version) and
+  `arm-linux-gnueabi` with **glibc 2.33** (REIMU 1.0.1 and 1.0.2) and
   `-mcpu=arm1176jz_s -mfloat-abi=soft`, which matches the REIMU tune
   `arm1176jzs`. The build checks that no binary needs a newer glibc or uses
-  VFP;
+  VFP. glibc can't be older than 2.33 here: for older versions zig's `stat()`
+  shim calls `__xstat` with the x86 `_STAT_VER`, ARM's glibc answers EINVAL
+  and bmcweb dies in `std::filesystem` at start;
+* every program is a PIE: zig 0.13's glibc link stub puts all data objects
+  (`environ`, `stderr`, `optarg`…) at one address, so a non-PIE executable
+  gets a single copy relocation for all of them and they overwrite each other
+  (reimu-serial crashed in `getopt()`). The build refuses copy relocations;
 * C++ uses zig's libc++, linked statically. The BMC's libstdc++ isn't
   involved, so ABI differences don't matter;
 * openssl 1.1.1, zlib, tinyxml2 and json-c are built from source and linked
   statically;
 * libsystemd, libudev and libpam are linked against stubs made by
-  `mkstub.py` from Ubuntu 20.04 packages, with the same sonames and symbol
-  versions (`LIBSYSTEMD_209`…, `LIBPAM_1.0`). At run time the BMC's own
-  libraries are used: their sonames are stable, and the symbols needed exist
-  in systemd 246.
+  `mkstub.py` from the BMC's libraries (`BMC_ROOTFS`) or Ubuntu 20.04
+  packages, with the same sonames and symbol versions (`LIBSYSTEMD_209`…,
+  `LIBPAM_1.0`). At run time the BMC's own libraries are used. The stubs
+  export only the library's own symbols: libgcc helpers (`__aeabi_*`) that
+  Ubuntu's armhf libraries re-export, and the compiler-rt zig links into
+  every shared object, are left out, so the programs take them from the
+  static compiler-rt (otherwise: `undefined symbol: __aeabi_uldivmod` on the
+  BMC).
 
 `patches/` holds what only this build needs. For example, clang's libc++
 requires a `static constexpr` `min()`/`max()` in bmcweb's random generator,
@@ -81,6 +100,23 @@ changes of `meta-reliable-upgrade`. The firmware card then shows "no backup".
 The USB gadget and the KVM video stay as in the stock image.
 
 ## Test without a BMC
+
+In QEMU, with the release image the board runs (`meta-mcst/tests/qemu`):
+
+    cp obmc-phosphor-image-reimu-5564.static.mtd /tmp/stock.mtd
+    meta-mcst/tests/qemu/run-bmc.sh /tmp/stock.mtd stock 2222 2443
+    meta-mcst/tests/qemu/bmcssh 2222 'cat > /tmp/wd.tgz' < reimu-webdev-*.tar.gz
+    meta-mcst/tests/qemu/bmcssh 2222 'tar xzf /tmp/wd.tgz -C /tmp && /tmp/reimu-webdev/reimu-webdev start'
+
+Checked this way on REIMU 1.0.2 (ARM, the real binaries): `start`, `status`,
+`stop` and the stock state after a reboot; `tests/e2e/console.qemu.mjs`
+(18 checks), `nbd-rw.qemu.mjs` (read-write media through `/dev/nbd0`, 5),
+`pages.qemu.mjs` (every page, 9), the KVM handshake with the stock
+obmc-ikvm. Not in QEMU: KVM video, the USB host side of media. On a stock
+BMC `--web-only` has no `/reimu/serial` and no media writes, as described
+above; the ПНС page shows what `reimu-pnsd` finds (nothing in QEMU).
+
+On the x86 test VM:
 
 `TARGET=x86_64 STUB_LIBS=<VM's lib dir> build.sh` builds the same package for
 the x86 test VM (`meta-mcst/tests/testvm`). There, `reimu-webdev start` is
