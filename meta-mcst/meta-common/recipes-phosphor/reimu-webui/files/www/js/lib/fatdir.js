@@ -566,10 +566,30 @@ export async function listVolume(dev) {
 
 async function sameContent(f, file) {
   const now = await f.read();
-  const was = new Uint8Array(await file.arrayBuffer());
+  let was;
+  try {
+    was = new Uint8Array(await file.arrayBuffer());
+  } catch (e) {
+    return false; // the original was rewritten (synced to the folder): report it, the caller dedups
+  }
   if (now.length !== was.length) return false;
   for (let i = 0; i < now.length; i++) if (now[i] !== was[i]) return false;
   return true;
+}
+
+// The original cluster run of a file, by path: [byte offset, length] on the
+// device, or null.
+export function originalExtent(fat, path) {
+  let d = fat.root;
+  const parts = path.split("/");
+  for (const p of parts.slice(0, -1)) {
+    d = d.children.get(p);
+    if (!d || !d.dir) return null;
+  }
+  const f = d.children.get(parts[parts.length - 1]);
+  if (!f || f.dir || !f.size) return null;
+  const start = (PART_START + fat.dataStart) * SECTOR + (f.cluster - 2) * fat.clusterSize;
+  return [start, Math.ceil(f.size / fat.clusterSize) * fat.clusterSize];
 }
 
 // Files on `dev` (an OverlayBackend over `fat`) that differ from the folder

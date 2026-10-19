@@ -3,7 +3,7 @@
 
 import { api, h, toast, fmtBytes } from "../api.js";
 import { NbdServer, BlobBackend, OverlayBackend, FileHandleBackend, OpfsBackend } from "../lib/nbd-server.js";
-import { FatDirBackend, entriesFromHandle, entriesFromFileList, changedFiles } from "../lib/fatdir.js";
+import { FatDirBackend, entriesFromHandle, entriesFromFileList, changedFiles, originalExtent } from "../lib/fatdir.js";
 
 const hasPicker = typeof window.showOpenFilePicker === "function";
 const hasOpfs = !!(navigator.storage && navigator.storage.getDirectory);
@@ -73,6 +73,13 @@ function renderSlot(s) {
     disconnect: h("button", { class: "btn danger hidden" }, "Отключить"),
     save: h("button", { class: "btn hidden", title: "Записать изменения в файл" }, "Сохранить"),
     saveDir: h("button", { class: "btn primary hidden", title: "Записать в папку файлы, созданные и изменённые платформой" }, "Сохранить в папку…"),
+    sync: h("button", { class: "btn hidden", title: "Записать в папку то, что платформа уже сохранила (sync)" }, "Синхронизировать"),
+    autoSync: h(
+      "label",
+      { class: "inline hidden", title: "Когда платформа делает sync или закрывает файл (FLUSH), новые и изменённые файлы сразу пишутся в папку" },
+      h("input", { type: "checkbox", checked: true }),
+      "автосинхронизация",
+    ),
     download: h("button", { class: "btn hidden", title: "Скачать образ со всеми изменениями" }, "Скачать образ"),
     state: h("div", { class: "state" }, h("span", { class: "led off" }), " отключён"),
     stats: h("div", { class: "muted small mono" }, ""),
@@ -90,7 +97,7 @@ function renderSlot(s) {
     e.source,
     e.state,
     e.stats,
-    h("div", { class: "row" }, e.connect, e.disconnect, e.save, e.saveDir, e.download),
+    h("div", { class: "row" }, e.connect, e.disconnect, e.sync, e.autoSync, e.save, e.saveDir, e.download),
   );
   if (s.id === 1) e.rw.classList.add("hidden");
 
@@ -144,6 +151,7 @@ function renderSlot(s) {
     updateSource(s);
   });
   e.saveDir.addEventListener("click", () => saveToFolder(s));
+  e.sync.addEventListener("click", () => syncFolder(s, { manual: true }));
   e.opfs.addEventListener("change", () => updateSource(s));
   e.connect.addEventListener("click", () => connect(s));
   e.disconnect.addEventListener("click", () => disconnect(s));
@@ -230,7 +238,10 @@ async function folderBackend(s) {
   if (!rw) return fat;
   const ov = new OverlayBackend(fat, { limit: FOLDER_OVERLAY, name });
   ov.describe = () =>
-    `${fat.describe()}; записано платформой ${fmtBytes(ov.overlayBytes)} в памяти браузера (до ${fmtBytes(FOLDER_OVERLAY)}), свободно на флешке ~${fmtBytes(fat.freeClusters * fat.clusterSize)}`;
+    `${fat.describe()}; в памяти браузера ${fmtBytes(ov.overlayBytes)} (до ${fmtBytes(FOLDER_OVERLAY)}), свободно на флешке ~${fmtBytes(fat.freeClusters * fat.clusterSize)}\n` +
+    (s.lastSync
+      ? `в папку записано файлов: ${s.synced.size}, последний раз ${new Date(s.lastSync.time).toLocaleTimeString()}`
+      : "изменения платформы пишутся в папку после sync/закрытия файла на ней (автосинхронизация), по кнопке «Синхронизировать» и при отключении");
   ov.fat = fat;
   ov.dirHandle = s.dirHandle;
   return ov;
@@ -258,60 +269,141 @@ async function removeFile(dir, path) {
   await d.removeEntry(parts[parts.length - 1]);
 }
 
-// Writes back what the host changed on a folder drive. Only after
-// disconnect: the drive's unchanged parts are read from the original files,
-// which must not change under a connected host.
+// CRC-32 of written content: a file already written to the folder in its
+// current state is not written again.
+const CRC = new Uint32Array(256).map((_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+function fingerprint(data) {
+  let c = 0xffffffff;
+  for (let i = 0; i < data.length; i++) c = CRC[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  return `${data.length}:${(c ^ 0xffffffff) >>> 0}`;
+}
+
+// What the host created/changed/deleted and is not in the folder yet.
+async function folderChanges(s, fat, ov) {
+  const { changed, deleted } = await changedFiles(fat, ov);
+  const todo = [];
+  for (const f of changed) {
+    const data = await f.read();
+    const fp = fingerprint(data);
+    if (s.synced.get(f.path) !== fp) todo.push({ path: f.path, status: f.status, data, fp });
+  }
+  return { todo, deleted: deleted.filter((p) => !s.removed.has(p)) };
+}
+
+// Before a file of the original folder is overwritten or removed, the drive
+// must stop reading it: the browser can't read a File after it changed on
+// disk. Its clusters are copied into the overlay first.
+async function pinOriginal(fat, ov, path) {
+  const ext = originalExtent(fat, path);
+  if (!ext) return;
+  const BLK = 64 * 1024;
+  for (let i = Math.floor(ext[0] / BLK); i * BLK < ext[0] + ext[1]; i++) await ov._block(i);
+}
+
+async function applyChanges(s, fat, ov, dir, todo, connected, progress) {
+  let n = 0;
+  for (const t of todo) {
+    if (progress) progress(++n, todo.length, t.path);
+    if (connected && t.status === "changed") await pinOriginal(fat, ov, t.path);
+    await writeFile(dir, t.path, t.data);
+    s.synced.set(t.path, t.fp);
+  }
+}
+
+async function applyDeletions(s, fat, ov, dir, paths, connected) {
+  let n = 0;
+  for (const p of paths) {
+    try {
+      if (connected) await pinOriginal(fat, ov, p);
+      await removeFile(dir, p);
+      s.removed.add(p);
+      n++;
+    } catch (err) {
+      toast(`Не удалось удалить ${p}: ${err.message}`, "err");
+    }
+  }
+  return n;
+}
+
+const listText = (a) => a.slice(0, 15).join("\n") + (a.length > 15 ? `\n… и ещё ${a.length - 15}` : "");
+
+// While connected: write to the folder what the host has flushed. Automatic
+// (after a FLUSH: sync, umount, file close with the vfat "flush" option)
+// writes new and changed files silently; deletions only from the button.
+async function syncFolder(s, { manual = false } = {}) {
+  const ov = s.backend;
+  if (!s.server || !ov || !ov.fat) return;
+  if (s.syncing) {
+    s.syncAgain = true;
+    return;
+  }
+  s.syncing = true;
+  try {
+    const { todo, deleted } = await folderChanges(s, ov.fat, ov);
+    if (todo.length) {
+      await applyChanges(s, ov.fat, ov, ov.dirHandle, todo, true);
+      s.lastSync = { time: Date.now(), files: todo.length };
+      if (manual || todo.length) toast(`В папку «${ov.dirHandle.name}» записано: ${todo.map((t) => t.path).slice(0, 3).join(", ")}${todo.length > 3 ? ` и ещё ${todo.length - 3}` : ""}`, "ok");
+    } else if (manual) toast("Новых изменений нет (платформа могла ещё не сохранить их: sync на платформе)", "ok");
+    if (manual && deleted.length && confirm(`На платформе удалены ${deleted.length} файлов. Удалить их и в папке?\n\n${listText(deleted)}`)) {
+      toast(`Удалено в папке: ${await applyDeletions(s, ov.fat, ov, ov.dirHandle, deleted, true)}`, "ok");
+    }
+  } catch (err) {
+    toast(`Синхронизация с папкой: ${err.message}`, "err");
+  } finally {
+    s.syncing = false;
+    updateStats(s);
+    if (s.syncAgain) {
+      s.syncAgain = false;
+      syncFolder(s);
+    }
+  }
+}
+
+// After disconnect: whatever is left, with confirmation.
 async function saveToFolder(s) {
   const pf = s.pendingFolder;
   if (!pf) return;
   let res;
   try {
     setState(s, "warn", "поиск изменений…");
-    res = await changedFiles(pf.fat, pf.overlay);
+    res = await folderChanges(s, pf.fat, pf.overlay);
   } catch (err) {
     toast(`Не удалось разобрать флешку: ${err.message}`, "err");
     setState(s, "off", "отключён");
     return;
   }
-  const { changed, deleted } = res;
+  const { todo, deleted } = res;
   setState(s, "off", "отключён");
-  if (!changed.length && !deleted.length) {
-    toast("Платформа ничего не изменила в папке", "ok");
+  if (!todo.length && !deleted.length) {
+    if (!s.synced.size) toast("Платформа ничего не изменила в папке", "ok");
     s.pendingFolder = null;
     updateStats(s);
     return;
   }
-  const list = (a) => a.slice(0, 15).join("\n") + (a.length > 15 ? `\n… и ещё ${a.length - 15}` : "");
-  if (changed.length) {
+  if (todo.length) {
     const msg =
-      `Записать в папку «${pf.dirHandle.name}» ${changed.length} файлов (${fmtBytes(changed.reduce((a, f) => a + f.size, 0))})?\n\n` +
-      list(changed.map((f) => `${f.status === "new" ? "+" : "~"} ${f.path}`));
-    if (confirm(msg)) {
-      let done = 0;
-      try {
-        for (const f of changed) {
-          setState(s, "warn", `запись в папку: ${++done}/${changed.length} ${f.path}`);
-          await writeFile(pf.dirHandle, f.path, await f.read());
-        }
-        toast(`Записано в папку: ${changed.length} файлов`, "ok");
-      } catch (err) {
-        toast(`Ошибка записи ${changed[done - 1] ? changed[done - 1].path : ""}: ${err.message}`, "err");
-        setState(s, "off", "отключён");
-        return;
-      }
+      `Записать в папку «${pf.dirHandle.name}» ${todo.length} файлов (${fmtBytes(todo.reduce((a, t) => a + t.data.length, 0))})?\n\n` +
+      listText(todo.map((t) => `${t.status === "new" ? "+" : "~"} ${t.path}`));
+    if (!confirm(msg)) {
+      updateStats(s);
+      return;
+    }
+    try {
+      await applyChanges(s, pf.fat, pf.overlay, pf.dirHandle, todo, false, (n, all, path) => setState(s, "warn", `запись в папку: ${n}/${all} ${path}`));
+      toast(`Записано в папку: ${todo.length} файлов`, "ok");
+    } catch (err) {
+      toast(`Ошибка записи в папку: ${err.message}`, "err");
+      setState(s, "off", "отключён");
+      return;
     }
   }
-  if (deleted.length && confirm(`На платформе удалены ${deleted.length} файлов. Удалить их и в папке?\n\n${list(deleted)}`)) {
-    let n = 0;
-    for (const p of deleted) {
-      try {
-        await removeFile(pf.dirHandle, p);
-        n++;
-      } catch (err) {
-        toast(`Не удалось удалить ${p}: ${err.message}`, "err");
-      }
-    }
-    toast(`Удалено в папке: ${n}`, "ok");
+  if (deleted.length && confirm(`На платформе удалены ${deleted.length} файлов. Удалить их и в папке?\n\n${listText(deleted)}`)) {
+    toast(`Удалено в папке: ${await applyDeletions(s, pf.fat, pf.overlay, pf.dirHandle, deleted, false)}`, "ok");
   }
   s.pendingFolder = null;
   setState(s, "off", "отключён");
@@ -322,6 +414,10 @@ async function connect(s) {
   if (s.server) return;
   if (s.pendingFolder && !confirm("Изменения с прошлого подключения папки ещё не сохранены и будут потеряны. Продолжить?")) return;
   s.pendingFolder = null;
+  s.synced = new Map(); // path -> fingerprint written to the folder
+  s.removed = new Set();
+  s.lastSync = null;
+  s.flushes = 0;
   let backend;
   try {
     backend = await makeBackend(s);
@@ -351,7 +447,17 @@ async function connect(s) {
     setState(s, "on", ev.detail.readOnly ? "подключён (только чтение)" : "подключён (чтение и запись)");
     toast(`${s.title}: образ ${backend.name} подключён к платформе`, "ok");
   });
-  srv.addEventListener("stats", () => updateStats(s));
+  srv.addEventListener("stats", () => {
+    updateStats(s);
+    // FLUSH from the host: its data is consistent now, write it to the folder
+    if (backend.fat && srv.stats.flushes > s.flushes) {
+      s.flushes = srv.stats.flushes;
+      if (s.el.autoSync.querySelector("input").checked) {
+        clearTimeout(s.syncTimer);
+        s.syncTimer = setTimeout(() => syncFolder(s), 2000);
+      }
+    }
+  });
   srv.addEventListener("error", (ev) => toast(`${s.title}: ${ev.detail.message}`, "err"));
   srv.addEventListener("close", async (ev) => {
     const was = s.server;
@@ -368,6 +474,7 @@ async function connect(s) {
     s.el.disconnect.classList.add("hidden");
     s.el.mode.disabled = false;
     if (s.mode === "opfs") refreshLibrary();
+    clearTimeout(s.syncTimer);
     if (backend.fat && backend.dirty && backend.dirty.size) {
       s.pendingFolder = { fat: backend.fat, overlay: backend, dirHandle: backend.dirHandle };
       updateStats(s);
@@ -407,6 +514,9 @@ function updateStats(s, server = s.server) {
   e.save.classList.toggle("hidden", !(be instanceof FileHandleBackend && dirty));
   e.download.classList.toggle("hidden", !(be instanceof OverlayBackend && !(be instanceof FileHandleBackend) && !be.fat && dirty));
   e.saveDir.classList.toggle("hidden", !s.pendingFolder);
+  const live = !!(server && be && be.fat && !be.readOnly);
+  e.sync.classList.toggle("hidden", !live);
+  e.autoSync.classList.toggle("hidden", !live);
 }
 
 /* ------------------------------------------------------------------ */
