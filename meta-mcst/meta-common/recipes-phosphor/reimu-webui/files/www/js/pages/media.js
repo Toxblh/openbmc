@@ -3,9 +3,12 @@
 
 import { api, h, toast, fmtBytes } from "../api.js";
 import { NbdServer, BlobBackend, OverlayBackend, FileHandleBackend, OpfsBackend } from "../lib/nbd-server.js";
+import { FatDirBackend, entriesFromHandle, entriesFromFileList, changedFiles } from "../lib/fatdir.js";
 
 const hasPicker = typeof window.showOpenFilePicker === "function";
 const hasOpfs = !!(navigator.storage && navigator.storage.getDirectory);
+const hasDirPicker = typeof window.showDirectoryPicker === "function";
+const FOLDER_OVERLAY = 1024 * 1024 * 1024; // RAM for what the host writes to a folder drive
 
 const SLOTS = [
   { id: 0, title: "USB-диск", hint: "Съёмный диск. Поддерживает запись, если источник позволяет." },
@@ -17,13 +20,16 @@ const MODES = [
   { id: "file-rw", label: "Локальный файл — чтение и запись", ok: () => hasPicker, why: "нужен Chromium-браузер (File System Access API)" },
   { id: "snapshot", label: "Локальный файл — запись в снимок (в памяти браузера)", ok: () => true },
   { id: "opfs", label: "Образ из хранилища браузера", ok: () => hasOpfs, why: "браузер не поддерживает OPFS" },
+  { id: "dir-ro", label: "Папка как флешка — только чтение", ok: () => true },
+  { id: "dir-rw", label: "Папка как флешка — с записью в папку", ok: () => hasDirPicker, why: "только Chrome/Edge: нужен File System Access API" },
 ];
+const isDir = (m) => m === "dir-ro" || m === "dir-rw";
 
 let root;
 const slots = SLOTS.map((s) => ({ ...s, server: null, backend: null, file: null, handle: null, mode: s.id === 1 ? "file-ro" : "file-rw" }));
 
 function onBeforeUnload(e) {
-  if (slots.some((s) => s.server)) {
+  if (slots.some((s) => s.server || s.pendingFolder)) {
     e.preventDefault();
     e.returnValue = "";
   }
@@ -58,19 +64,22 @@ function renderSlot(s) {
     ),
     file: h("input", { type: "file" }),
     pick: h("button", { class: "btn" }, "Выбрать файл…"),
+    pickDir: h("button", { class: "btn" }, "Выбрать папку…"),
+    dirInput: h("input", { type: "file", webkitdirectory: true, multiple: true, class: "hidden" }),
     opfs: h("select", {}),
     rw: h("label", { class: "inline" }, h("input", { type: "checkbox", checked: s.id === 0 }), "разрешить запись"),
     source: h("div", { class: "muted small" }, "Источник не выбран"),
     connect: h("button", { class: "btn primary" }, "Подключить"),
     disconnect: h("button", { class: "btn danger hidden" }, "Отключить"),
     save: h("button", { class: "btn hidden", title: "Записать изменения в файл" }, "Сохранить"),
+    saveDir: h("button", { class: "btn primary hidden", title: "Записать в папку файлы, созданные и изменённые платформой" }, "Сохранить в папку…"),
     download: h("button", { class: "btn hidden", title: "Скачать образ со всеми изменениями" }, "Скачать образ"),
     state: h("div", { class: "state" }, h("span", { class: "led off" }), " отключён"),
     stats: h("div", { class: "muted small mono" }, ""),
   };
   s.el.mode.value = s.mode;
   const e = s.el;
-  const sourceRow = h("div", { class: "row" }, e.file, e.pick, e.opfs, e.rw);
+  const sourceRow = h("div", { class: "row" }, e.file, e.pick, e.pickDir, e.dirInput, e.opfs, e.rw);
   const card = h(
     "div",
     { class: "card slot" },
@@ -81,7 +90,7 @@ function renderSlot(s) {
     e.source,
     e.state,
     e.stats,
-    h("div", { class: "row" }, e.connect, e.disconnect, e.save, e.download),
+    h("div", { class: "row" }, e.connect, e.disconnect, e.save, e.saveDir, e.download),
   );
   if (s.id === 1) e.rw.classList.add("hidden");
 
@@ -89,6 +98,8 @@ function renderSlot(s) {
     s.mode = e.mode.value;
     e.file.classList.toggle("hidden", !(s.mode === "file-ro" || s.mode === "snapshot"));
     e.pick.classList.toggle("hidden", s.mode !== "file-rw");
+    e.pickDir.classList.toggle("hidden", !isDir(s.mode));
+    if (isDir(s.mode) && s.dirMode && s.dirMode !== s.mode && s.mode === "dir-rw") s.dirHandle = null; // read-only grant is not enough
     e.opfs.classList.toggle("hidden", s.mode !== "opfs");
     e.rw.classList.toggle("hidden", s.mode !== "opfs" || s.id === 1);
     updateSource(s);
@@ -110,6 +121,29 @@ function renderSlot(s) {
       if (err.name !== "AbortError") toast(err.message, "err");
     }
   });
+  e.pickDir.addEventListener("click", async () => {
+    if (!hasDirPicker) return e.dirInput.click();
+    try {
+      const rw = s.mode === "dir-rw";
+      const handle = await window.showDirectoryPicker({ mode: rw ? "readwrite" : "read" });
+      if (rw && (await handle.requestPermission({ mode: "readwrite" })) !== "granted") throw new Error("нет разрешения на запись в папку");
+      s.dirHandle = handle;
+      s.dirFiles = null;
+      s.dirMode = s.mode;
+      updateSource(s);
+    } catch (err) {
+      if (err.name !== "AbortError") toast(err.message, "err");
+    }
+  });
+  e.dirInput.addEventListener("change", () => {
+    const files = [...e.dirInput.files];
+    if (!files.length) return;
+    s.dirFiles = files;
+    s.dirHandle = null;
+    s.dirName = (files[0].webkitRelativePath || "").split("/")[0] || "folder";
+    updateSource(s);
+  });
+  e.saveDir.addEventListener("click", () => saveToFolder(s));
   e.opfs.addEventListener("change", () => updateSource(s));
   e.connect.addEventListener("click", () => connect(s));
   e.disconnect.addEventListener("click", () => disconnect(s));
@@ -144,6 +178,9 @@ function updateSource(s) {
   if ((s.mode === "file-ro" || s.mode === "snapshot") && s.file) text = `${s.file.name} — ${fmtBytes(s.file.size)}`;
   if (s.mode === "file-rw" && s.handle) text = `${s.handle.name} (чтение и запись)`;
   if (s.mode === "opfs" && e.opfs.value) text = `${e.opfs.value} из хранилища браузера`;
+  if (isDir(s.mode) && s.dirHandle) text = `папка «${s.dirHandle.name}»${s.mode === "dir-rw" ? " (изменения можно сохранить в неё)" : ""}`;
+  if (isDir(s.mode) && s.dirFiles) text = `папка «${s.dirName}» — ${s.dirFiles.length} файлов, ${fmtBytes(s.dirFiles.reduce((a, f) => a + f.size, 0))}`;
+  if (s.mode === "dir-ro" && !hasDirPicker) text += " · в этом браузере папка подключается только для чтения";
   e.source.textContent = text;
 }
 
@@ -166,12 +203,125 @@ async function makeBackend(s) {
       const ro = s.id === 1 || !s.el.rw.querySelector("input").checked;
       return OpfsBackend.open(name, { readOnly: ro });
     }
+    case "dir-ro":
+    case "dir-rw":
+      return folderBackend(s);
   }
   throw new Error("неизвестный режим");
 }
 
+// A folder as a FAT32 flash drive. Read-only: the synthesized volume itself.
+// With writes: a RAM overlay on top; after disconnect the files the host
+// created or changed are written back into the folder (Chromium only).
+async function folderBackend(s) {
+  if (!s.dirHandle && !s.dirFiles) throw new Error("выберите папку");
+  const rw = s.mode === "dir-rw";
+  if (rw && !s.dirHandle) throw new Error("для записи выберите папку кнопкой «Выбрать папку…» (Chrome/Edge)");
+  const name = s.dirHandle ? s.dirHandle.name : s.dirName;
+  let entries;
+  if (s.dirHandle) {
+    setState(s, "warn", "чтение списка файлов…");
+    entries = await entriesFromHandle(s.dirHandle, (n) => setState(s, "warn", `чтение списка файлов: ${n}…`));
+  } else entries = entriesFromFileList(s.dirFiles);
+  const fat = new FatDirBackend(entries, { name, headroom: rw ? undefined : 0 });
+  if (fat.skipped.length) {
+    toast(`Пропущено ${fat.skipped.length} файлов: ${fat.skipped.slice(0, 3).map((x) => `${x.path} (${x.reason})`).join(", ")}${fat.skipped.length > 3 ? "…" : ""}`, "err");
+  }
+  if (!rw) return fat;
+  const ov = new OverlayBackend(fat, { limit: FOLDER_OVERLAY, name });
+  ov.describe = () =>
+    `${fat.describe()}; записано платформой ${fmtBytes(ov.overlayBytes)} в памяти браузера (до ${fmtBytes(FOLDER_OVERLAY)}), свободно на флешке ~${fmtBytes(fat.freeClusters * fat.clusterSize)}`;
+  ov.fat = fat;
+  ov.dirHandle = s.dirHandle;
+  return ov;
+}
+
+async function writeFile(dir, path, data) {
+  const parts = path.split("/");
+  let d = dir;
+  for (const p of parts.slice(0, -1)) d = await d.getDirectoryHandle(p, { create: true });
+  const fh = await d.getFileHandle(parts[parts.length - 1], { create: true });
+  const w = await fh.createWritable();
+  try {
+    await w.write(data);
+    await w.close();
+  } catch (e) {
+    await w.abort().catch(() => {});
+    throw e;
+  }
+}
+
+async function removeFile(dir, path) {
+  const parts = path.split("/");
+  let d = dir;
+  for (const p of parts.slice(0, -1)) d = await d.getDirectoryHandle(p);
+  await d.removeEntry(parts[parts.length - 1]);
+}
+
+// Writes back what the host changed on a folder drive. Only after
+// disconnect: the drive's unchanged parts are read from the original files,
+// which must not change under a connected host.
+async function saveToFolder(s) {
+  const pf = s.pendingFolder;
+  if (!pf) return;
+  let res;
+  try {
+    setState(s, "warn", "поиск изменений…");
+    res = await changedFiles(pf.fat, pf.overlay);
+  } catch (err) {
+    toast(`Не удалось разобрать флешку: ${err.message}`, "err");
+    setState(s, "off", "отключён");
+    return;
+  }
+  const { changed, deleted } = res;
+  setState(s, "off", "отключён");
+  if (!changed.length && !deleted.length) {
+    toast("Платформа ничего не изменила в папке", "ok");
+    s.pendingFolder = null;
+    updateStats(s);
+    return;
+  }
+  const list = (a) => a.slice(0, 15).join("\n") + (a.length > 15 ? `\n… и ещё ${a.length - 15}` : "");
+  if (changed.length) {
+    const msg =
+      `Записать в папку «${pf.dirHandle.name}» ${changed.length} файлов (${fmtBytes(changed.reduce((a, f) => a + f.size, 0))})?\n\n` +
+      list(changed.map((f) => `${f.status === "new" ? "+" : "~"} ${f.path}`));
+    if (confirm(msg)) {
+      let done = 0;
+      try {
+        for (const f of changed) {
+          setState(s, "warn", `запись в папку: ${++done}/${changed.length} ${f.path}`);
+          await writeFile(pf.dirHandle, f.path, await f.read());
+        }
+        toast(`Записано в папку: ${changed.length} файлов`, "ok");
+      } catch (err) {
+        toast(`Ошибка записи ${changed[done - 1] ? changed[done - 1].path : ""}: ${err.message}`, "err");
+        setState(s, "off", "отключён");
+        return;
+      }
+    }
+  }
+  if (deleted.length && confirm(`На платформе удалены ${deleted.length} файлов. Удалить их и в папке?\n\n${list(deleted)}`)) {
+    let n = 0;
+    for (const p of deleted) {
+      try {
+        await removeFile(pf.dirHandle, p);
+        n++;
+      } catch (err) {
+        toast(`Не удалось удалить ${p}: ${err.message}`, "err");
+      }
+    }
+    toast(`Удалено в папке: ${n}`, "ok");
+  }
+  s.pendingFolder = null;
+  setState(s, "off", "отключён");
+  updateStats(s);
+}
+
 async function connect(s) {
   if (s.server) return;
+  if (s.pendingFolder && !confirm("Изменения с прошлого подключения папки ещё не сохранены и будут потеряны. Продолжить?")) return;
+  s.pendingFolder = null;
   let backend;
   try {
     backend = await makeBackend(s);
@@ -218,6 +368,11 @@ async function connect(s) {
     s.el.disconnect.classList.add("hidden");
     s.el.mode.disabled = false;
     if (s.mode === "opfs") refreshLibrary();
+    if (backend.fat && backend.dirty && backend.dirty.size) {
+      s.pendingFolder = { fat: backend.fat, overlay: backend, dirHandle: backend.dirHandle };
+      updateStats(s);
+      saveToFolder(s);
+    }
   });
   s.el.connect.classList.add("hidden");
   s.el.disconnect.classList.remove("hidden");
@@ -250,7 +405,8 @@ function updateStats(s, server = s.server) {
   }
   const dirty = be && be.dirty && be.dirty.size > 0;
   e.save.classList.toggle("hidden", !(be instanceof FileHandleBackend && dirty));
-  e.download.classList.toggle("hidden", !(be instanceof OverlayBackend && !(be instanceof FileHandleBackend) && dirty));
+  e.download.classList.toggle("hidden", !(be instanceof OverlayBackend && !(be instanceof FileHandleBackend) && !be.fat && dirty));
+  e.saveDir.classList.toggle("hidden", !s.pendingFolder);
 }
 
 /* ------------------------------------------------------------------ */
