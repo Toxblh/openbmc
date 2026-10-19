@@ -1,0 +1,8 @@
+[Unit]
+Description=Test fixture: PNS flash image as MTD device /dev/mtd/sys (block2mtd)
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'LOOP=$(losetup -f --show /root/fixtures/pns-flash.bin); modprobe block2mtd block2mtd=$LOOP,4096; modprobe mtdblock; mkdir -p /dev/mtd; ln -sf ../mtd0 /dev/mtd/sys'
+[Install]
+WantedBy=multi-user.target

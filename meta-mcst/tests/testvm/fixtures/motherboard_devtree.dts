@@ -1,0 +1,6 @@
+/dts-v1/;
+/ {
+	model = "MCST E8C-mATX (test fixture)";
+	compatible = "mcst,e8c-matx";
+	i2c@0 { lm96163@4c { compatible = "national,lm96163"; reg = <0x4c>; }; };
+};

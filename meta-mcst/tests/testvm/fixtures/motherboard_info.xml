@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fruinfo>
+	<board_info_area>
+		<mfg_date type="timestamp">1600000000</mfg_date>
+		<mfg_date type="string">2020-09-13 15:26:40</mfg_date>
+		<manufacturer>MCST (test fixture)</manufacturer>
+		<product_name>E8C-mATX (test)</product_name>
+		<serial_number>TEST-0001</serial_number>
+		<part_number>TVGI.00306-01</part_number>
+	</board_info_area>
+</fruinfo>

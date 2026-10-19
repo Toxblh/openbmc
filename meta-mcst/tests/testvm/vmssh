@@ -1,0 +1,4 @@
+#!/bin/sh
+# ssh into the test VM started by run-vm.sh
+HERE=$(cd "$(dirname "$0")" && pwd)
+exec ssh -q -i "${VMKEY:-$HERE/work/id_ed25519}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 root@127.0.0.1 "$@"

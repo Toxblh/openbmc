@@ -1,0 +1,6 @@
+# Test fixture replacing REIMU /libexec/gpio-funcs: the SPI switch GPIO is
+# simulated by a file so tests can check that the flash was attached and
+# released again.
+GPIO_SPI_CONNECT=O0
+gpio2num() { echo 112; }
+gpiowrite() { echo "$2" > /tmp/spi-gpio-$1; echo "$(date +%s.%N) $2" >> /tmp/spi-gpio-log; }

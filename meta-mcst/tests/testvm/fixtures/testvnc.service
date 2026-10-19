@@ -1,0 +1,9 @@
+[Unit]
+Description=Test VNC desktop standing in for obmc-ikvm (no video engine in QEMU)
+[Service]
+Environment=DISPLAY=:0
+ExecStartPre=/bin/sh -c 'mkdir -p /root/.vnc; x11vnc -storepasswd 0penBmc /root/.vnc/passwd'
+ExecStart=/bin/sh -c 'Xvfb :0 -screen 0 1024x768x24 & sleep 2; xterm -geometry 100x20+0+0 -bg "#203040" -fg white -e "cat > /tmp/kvm-typed.txt" & xterm -geometry 100x22+0+330 -e "while true; do date; ls --color=always -la /usr/lib | head -30; sleep 1; clear; done" & xclock -geometry 300x300+700+400 -update 1 & exec x11vnc -display :0 -rfbport 5900 -rfbauth /root/.vnc/passwd -forever -shared -localhost'
+Restart=always
+[Install]
+WantedBy=multi-user.target

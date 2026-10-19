@@ -1,0 +1,7 @@
+[Unit]
+Description=Test fixture: FRU/DTS files normally produced by mcst-fruid
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p /var/volatile; cp /root/fixtures/motherboard_info.xml /root/fixtures/motherboard_devtree.dts /var/volatile/'
+[Install]
+WantedBy=multi-user.target
