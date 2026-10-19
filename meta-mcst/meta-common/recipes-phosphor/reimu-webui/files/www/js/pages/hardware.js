@@ -188,8 +188,24 @@ async function loadPns() {
     h(
       "div",
       { class: "grid" },
-      ...fru.map((s) => h("div", { class: "card" }, h("h3", {}, `FRU: ${s.title}`), kv(s.rows))),
-      fru.length ? null : h("div", { class: "card" }, h("h3", {}, "FRU"), h("div", { class: "muted" }, "FRU платы не прочитан при загрузке BMC")),
+      ...fru.map((s) =>
+        h(
+          "div",
+          { class: "card" },
+          h("h3", {}, `FRU: ${s.title}`),
+          kv(s.rows),
+          doc.fruSource === "eeprom" || doc.fruSource === "cache"
+            ? h(
+                "div",
+                { class: "muted small" },
+                doc.fruSource === "cache"
+                  ? "сохранённая копия: EEPROM FRU отвечает только при включённой платформе"
+                  : "прочитан из EEPROM: при загрузке BMC mcst-fruid его не получил",
+              )
+            : null,
+        ),
+      ),
+      fru.length ? null : h("div", { class: "card" }, h("h3", {}, "FRU"), h("div", { class: "muted" }, "FRU не прочитан: EEPROM отвечает только при включённой платформе")),
       h("div", { class: "card" }, h("h3", {}, "Device tree платформы"), doc.devtree ? kv(dtsSummary(doc.devtree)) : h("div", { class: "muted" }, "нет данных"), h("div", { class: "row" }, doc.devtree ? dtsBtn : null)),
       h("div", { class: "card span2" }, h("h3", {}, "Флеш ПНС"), flash, h("br"), h("div", { class: "row" }, rescan)),
     ),

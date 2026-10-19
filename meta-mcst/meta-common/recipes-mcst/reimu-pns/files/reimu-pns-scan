@@ -5,7 +5,7 @@
 
 . /libexec/gpio-funcs
 
-OUT=/var/lib/reimu-pns/scan.json
+OUT=${REIMU_PNS_SCAN_OUT:-/var/lib/reimu-pns/scan.json}
 PNSD=${REIMU_PNSD:-/usr/sbin/reimu-pnsd}
 
 state=$(busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 \

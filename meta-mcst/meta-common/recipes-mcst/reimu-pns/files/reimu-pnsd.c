@@ -10,6 +10,10 @@
  *
  * Data sources:
  *   /var/volatile/motherboard_info.xml   FRU ID, extracted at BMC boot by mcst-fruid
+ *                                         (absent: read from the FRU EEPROM itself,
+ *                                         REIMU_FRU_EEPROM overrides its sysfs path;
+ *                                         the chip answers only while the platform is
+ *                                         on, so the last copy is kept in FRU_CACHE)
  *   /var/volatile/motherboard_devtree.dts device tree from the ПНС flash (mcst-fruid)
  *   /var/lib/reimu-pns/scan.json         last flash scan (reimu-pns-scan)
  *
@@ -42,6 +46,7 @@
 #define FRU_XML   "/var/volatile/motherboard_info.xml"
 #define DTS_FILE  "/var/volatile/motherboard_devtree.dts"
 #define SCAN_JSON "/var/lib/reimu-pns/scan.json"
+#define FRU_CACHE "/var/lib/reimu-pns/fru.xml"
 #define SCAN_TOOL "/usr/libexec/reimu-pns-scan"
 
 #define FPT_SIGNATURE   0xb007e2e2U
@@ -296,6 +301,295 @@ static int parse_flash(const char *path, struct buf *b)
 }
 
 /* ------------------------------------------------------------------ */
+/* FRU ID EEPROM (IPMI Platform Management FRU Information Storage)    */
+/*                                                                     */
+/* mcst-fruid writes FRU_XML once at BMC boot. If the EEPROM did not   */
+/* answer then (seen on 1Э8СВ-uATX: no file, service failed with 12),  */
+/* the same XML is built here from the EEPROM itself.                  */
+
+#define FRU_MAXAREA 2048
+
+/* a sysfs eeprom file of the FRU ID chip: REIMU_FRU_EEPROM, else the
+ * first 24cXX device at address 0x57 (the address the device tree
+ * of every REIMU platform uses for the "FRUID" chip) */
+static int fru_eeprom_path(char *out, size_t outsz)
+{
+    const char *env = getenv("REIMU_FRU_EEPROM");
+    if (env)
+    {
+        snprintf(out, outsz, "%s", env);
+        return access(out, R_OK);
+    }
+    for (int bus = 0; bus < 16; bus++)
+    {
+        char dir[96], name[32] = "";
+        snprintf(dir, sizeof(dir), "/sys/bus/i2c/devices/%d-0057", bus);
+        snprintf(out, outsz, "%s/name", dir);
+        FILE *f = fopen(out, "r");
+        if (!f) continue;
+        if (!fgets(name, sizeof(name), f)) name[0] = 0;
+        fclose(f);
+        if (strncmp(name, "24c", 3)) continue;
+        snprintf(out, outsz, "%s/eeprom", dir);
+        if (access(out, R_OK) == 0) return 0;
+    }
+    return -1;
+}
+
+static void xml_text(struct buf *b, const unsigned char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        switch (s[i])
+        {
+        case '<': buf_str(b, "&lt;"); break;
+        case '>': buf_str(b, "&gt;"); break;
+        case '&': buf_str(b, "&amp;"); break;
+        default:
+            if (s[i] >= 0x20) buf_add(b, (const char *)s + i, 1);
+        }
+    }
+}
+
+/* one type/length-encoded field as text; returns its total size or -1 */
+static int fru_field(const unsigned char *p, size_t avail, struct buf *out, int *is_end)
+{
+    if (!avail) return -1;
+    unsigned type = p[0] >> 6, len = p[0] & 0x3f;
+    *is_end = p[0] == 0xc1;
+    if (*is_end) return 1;
+    if (1 + len > avail) return -1;
+    const unsigned char *d = p + 1;
+    switch (type)
+    {
+    case 0: /* binary */
+        for (unsigned i = 0; i < len; i++) buf_printf(out, i ? " 0x%02X" : "0x%02X", d[i]);
+        break;
+    case 1: /* BCD plus */
+        for (unsigned i = 0; i < len * 2; i++)
+        {
+            unsigned v = i & 1 ? d[i / 2] & 0xf : d[i / 2] >> 4;
+            buf_add(out, &"0123456789 -.???"[v], 1);
+        }
+        break;
+    case 2: /* 6-bit packed ASCII */
+        for (unsigned bit = 0; bit + 6 <= len * 8; bit += 6)
+        {
+            unsigned v = 0;
+            for (unsigned k = 0; k < 6; k++) v |= ((d[(bit + k) / 8] >> ((bit + k) % 8)) & 1) << k;
+            char c = (char)(v + 0x20);
+            buf_add(out, &c, 1);
+        }
+        break;
+    default: /* 8-bit text (UTF-8 in MCST boards) */
+        buf_add(out, (const char *)d, len);
+    }
+    return 1 + len;
+}
+
+static void fru_elem(struct buf *x, const char *tag, struct buf *val)
+{
+    buf_printf(x, "\t\t<%s>", tag);
+    if (val->s) xml_text(x, (unsigned char *)val->s, val->len);
+    buf_printf(x, "</%s>\n", tag);
+}
+
+/* board (with mfg date) or product area: fixed fields, then custom ones */
+static void fru_info_area(struct buf *x, const char *area, const unsigned char *a, size_t n, int board)
+{
+    static const char *const board_f[] = { "manufacturer", "product_name", "serial_number", "part_number",
+                                           "fru_file_id" };
+    static const char *const prod_f[] = { "manufacturer", "product_name", "part_number", "version",
+                                          "serial_number", "asset_tag", "fru_file_id" };
+    const char *const *names = board ? board_f : prod_f;
+    int nfixed = board ? 5 : 7;
+    size_t off = board ? 6 : 3;
+    buf_printf(x, "\t<%s>\n", area);
+    if (board && n >= 6)
+    {
+        /* minutes since 1996-01-01 00:00 UTC */
+        time_t t = 820454400 + 60 * (time_t)(a[3] | a[4] << 8 | a[5] << 16);
+        struct tm tm;
+        char s[32];
+        gmtime_r(&t, &tm);
+        strftime(s, sizeof(s), "%Y-%m-%d %H:%M:%S", &tm);
+        buf_printf(x, "\t\t<mfg_date type=\"timestamp\">%lld</mfg_date>\n", (long long)t);
+        buf_printf(x, "\t\t<mfg_date type=\"string\">%s</mfg_date>\n", s);
+    }
+    for (int i = 0; off < n; i++)
+    {
+        struct buf v = { 0 };
+        int end;
+        int used = fru_field(a + off, n - off, &v, &end);
+        if (used < 0 || end)
+        {
+            free(v.s);
+            break;
+        }
+        off += used;
+        char tag[24];
+        if (i < nfixed) snprintf(tag, sizeof(tag), "%s", names[i]);
+        else snprintf(tag, sizeof(tag), "extra_field_%d", i - nfixed);
+        fru_elem(x, tag, &v);
+        free(v.s);
+    }
+    buf_printf(x, "\t</%s>\n", area);
+}
+
+/* MCST internal use area: version byte, then name/value pairs of
+ * type/length fields, e.g. "mac_addr" = 6 binary bytes */
+static void fru_internal_area(struct buf *x, const unsigned char *a, size_t n)
+{
+    buf_str(x, "\t<internal_use_area>\n");
+    size_t off = 1;
+    while (off < n)
+    {
+        struct buf k = { 0 }, v = { 0 };
+        int end, used = fru_field(a + off, n - off, &k, &end);
+        if (used < 0 || end || !k.s)
+        {
+            free(k.s);
+            break;
+        }
+        off += used;
+        if (off + 7 <= n && a[off] == 0x06 && strstr(k.s, "mac"))
+        {
+            const unsigned char *m = a + off + 1;
+            buf_printf(&v, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+            used = 7;
+        }
+        else used = fru_field(a + off, n - off, &v, &end);
+        if (used < 0 || end)
+        {
+            free(k.s);
+            free(v.s);
+            break;
+        }
+        off += used;
+        int ok = 1;
+        for (size_t i = 0; i < k.len; i++)
+            if (!(k.s[i] == '_' || (k.s[i] >= 'a' && k.s[i] <= 'z') || (k.s[i] >= '0' && k.s[i] <= '9'))) ok = 0;
+        if (ok && k.len) fru_elem(x, k.s, &v);
+        free(k.s);
+        free(v.s);
+    }
+    buf_str(x, "\t</internal_use_area>\n");
+}
+
+static int fru_area_ok(const unsigned char *a, size_t n)
+{
+    unsigned sum = 0;
+    for (size_t i = 0; i < n; i++) sum += a[i];
+    return (sum & 0xff) == 0;
+}
+
+/* FRU XML from an EEPROM image (fd), NULL if it isn't a valid FRU */
+static char *fru_xml_from_fd(int fd)
+{
+    unsigned char hdr[8];
+    if (pread_full(fd, hdr, 8, 0) || hdr[0] != 0x01 || !fru_area_ok(hdr, 8)) return NULL;
+    struct buf x = { 0 };
+    buf_str(&x, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<fruinfo>\n");
+    for (int ai = 1; ai <= 4; ai++)
+    {
+        if (ai == 2 || !hdr[ai]) continue; /* chassis area: not used by MCST */
+        off_t off = hdr[ai] * 8;
+        unsigned char a[FRU_MAXAREA];
+        size_t n;
+        if (ai == 1)
+        {
+            /* internal use area has no length: it ends where the next area starts */
+            int next = 0;
+            for (int k = 2; k <= 5; k++)
+                if (hdr[k] > hdr[1] && (!next || hdr[k] < next)) next = hdr[k];
+            n = next ? (size_t)(next - hdr[1]) * 8 : 256;
+            if (n > sizeof(a) || pread_full(fd, a, n, off)) continue;
+            fru_internal_area(&x, a, n);
+            continue;
+        }
+        if (pread_full(fd, a, 2, off)) continue;
+        n = a[1] * 8;
+        if (n < 8 || n > sizeof(a) || pread_full(fd, a, n, off) || !fru_area_ok(a, n)) continue;
+        fru_info_area(&x, ai == 3 ? "board_info_area" : "product_info_area", a, n, ai == 3);
+    }
+    buf_str(&x, "</fruinfo>\n");
+    return x.s;
+}
+
+/* REIMU_FRU_CACHE: the web devkit keeps it on tmpfs, off the BMC flash */
+static const char *fru_cache(void)
+{
+    const char *p = getenv("REIMU_FRU_CACHE");
+    return p ? p : FRU_CACHE;
+}
+
+#ifndef PARSER_ONLY
+static sd_bus *g_bus; /* set by the daemon: lets the EEPROM read check host power */
+#endif
+
+/* The chip shares the bus with the platform's boot loader (its RTC and FRU
+ * code) and is powered only while the platform is on. A read of the
+ * unpowered chip blocks for seconds (at24 retries), and touching the bus
+ * while the platform powers up is what the BMC must avoid, so the EEPROM is
+ * read only after the platform has been running for FRU_SETTLE_S seconds
+ * (seen by two property reads at least that far apart), and at most once a
+ * minute. */
+#define FRU_SETTLE_S 120
+static int fru_worth_trying(void)
+{
+    static time_t last_try;
+    time_t now = time(NULL);
+#ifndef PARSER_ONLY
+    static time_t running_since;
+    if (g_bus)
+    {
+        char *st = NULL;
+        int on = sd_bus_get_property_string(g_bus, "xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0",
+                                            "xyz.openbmc_project.State.Host", "CurrentHostState", NULL, &st) >= 0 &&
+                 st && strstr(st, ".Running");
+        free(st);
+        if (!on)
+        {
+            running_since = 0;
+            return 0;
+        }
+        if (!running_since) running_since = now;
+        if (now - running_since < FRU_SETTLE_S) return 0;
+    }
+#endif
+    if (last_try && now - last_try < 60) return 0;
+    last_try = now;
+    return 1;
+}
+
+static char *fru_xml_from_eeprom(void)
+{
+    static char *cached;
+    char path[128];
+    if (cached) return strdup(cached);
+    if (!fru_worth_trying() || fru_eeprom_path(path, sizeof(path))) return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    char *x = fru_xml_from_fd(fd);
+    close(fd);
+    if (!x) return NULL;
+    cached = strdup(x);
+    /* the chip is powered only while the platform is on: keep a copy for
+     * the times the BMC boots or runs with the platform off */
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", fru_cache());
+    if (!getenv("REIMU_FRU_CACHE")) mkdir("/var/lib/reimu-pns", 0755);
+    FILE *f = fopen(tmp, "w");
+    if (f)
+    {
+        int ok = fputs(x, f) >= 0;
+        if (fclose(f) == 0 && ok) rename(tmp, fru_cache());
+        else unlink(tmp);
+    }
+    return x;
+}
+
+/* ------------------------------------------------------------------ */
 /* JSON document served over D-Bus                                     */
 
 static char *build_json(void)
@@ -305,9 +599,18 @@ static char *build_json(void)
     char *data;
 
     buf_printf(&b, "{\"version\":1,\"now\":%lld,\"fruXml\":", (long long)time(NULL));
+    const char *fru_src = "null";
     data = read_file(FRU_XML, MAX_TEXT, &len);
+    if (data) fru_src = "\"xml\"";
+    else if ((data = fru_xml_from_eeprom()))
+    {
+        len = strlen(data);
+        fru_src = "\"eeprom\"";
+    }
+    else if ((data = read_file(fru_cache(), MAX_TEXT, &len))) fru_src = "\"cache\"";
     if (data) buf_json(&b, data, len);
     else buf_str(&b, "null");
+    buf_printf(&b, ",\"fruSource\":%s", fru_src);
     free(data);
 
     buf_str(&b, ",\"devtree\":");
@@ -317,7 +620,10 @@ static char *build_json(void)
     free(data);
 
     buf_str(&b, ",\"scan\":");
-    data = read_file(SCAN_JSON, MAX_TEXT, &len);
+    /* REIMU_PNS_SCAN_OUT: the web devkit keeps the scan on tmpfs (inherited
+     * by the scan tool, which writes the same path) */
+    const char *scan = getenv("REIMU_PNS_SCAN_OUT");
+    data = read_file(scan ? scan : SCAN_JSON, MAX_TEXT, &len);
     /* scan.json is produced by our own parser; trust but sanity check */
     if (data && len && data[0] == '{') buf_add(&b, data, len);
     else buf_str(&b, "null");
@@ -399,6 +705,7 @@ static int run_daemon(void)
         fprintf(stderr, "can't connect to system bus: %s\n", strerror(-r));
         return 1;
     }
+    g_bus = bus;
     r = sd_bus_add_object_vtable(bus, &slot, "/xyz/openbmc_project/reimu/pns", "xyz.openbmc_project.Reimu.Pns",
                                  pns_vtable, NULL);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
@@ -431,6 +738,17 @@ int main(int argc, char **argv)
         free(b.s);
         return rv;
     }
+    if (argc == 3 && !strcmp(argv[1], "--fru"))
+    {
+        int fd = open(argv[2], O_RDONLY);
+        char *x = fd >= 0 ? fru_xml_from_fd(fd) : NULL;
+        if (fd >= 0) close(fd);
+        if (x) fputs(x, stdout);
+        else fprintf(stderr, "%s: not a valid FRU image\n", argv[2]);
+        int rv = x ? 0 : 1;
+        free(x);
+        return rv;
+    }
     if (argc == 2 && !strcmp(argv[1], "--json"))
     {
         char *j = build_json();
@@ -443,7 +761,8 @@ int main(int argc, char **argv)
 #endif
     fprintf(stderr, "Usage: %s                    run D-Bus service\n"
                     "       %s --parse <flash>    print ПНС flash partition table as JSON\n"
+                    "       %s --fru <eeprom>     print FRU ID EEPROM image as XML\n"
                     "       %s --json             print the D-Bus JSON document\n",
-            argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }
