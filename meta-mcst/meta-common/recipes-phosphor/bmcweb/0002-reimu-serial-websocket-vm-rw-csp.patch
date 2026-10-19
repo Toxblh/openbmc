@@ -1,0 +1,461 @@
+diff --git a/http/timer_queue.hpp b/http/timer_queue.hpp
+index 24a4ab4c..dc9168ce 100644
+--- a/http/timer_queue.hpp
++++ b/http/timer_queue.hpp
+@@ -15,7 +15,12 @@ constexpr const size_t timerQueueTimeoutSeconds = 5;
+ namespace detail
+ {
+ 
+-constexpr const size_t maxSize = 100;
++// Canceled timers are only released from the head of the queue, so a burst
++// of requests (a modern web UI loading its modules and Redfish resources in
++// parallel) easily fills a small queue; when it is full, Connection closes
++// the socket immediately, even in the middle of the TLS handshake.
++// 4096 entries cost ~100 KiB and keep bursts of hundreds of requests safe.
++constexpr const size_t maxSize = 4096;
+ // fast timer queue for fixed tick value.
+ class TimerQueue
+ {
+diff --git a/include/reimu_serial.hpp b/include/reimu_serial.hpp
+new file mode 100644
+index 00000000..e42e8827
+--- /dev/null
++++ b/include/reimu_serial.hpp
+@@ -0,0 +1,185 @@
++#pragma once
++#include <app.hpp>
++#include <async_resp.hpp>
++#include <boost/asio/local/stream_protocol.hpp>
++#include <boost/container/flat_map.hpp>
++#include <websocket.hpp>
++
++#include <array>
++#include <memory>
++#include <string>
++
++namespace crow
++{
++namespace reimu_serial
++{
++
++// Relays a websocket to the reimu-serial daemon socket
++// /run/reimu-serial/port<N>.sock. Unlike /console0, every websocket gets its
++// own daemon connection, so each client receives the full timestamped history
++// on connect. The daemon speaks newline-delimited JSON; this relay is
++// protocol agnostic and just forwards the byte stream in both directions.
++class Relay : public std::enable_shared_from_this<Relay>
++{
++  public:
++    Relay(crow::websocket::Connection& connIn, const std::string& path) :
++        conn(connIn), sock(connIn.getIoContext()), endpoint(path)
++    {}
++
++    void start()
++    {
++        sock.async_connect(endpoint, [self(shared_from_this())](
++                                         const boost::system::error_code& ec) {
++            if (ec)
++            {
++                BMCWEB_LOG_ERROR << "reimu-serial: can't connect: " << ec;
++                self->closeConn("Serial port service is unavailable");
++                return;
++            }
++            self->connected = true;
++            self->doRead();
++            self->doWrite();
++        });
++    }
++
++    void send(const std::string& data)
++    {
++        // Don't let a misbehaving client grow the buffer without bound
++        if (inputBuffer.size() + data.size() > maxInput)
++        {
++            closeConn("Input overflow");
++            return;
++        }
++        inputBuffer += data;
++        doWrite();
++    }
++
++    void stop()
++    {
++        closed = true;
++        boost::system::error_code ec;
++        sock.close(ec);
++    }
++
++  private:
++    void closeConn(const std::string& reason)
++    {
++        if (!closed)
++        {
++            closed = true;
++            conn.close(reason);
++        }
++    }
++
++    void doRead()
++    {
++        sock.async_read_some(
++            boost::asio::buffer(outputBuffer.data(), outputBuffer.size()),
++            [self(shared_from_this())](const boost::system::error_code& ec,
++                                       std::size_t bytesRead) {
++                if (self->closed)
++                {
++                    return;
++                }
++                if (ec)
++                {
++                    BMCWEB_LOG_DEBUG << "reimu-serial: read failed: " << ec;
++                    self->closeConn("Serial port service closed connection");
++                    return;
++                }
++                self->conn.sendBinary(
++                    std::string_view(self->outputBuffer.data(), bytesRead));
++                self->doRead();
++            });
++    }
++
++    void doWrite()
++    {
++        if (!connected || doingWrite || inputBuffer.empty() || closed)
++        {
++            return;
++        }
++        doingWrite = true;
++        sock.async_write_some(
++            boost::asio::buffer(inputBuffer.data(), inputBuffer.size()),
++            [self(shared_from_this())](const boost::system::error_code& ec,
++                                       std::size_t bytesWritten) {
++                self->doingWrite = false;
++                if (self->closed)
++                {
++                    return;
++                }
++                if (ec)
++                {
++                    BMCWEB_LOG_ERROR << "reimu-serial: write failed: " << ec;
++                    self->closeConn("Error writing to serial port service");
++                    return;
++                }
++                self->inputBuffer.erase(0, bytesWritten);
++                self->doWrite();
++            });
++    }
++
++    static constexpr std::size_t maxInput = 1024 * 1024;
++
++    crow::websocket::Connection& conn;
++    boost::asio::local::stream_protocol::socket sock;
++    boost::asio::local::stream_protocol::endpoint endpoint;
++    std::array<char, 16384> outputBuffer{};
++    std::string inputBuffer;
++    bool connected = false;
++    bool doingWrite = false;
++    bool closed = false;
++};
++
++static boost::container::flat_map<crow::websocket::Connection*,
++                                  std::shared_ptr<Relay>>
++    relays;
++
++template <typename Rule>
++inline void setupRule(Rule& rule, int index)
++{
++    rule.privileges({"ConfigureComponents", "ConfigureManager"})
++        .websocket()
++        .onopen([index](crow::websocket::Connection& conn,
++                        const std::shared_ptr<bmcweb::AsyncResp>&) {
++            auto relay = std::make_shared<Relay>(
++                conn,
++                "/run/reimu-serial/port" + std::to_string(index) + ".sock");
++            relays[&conn] = relay;
++            relay->start();
++        })
++        .onclose([](crow::websocket::Connection& conn, const std::string&) {
++            auto it = relays.find(&conn);
++            if (it != relays.end())
++            {
++                it->second->stop();
++                relays.erase(it);
++            }
++        })
++        .onmessage([](crow::websocket::Connection& conn,
++                      const std::string& data, bool) {
++            auto it = relays.find(&conn);
++            if (it != relays.end())
++            {
++                it->second->send(data);
++            }
++        });
++}
++
++inline void requestRoutes(App& app)
++{
++    // Route paths must be compile time literals, so the (small) set of
++    // port indexes supported by reimu-serial is enumerated here.
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/0"), 0);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/1"), 1);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/2"), 2);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/3"), 3);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/4"), 4);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/5"), 5);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/6"), 6);
++    setupRule(BMCWEB_ROUTE(app, "/reimu/serial/7"), 7);
++}
++
++} // namespace reimu_serial
++} // namespace crow
+diff --git a/include/security_headers.hpp b/include/security_headers.hpp
+index e3c472e5..e741c6e7 100644
+--- a/include/security_headers.hpp
++++ b/include/security_headers.hpp
+@@ -25,10 +25,12 @@ inline void addSecurityHeaders(const crow::Request& req [[maybe_unused]],
+ 
+     if (bmcwebInsecureDisableXssPrevention)
+     {
++        // style-src allows inline styles: the terminal emulator (xterm.js)
++        // of the REIMU web UI injects its theme as <style> elements.
+         res.addHeader("Content-Security-Policy", "default-src 'none'; "
+                                                  "img-src 'self' data:; "
+                                                  "font-src 'self'; "
+-                                                 "style-src 'self'; "
++                                                 "style-src 'self' 'unsafe-inline'; "
+                                                  "script-src 'self'; "
+                                                  "connect-src 'self' wss:");
+         // The KVM currently needs to load images from base64 encoded
+@@ -40,9 +42,9 @@ inline void addSecurityHeaders(const crow::Request& req [[maybe_unused]],
+         // If XSS is disabled, we need to allow loading from addresses other
+         // than self, as the BMC will be hosted elsewhere.
+         res.addHeader("Content-Security-Policy", "default-src 'none'; "
+-                                                 "img-src *; "
++                                                 "img-src * data:; "
+                                                  "font-src *; "
+-                                                 "style-src *; "
++                                                 "style-src * 'unsafe-inline'; "
+                                                  "script-src *; "
+                                                  "connect-src *");
+ 
+diff --git a/include/vm_websocket.hpp b/include/vm_websocket.hpp
+index a175f0a8..139a19e0 100644
+--- a/include/vm_websocket.hpp
++++ b/include/vm_websocket.hpp
+@@ -1,10 +1,12 @@
+ #pragma once
+ 
+ #include <app.hpp>
++#include <boost/beast/core/flat_buffer.hpp>
+ #include <boost/beast/core/flat_static_buffer.hpp>
+ #include <boost/process.hpp>
+ #include <websocket.hpp>
+ 
++#include <array>
+ #include <csignal>
+ 
+ namespace crow
+@@ -12,20 +14,22 @@ namespace crow
+ namespace obmc_vm
+ {
+ 
+-static crow::websocket::Connection* session = nullptr;
+ 
+ // The max network block device buffer size is 128kb plus 16bytes
+ // for the message header:
+ // https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md#simple-reply-message
+ static constexpr auto nbdBufferSize = 131088;
++static constexpr std::size_t maxInputBufferSize = 16 * 1024 * 1024;
+ 
+ class Handler : public std::enable_shared_from_this<Handler>
+ {
+   public:
+-    Handler(const std::string& mediaIn, boost::asio::io_context& ios) :
+-        pipeOut(ios), pipeIn(ios), media(mediaIn), doingWrite(false),
++    Handler(const std::string& mediaIn, boost::asio::io_context& ios,
++            crow::websocket::Connection*& sessionIn) :
++        pipeOut(ios),
++        pipeIn(ios), media(mediaIn), doingWrite(false), session(sessionIn),
+         outputBuffer(new boost::beast::flat_static_buffer<nbdBufferSize>),
+-        inputBuffer(new boost::beast::flat_static_buffer<nbdBufferSize>)
++        inputBuffer(new boost::beast::flat_buffer(maxInputBufferSize))
+     {}
+ 
+     ~Handler() = default;
+@@ -144,60 +148,79 @@ class Handler : public std::enable_shared_from_this<Handler>
+     boost::process::child proxy;
+     std::string media;
+     bool doingWrite;
++    crow::websocket::Connection*& session;
+ 
+     std::unique_ptr<boost::beast::flat_static_buffer<nbdBufferSize>>
+         outputBuffer;
+-    std::unique_ptr<boost::beast::flat_static_buffer<nbdBufferSize>>
+-        inputBuffer;
++    // The browser may answer several pipelined NBD requests (up to 128 KiB
++    // each) before the proxy drains the pipe, so the input side must be able
++    // to hold more than one message.
++    std::unique_ptr<boost::beast::flat_buffer> inputBuffer;
+ };
+ 
+-static std::shared_ptr<Handler> handler;
++struct Media
++{
++    crow::websocket::Connection* session = nullptr;
++    std::shared_ptr<Handler> handler;
++};
+ 
+-inline void requestRoutes(App& app)
++// /vm/0/0 - removable disk (read-write when the browser allows it),
++// /vm/0/1 - CD-ROM; the index selects nbd-proxy configuration
++static std::array<Media, 2> medias;
++
++template <typename Rule>
++inline void setupRule(Rule& rule, std::size_t index)
+ {
+-    BMCWEB_ROUTE(app, "/vm/0/0")
+-        .privileges({"ConfigureComponents", "ConfigureManager"})
++    rule.privileges({"ConfigureComponents", "ConfigureManager"})
+         .websocket()
+-        .onopen([](crow::websocket::Connection& conn,
+-                   const std::shared_ptr<bmcweb::AsyncResp>&) {
++        .onopen([index](crow::websocket::Connection& conn,
++                        const std::shared_ptr<bmcweb::AsyncResp>&) {
+             BMCWEB_LOG_DEBUG << "Connection " << &conn << " opened";
++            Media& m = medias[index];
+ 
+-            if (session != nullptr)
++            if (m.session != nullptr)
+             {
+                 conn.close("Session already connected");
+                 return;
+             }
+ 
+-            if (handler != nullptr)
++            if (m.handler != nullptr)
+             {
+                 conn.close("Handler already running");
+                 return;
+             }
+ 
+-            session = &conn;
++            m.session = &conn;
+ 
+-            // media is the last digit of the endpoint /vm/0/0. A future
+-            // enhancement can include supporting different endpoint values.
+-            const char* media = "0";
+-            handler = std::make_shared<Handler>(media, conn.getIoContext());
+-            handler->connect();
++            // media is the last digit of the endpoint /vm/0/<media>
++            m.handler = std::make_shared<Handler>(
++                std::to_string(index), conn.getIoContext(), m.session);
++            m.handler->connect();
+         })
+-        .onclose([](crow::websocket::Connection& conn,
+-                    const std::string& /*reason*/) {
+-            if (&conn != session)
++        .onclose([index](crow::websocket::Connection& conn,
++                         const std::string& /*reason*/) {
++            Media& m = medias[index];
++            if (&conn != m.session)
+             {
+                 return;
+             }
+ 
+-            session = nullptr;
+-            handler->doClose();
+-            handler->inputBuffer->clear();
+-            handler->outputBuffer->clear();
+-            handler.reset();
++            m.session = nullptr;
++            m.handler->doClose();
++            m.handler->inputBuffer->clear();
++            m.handler->outputBuffer->clear();
++            m.handler.reset();
+         })
+-        .onmessage([](crow::websocket::Connection& conn,
+-                      const std::string& data, bool) {
+-            if (data.length() > handler->inputBuffer->capacity())
++        .onmessage([index](crow::websocket::Connection& conn,
++                           const std::string& data, bool) {
++            Media& m = medias[index];
++            if (m.handler == nullptr)
++            {
++                return;
++            }
++            std::size_t avail = m.handler->inputBuffer->max_size() -
++                                m.handler->inputBuffer->size();
++            if (data.length() > avail)
+             {
+                 BMCWEB_LOG_ERROR << "Buffer overrun when writing "
+                                  << data.length() << " bytes";
+@@ -205,12 +228,19 @@ inline void requestRoutes(App& app)
+                 return;
+             }
+ 
+-            boost::asio::buffer_copy(handler->inputBuffer->prepare(data.size()),
+-                                     boost::asio::buffer(data));
+-            handler->inputBuffer->commit(data.size());
+-            handler->doWrite();
++            boost::asio::buffer_copy(
++                m.handler->inputBuffer->prepare(data.size()),
++                boost::asio::buffer(data));
++            m.handler->inputBuffer->commit(data.size());
++            m.handler->doWrite();
+         });
+ }
+ 
++inline void requestRoutes(App& app)
++{
++    setupRule(BMCWEB_ROUTE(app, "/vm/0/0"), 0);
++    setupRule(BMCWEB_ROUTE(app, "/vm/0/1"), 1);
++}
++
+ } // namespace obmc_vm
+ } // namespace crow
+diff --git a/meson.build b/meson.build
+index 35f4f1dc..6fdb7820 100644
+--- a/meson.build
++++ b/meson.build
+@@ -60,6 +60,7 @@ feature_map = {
+ 'insecure-disable-csrf'           : '-DBMCWEB_INSECURE_DISABLE_CSRF_PREVENTION',
+ 'insecure-disable-ssl'            : '-DBMCWEB_INSECURE_DISABLE_SSL',
+ 'host-serial-socket'              : '-DBMCWEB_ENABLE_HOST_SERIAL_WEBSOCKET',
++'reimu-serial-socket'             : '-DBMCWEB_ENABLE_REIMU_SERIAL_WEBSOCKET',
+ 'ibm-management-console'          : '-DBMCWEB_ENABLE_IBM_MANAGEMENT_CONSOLE',
+ 'kvm'                             : '-DBMCWEB_ENABLE_KVM' ,
+ 'basic-auth'                      : '-DBMCWEB_ENABLE_BASIC_AUTHENTICATION',
+diff --git a/meson_options.txt b/meson_options.txt
+index 1298b968..70a12752 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -7,6 +7,7 @@ option('vm-nbdproxy', type: 'feature', value : 'disabled', description : 'Enable
+ option('rest', type : 'feature', value : 'enabled', description : '''Enable Phosphor REST (D-Bus) APIs. Paths directly map Phosphor D-Bus object paths, for example, \'/xyz/openbmc_project/logging/entry/enumerate\'. See https://github.com/openbmc/docs/blob/master/rest-api.md.''')
+ option('redfish', type : 'feature',value : 'enabled', description: 'Enable Redfish APIs.  Paths are under \'/redfish/v1/\'. See https://github.com/openbmc/bmcweb/blob/master/DEVELOPING.md#redfish.')
+ option('host-serial-socket', type : 'feature', value : 'enabled', description : 'Enable host serial console WebSocket. Path is \'/console0\'.  See https://github.com/openbmc/docs/blob/master/console.md.')
++option('reimu-serial-socket', type : 'feature', value : 'enabled', description : 'Enable REIMU serial ports WebSocket with timestamped history. Paths are \'/reimu/serial/<N>\', see reimu-serial daemon.')
+ option('static-hosting', type : 'feature', value : 'enabled', description : 'Enable serving files from the \'/usr/share/www\' directory as paths under \'/\'.')
+ option('redfish-bmc-journal', type : 'feature', value : 'disabled', description : 'Enable BMC journal access through Redfish. Paths are under \'/redfish/v1/Managers/bmc/LogServices/Journal\'.')
+ option('redfish-raw-peci', type : 'feature', value : 'disabled', description : '''Enable PECI transactions through Redfish. Paths are under \/redfish/v1/Systems/system/LogServices/CpuLog/Actions/Oem/CpuLog.SendRawPeci\'.''')
+diff --git a/src/webserver_main.cpp b/src/webserver_main.cpp
+index 014c2ff4..36433fde 100644
+--- a/src/webserver_main.cpp
++++ b/src/webserver_main.cpp
+@@ -14,6 +14,7 @@
+ #include <openbmc_dbus_rest.hpp>
+ #include <redfish.hpp>
+ #include <redfish_v1.hpp>
++#include <reimu_serial.hpp>
+ #include <sdbusplus/asio/connection.hpp>
+ #include <sdbusplus/bus.hpp>
+ #include <sdbusplus/server.hpp>
+@@ -95,6 +96,10 @@ int main(int /*argc*/, char** /*argv*/)
+     crow::obmc_vm::requestRoutes(app);
+ #endif
+ 
++#ifdef BMCWEB_ENABLE_REIMU_SERIAL_WEBSOCKET
++    crow::reimu_serial::requestRoutes(app);
++#endif
++
+ #ifdef BMCWEB_ENABLE_IBM_MANAGEMENT_CONSOLE
+     crow::ibm_mc::requestRoutes(app);
+     crow::ibm_mc_lock::Lock::getInstance();
