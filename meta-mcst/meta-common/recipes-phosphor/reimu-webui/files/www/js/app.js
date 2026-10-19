@@ -7,7 +7,7 @@ const pages = {
   media: () => import("./pages/media.js"),
   sensors: () => import("./pages/sensors.js"),
   hardware: () => import("./pages/hardware.js"),
-  logs: () => import("./pages/logs.js"),
+  logs: () => import("./pages/journal.js"),
   settings: () => import("./pages/settings.js"),
 };
 
@@ -88,6 +88,7 @@ async function doRoute() {
   const name = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] || "overview").toLowerCase();
   const key = pages[name] ? name : "overview";
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === key));
+  $("page").querySelectorAll(".load-error").forEach((e) => e.remove());
 
   if (state.current && state.current !== key) {
     const cur = state.mounted[state.current];
@@ -106,10 +107,21 @@ async function doRoute() {
   const pageRoot = $("page");
   let entry = state.mounted[key];
   if (!entry) {
-    const mod = await pages[key]();
     const el = document.createElement("div");
     el.className = "page-view";
     pageRoot.append(el);
+    let mod;
+    try {
+      mod = await pages[key]();
+    } catch (e) {
+      // not kept in state.mounted: the next navigation retries the import
+      el.className = "page-view load-error";
+      el.textContent =
+        `Не удалось загрузить страницу: ${e.message}. ` +
+        "Если в консоли браузера ERR_BLOCKED_BY_CLIENT, файл блокирует расширение (блокировщик рекламы): отключите его для этого адреса.";
+      state.current = null;
+      return;
+    }
     entry = state.mounted[key] = { mod, el };
     try {
       await mod.mount(el);

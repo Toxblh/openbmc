@@ -3,7 +3,7 @@
 
 import { h, toast, fmtTime } from "../api.js";
 import { SerialClient, keyToBytes } from "../lib/serial-client.js";
-import { LogView } from "../lib/logview.js";
+import { LogView } from "../lib/lineview.js";
 
 export const fill = true;
 
