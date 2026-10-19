@@ -1,0 +1,12 @@
+[Unit]
+Description=REIMU host boot firmware (PNS) information service
+After=mcst-fruid.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Reimu.Pns
+ExecStart=/usr/sbin/reimu-pnsd
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
