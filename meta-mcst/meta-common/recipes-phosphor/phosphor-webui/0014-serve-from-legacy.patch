@@ -1,0 +1,15 @@
+The REIMU web UI (reimu-webui) is served from /, the classic phosphor-webui
+is kept available at /legacy/.
+
+diff -ru a/webpack.config.js b/webpack.config.js
+--- a/webpack.config.js
++++ b/webpack.config.js
+@@ -46,7 +46,7 @@
+ 
+     // Output path from the view of the page
+     // Uses webpack-dev-server in development
+-    publicPath: '/',
++    publicPath: '/legacy/',
+ 
+     // Filename for entry points
+     // Only adds hash in build mode

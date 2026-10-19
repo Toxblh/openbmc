@@ -39,4 +39,11 @@ OBMC_IMAGE_EXTRA_INSTALL_append += " \
   hwmon-instantiator \
   phosphor-sel-logger \
   rtcread \
+  reimu-webui \
+  reimu-pns \
   "
+
+# Platform COM ports are owned by reimu-serial, which also serves the
+# obmc-console socket (bmcweb /console0), so obmc-console-server must not
+# grab the same UART.
+IMAGE_FEATURES_remove = "obmc-console"

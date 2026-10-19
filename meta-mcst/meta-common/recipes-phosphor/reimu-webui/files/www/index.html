@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>REIMU</title>
+  <link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/reimu.css">
+  <link rel="stylesheet" href="vendor/xterm/xterm.css">
+  <script src="vendor/xterm/xterm.js"></script>
+  <script src="vendor/xterm/addon-fit.js"></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <div id="login" class="login hidden">
+    <form id="login-form" class="login-box" autocomplete="on">
+      <div class="login-logo"><img src="img/favicon.svg" alt=""><span>REIMU</span></div>
+      <div class="login-host" id="login-host"></div>
+      <label>Пользователь<input id="login-user" name="username" autocomplete="username" value="root" required></label>
+      <label>Пароль<input id="login-pass" name="password" type="password" autocomplete="current-password" required></label>
+      <div id="login-error" class="error-text"></div>
+      <button type="submit" class="btn primary wide">Войти</button>
+      <a class="muted small" href="legacy/">Старый интерфейс</a>
+    </form>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <a class="brand" href="#/"><img src="img/favicon.svg" alt=""><span>REIMU</span></a>
+      <nav class="nav" id="nav">
+        <a href="#/" data-page="overview">Обзор</a>
+        <a href="#/kvm" data-page="kvm">KVM</a>
+        <a href="#/console" data-page="console">Консоль</a>
+        <a href="#/media" data-page="media">Носители</a>
+        <a href="#/sensors" data-page="sensors">Датчики</a>
+        <a href="#/hardware" data-page="hardware">Оборудование</a>
+        <a href="#/logs" data-page="logs">Журнал</a>
+        <a href="#/settings" data-page="settings">Настройки</a>
+      </nav>
+      <div class="topbar-right">
+        <div class="power-chip" id="power-chip" title="Состояние питания платформы">
+          <span class="led" id="power-led"></span><span id="power-text">…</span>
+        </div>
+        <div class="dropdown">
+          <button class="btn" id="power-menu-btn" aria-haspopup="true">Питание ▾</button>
+          <div class="dropdown-menu" id="power-menu">
+            <button data-reset="On">Включить</button>
+            <button data-reset="GracefulShutdown">Выключить (ACPI)</button>
+            <button data-reset="ForceOff" class="danger">Выключить принудительно</button>
+            <button data-reset="GracefulRestart">Перезагрузить (ACPI)</button>
+            <button data-reset="ForceRestart" class="danger">Сброс (RESET)</button>
+          </div>
+        </div>
+        <div class="dropdown">
+          <button class="btn ghost" id="user-btn">root ▾</button>
+          <div class="dropdown-menu right">
+            <a href="legacy/">Старый интерфейс</a>
+            <button id="logout-btn">Выйти</button>
+          </div>
+        </div>
+      </div>
+    </header>
+    <main id="page" class="page"></main>
+    <div id="toasts" class="toasts"></div>
+  </div>
+</body>
+</html>

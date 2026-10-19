@@ -13,4 +13,12 @@ SRC_URI += " \
              file://0011-show-percents-in-sensors.patch \
              file://0012-event-log-from-menu.patch \
              file://0013-separate-hi-and-lo-alarms.patch \
+             file://0014-serve-from-legacy.patch \
            "
+
+# The REIMU web UI (reimu-webui) owns /usr/share/www; the classic UI moves
+# to /usr/share/www/legacy (served at https://<bmc>/legacy/).
+do_install_append() {
+    install -d ${D}${datadir}/www/legacy
+    find ${D}${datadir}/www -mindepth 1 -maxdepth 1 ! -name legacy -exec mv {} ${D}${datadir}/www/legacy/ \;
+}
