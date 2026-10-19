@@ -1,5 +1,7 @@
 #!/bin/bash
 
-[ -f /etc/sol.conf ] && . /etc/sol.conf
-[ "$SOL_LOGPATH" ] && SOL_LOGPATH="-C $SOL_LOGPATH"
-/usr/bin/tmux new-session -d -s SoL /usr/bin/minicom -D /dev/ttyS0 $SOL_LOGPATH -c on -8 -R utf8
+# The platform COM port is owned by reimu-serial (history with timestamps,
+# web console, raw log in /var/log/sol.log); minicom attaches to its pty.
+PTY=/run/reimu-serial/host.pty
+for i in $(seq 1 50); do [ -e $PTY ] && break; sleep 0.1; done
+/usr/bin/tmux new-session -d -s SoL /usr/bin/minicom -D $PTY -c on -8 -R utf8

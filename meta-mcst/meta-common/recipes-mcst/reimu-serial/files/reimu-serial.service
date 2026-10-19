@@ -1,0 +1,11 @@
+[Unit]
+Description=REIMU serial ports with timestamped history (SoL)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/sbin/reimu-serial
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

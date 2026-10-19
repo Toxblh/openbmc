@@ -1,6 +1,7 @@
 [Unit]
 Description=Serial over SSH by tmux with minicom
-After=network.target network-online.target remote-fs.target
+After=network.target network-online.target remote-fs.target reimu-serial.service
+Requires=reimu-serial.service
 
 [Service]
 ExecStart=/libexec/start-tmux

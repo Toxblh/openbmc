@@ -9,7 +9,7 @@ inherit systemd
 inherit features_check
 
 REQUIRED_DISTRO_FEATURES = "systemd"
-RDEPENDS_${PN} += "systemd bash minicom tmux logrotate"
+RDEPENDS_${PN} += "systemd bash minicom tmux logrotate reimu-serial"
 SYSTEMD_SERVICE_${PN} = "tmux-logger.service logrotate-sol.service logrotate-sol.timer"
 
 SRC_URI = "file://sol.conf \
