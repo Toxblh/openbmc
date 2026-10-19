@@ -1,7 +1,7 @@
 FILESEXTRAPATHS_prepend := "${THISDIR}/files:"
 
 SRC_URI += "file://reimu_state_hook file://config.json \
-            file://0001-nbd-proxy-disable-nbd-client-netlink-support.patch \
+            file://0001-nbd-proxy-disable-nbd-client-netlink-when-supported.patch \
            "
 
 NBD_PROXY_CONFIG_JSON = "${WORKDIR}/config.json"

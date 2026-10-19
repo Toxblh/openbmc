@@ -1,0 +1,80 @@
+From: Toxblh <toxblh@gmail.com>
+Subject: [PATCH] nbd-proxy: disable nbd-client netlink when it has netlink
+
+Based on jsnbd cfa074b ("nbd-proxy: Disable nbd-client's netlink
+support"), which always passes -L: nbd-client built with netlink exits
+right after setting up the device and nbd-proxy takes that for a lost
+connection.
+
+REIMU's nbd 3.20 is built without libnl, so its nbd-client has no -L
+and fails with "no information specified" (rc 1): the virtual media never
+connected. Pass -L only when "nbd-client -h" mentions -nonetlink, which
+keeps netlink builds (Ubuntu's nbd-client in the test VM) working too.
+
+Upstream-Status: Inappropriate [REIMU: 2021 nbd without netlink]
+---
+diff --git a/nbd-proxy.c b/nbd-proxy.c
+index bffe1f9..0ce57bd 100644
+--- a/nbd-proxy.c
++++ b/nbd-proxy.c
+@@ -126,8 +126,32 @@ err_free:
+ 	return -1;
+ }
+ 
++/*
++ * nbd-client built with netlink exits right after setting up the device,
++ * which nbd-proxy takes for a lost connection; -L (-nonetlink) keeps it on
++ * the ioctl interface. Builds without netlink (REIMU's nbd 3.20 has no
++ * libnl) don't know the option and fail on it, so pass it only when the
++ * usage text mentions it.
++ */
++static bool nbd_client_has_netlink(void)
++{
++	char line[256];
++	bool found = false;
++	FILE *f = popen("nbd-client -h 2>&1", "r");
++
++	if (!f)
++		return false;
++	while (fgets(line, sizeof(line), f))
++		if (strstr(line, "-nonetlink"))
++			found = true;
++	pclose(f);
++	return found;
++}
++
+ static int start_nbd_client(struct ctx *ctx)
+ {
++	bool nonetlink = nbd_client_has_netlink();
++
+ 	pid_t pid;
+ 
+ 	pid = fork();
+@@ -153,12 +177,21 @@ static int start_nbd_client(struct ctx *ctx)
+ 		dup2(fd, STDERR_FILENO);
+ 		close(fd);
+ 
+-		execlp("nbd-client", "nbd-client",
+-				"-u", ctx->sock_path,
+-				"-n",
+-				"-t", timeout_str,
+-				ctx->config->nbd_device,
+-				NULL);
++		if (nonetlink)
++			execlp("nbd-client", "nbd-client",
++					"-u", ctx->sock_path,
++					"-n",
++					"-L",
++					"-t", timeout_str,
++					ctx->config->nbd_device,
++					NULL);
++		else
++			execlp("nbd-client", "nbd-client",
++					"-u", ctx->sock_path,
++					"-n",
++					"-t", timeout_str,
++					ctx->config->nbd_device,
++					NULL);
+ 		err(EXIT_FAILURE, "can't start ndb client");
+ 	}
+ 
