@@ -65,6 +65,16 @@ which upstream bmcweb later changed the same way.
 
 ## Run on the BMC
 
+From a workstation (macOS or Linux, OpenSSH 8.4+), with the devkit tarball
+saved as `reimu-webdev.tar.gz` next to the script:
+
+    reimu-webdev-run.sh BMC [LOGIN [PASSWORD]]           # root / 0penBmc by default
+    reimu-webdev-run.sh BMC [LOGIN [PASSWORD]] --status
+    reimu-webdev-run.sh BMC [LOGIN [PASSWORD]] --stop
+
+It uploads the tarball to `/tmp` over one SSH connection, stops a devkit that
+is already running (an update) and starts the new one. By hand:
+
     scp /tmp/webdev/reimu-webdev-*.tar.gz root@BMC:/tmp/
     ssh root@BMC
     tar xzf /tmp/reimu-webdev-*.tar.gz -C /tmp
@@ -83,7 +93,9 @@ which upstream bmcweb later changed the same way.
    tmux-logger). SSH users keep a `tmux`/`minicom` session `SoL` on its pty,
    as with the new firmware.
 3. Adds the D-Bus policy of `reimu-pnsd` (a tmpfs copy of
-   `/etc/dbus-1/system.d`, bind mounted) and starts it.
+   `/etc/dbus-1/system.d`, bind mounted) and starts it. Its FRU copy and the
+   ПНС flash scan go to `/run/reimu-webdev` (`REIMU_FRU_CACHE`,
+   `REIMU_PNS_SCAN_OUT`), not to `/var/lib` on the flash.
 4. Restarts bmcweb and waits for `https://127.0.0.1/`. If it doesn't
    answer, all changes are rolled back.
 

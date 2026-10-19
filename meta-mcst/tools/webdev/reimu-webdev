@@ -56,6 +56,9 @@ web_ok()
 
 restart_bmcweb()
 {
+    # stop + start of a devkit (an update) restarts bmcweb twice within
+    # seconds: forget the earlier starts or systemd refuses (start-limit-hit)
+    systemctl reset-failed bmcweb.service bmcweb.socket 2>/dev/null
     systemctl stop bmcweb.service 2>/dev/null
     systemctl restart bmcweb.socket 2>/dev/null || systemctl restart bmcweb.service
 }
@@ -126,7 +129,7 @@ do_start()
         # Type=simple: reimu-pnsd requests its bus name itself (BusName= would
         # clash with a reimu-pnsd.service unit that has the same name)
         systemd-run -q --unit=reimu-webdev-pnsd -p Restart=on-failure --setenv=REIMU_PNS_SCAN="$D/libexec/reimu-pns-scan" \
-            --setenv=REIMU_PNSD="$D/bin/reimu-pnsd" "$D/bin/reimu-pnsd" ||
+            --setenv=REIMU_PNSD="$D/bin/reimu-pnsd" --setenv=REIMU_FRU_CACHE=$R/fru.xml --setenv=REIMU_PNS_SCAN_OUT=$R/scan.json "$D/bin/reimu-pnsd" ||
             log "WARNING: reimu-pnsd didn't start (ПНС page will be empty)"
 
         # SoL for SSH users, like the new tmux-logger
@@ -143,7 +146,7 @@ do_start()
         exit 1
     fi
     trap - EXIT
-    log "running $(cat "$D/VERSION")$([ $webonly = 1 ] && echo ' (web UI only)'): https://$(hostname -i 2>/dev/null | cut -d' ' -f1 || hostname)/"
+    log "running $(cat "$D/VERSION")$([ $webonly = 1 ] && echo ' (web UI only)'): https://$(ip -4 addr show 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -1)/"
     log "back to the stock firmware: $D/reimu-webdev stop (or reboot the BMC)"
 }
 
