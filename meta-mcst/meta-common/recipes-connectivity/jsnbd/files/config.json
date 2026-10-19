@@ -1,0 +1,17 @@
+{
+    "timeout": 30,
+    "configurations": {
+        "0": {
+            "nbd-device": "/dev/nbd0",
+            "metadata": {
+                "description": "Virtual disk (read-write capable)"
+            }
+        },
+        "1": {
+            "nbd-device": "/dev/nbd1",
+            "metadata": {
+                "description": "Virtual CD-ROM"
+            }
+        }
+    }
+}

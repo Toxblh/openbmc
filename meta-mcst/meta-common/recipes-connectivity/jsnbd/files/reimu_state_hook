@@ -1,0 +1,107 @@
+#!/bin/sh
+# nbd-proxy state hook for REIMU virtual media.
+#
+# Usage: state <start|stop> <config>
+#   config 0 - removable USB disk on /dev/nbd0. It is exported read-write
+#              when the browser offers a writable image (the NBD server in
+#              the browser doesn't set NBD_FLAG_READ_ONLY), read-only otherwise.
+#   config 1 - USB CD-ROM on /dev/nbd1, always read-only.
+
+if [ $# -ne 2 ]
+then
+    echo "usage: $0 <start|stop> <config>" >&2
+    exit 1
+fi
+
+action=$1
+config=$2
+
+case "$config" in
+0)
+    nbd=nbd0
+    cdrom=0
+    product="Virtual Disk"
+    ;;
+1)
+    nbd=nbd1
+    cdrom=1
+    product="Virtual CD-ROM"
+    ;;
+*)
+    echo "invalid config $config" >&2
+    exit 1
+    ;;
+esac
+
+gadget_dir=/sys/kernel/config/usb_gadget/mass-storage$config
+
+# Finds a USB device controller not bound to any gadget. On AST2500 these are
+# the virtual hub ports (1e6a0000.usb-vhub:pN); ports 4 and 5 are preferred
+# so that the KVM HID gadget keeps the lower ones. Any other UDC (e.g.
+# dummy_udc used for testing in QEMU) is accepted as a fallback.
+find_udc()
+{
+    used=" $(cat /sys/kernel/config/usb_gadget/*/UDC 2>/dev/null | tr '\n' ' ') "
+    for udc in 1e6a0000.usb-vhub:p4 1e6a0000.usb-vhub:p5 $(ls /sys/class/udc 2>/dev/null)
+    do
+        [ -e "/sys/class/udc/$udc" ] || continue
+        case "$used" in
+            *" $udc "*) continue ;;
+        esac
+        echo "$udc"
+        return 0
+    done
+    return 1
+}
+
+set -e
+
+case "$action" in
+start)
+    ro=1
+    if [ "$cdrom" = 0 ] && [ "$(cat /sys/block/$nbd/ro 2>/dev/null)" = 0 ]
+    then
+        ro=0
+    fi
+    udc=$(find_udc) || { echo "no free USB device controller" >&2; exit 1; }
+
+    mkdir -p $gadget_dir
+    cd $gadget_dir
+    # http://www.linux-usb.org/usb.ids
+    #    |-> 1d6b  Linux Foundation
+    #          |-> 0104  Multifunction Composite Gadget
+    echo "0x1d6b" > idVendor
+    echo "0x0104" > idProduct
+    mkdir -p strings/0x409
+    echo "OpenBMC" > strings/0x409/manufacturer
+    echo "$product" > strings/0x409/product
+    echo "REIMU$config" > strings/0x409/serialnumber
+    mkdir -p configs/c.1/strings/0x409
+    echo "config 1" > configs/c.1/strings/0x409/configuration
+    mkdir -p functions/mass_storage.usb0
+    ln -s functions/mass_storage.usb0 configs/c.1
+    echo 1 > functions/mass_storage.usb0/lun.0/removable
+    echo $ro > functions/mass_storage.usb0/lun.0/ro
+    echo $cdrom > functions/mass_storage.usb0/lun.0/cdrom
+    echo /dev/$nbd > functions/mass_storage.usb0/lun.0/file
+    echo "$udc" > UDC
+    echo "virtual media $config: /dev/$nbd on $udc, ro=$ro cdrom=$cdrom" >&2
+    ;;
+stop)
+    [ -d $gadget_dir ] || exit 0
+    cd $gadget_dir
+    echo "" > UDC 2>/dev/null || true
+    rm -f configs/c.1/mass_storage.usb0
+    rmdir functions/mass_storage.usb0
+    rmdir configs/c.1/strings/0x409
+    rmdir configs/c.1
+    rmdir strings/0x409
+    cd /
+    rmdir $gadget_dir
+    ;;
+*)
+    echo "invalid action $action" >&2
+    exit 1
+esac
+
+exit 0
