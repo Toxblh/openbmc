@@ -16,7 +16,7 @@ let active = null;
 let prefs;
 
 function loadPrefs() {
-  const def = { mode: "log", tz: "local", eol: "CR", date: true, active: 0 };
+  const def = { mode: "log", tz: "local", eol: "CR", date: true, active: 0, fontSize: 14, bs: "bs" };
   try {
     return Object.assign(def, JSON.parse(localStorage.getItem("reimu-console") || "{}"));
   } catch (e) {
@@ -29,6 +29,103 @@ function savePrefs() {
   } catch (e) {
     /* ignore */
   }
+}
+
+// Terminal font. Nothing is shipped in the firmware (a Nerd Font is 1-2.5 MB
+// per face): the stack prefers a Nerd Font installed on the viewer's
+// computer, and a font file the viewer picks is kept in this browser's
+// IndexedDB, never on the BMC.
+const USER_FONT = "REIMU user font";
+const FONT_STACK =
+  '"JetBrainsMono Nerd Font Mono", "JetBrainsMono NFM", "JetBrainsMono Nerd Font", "JetBrains Mono", ' +
+  '"DejaVu Sans Mono", "Liberation Mono", Consolas, Menlo, monospace';
+let userFontName = null; // file name of the loaded user font
+
+function fontDb(mode, fn) {
+  return new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = indexedDB.open("reimu-console", 1);
+    } catch (e) {
+      return reject(e);
+    }
+    req.onupgradeneeded = () => req.result.createObjectStore("fonts");
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const tx = req.result.transaction("fonts", mode);
+      const r = fn(tx.objectStore("fonts"));
+      tx.oncomplete = () => resolve(r && r.result);
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+}
+
+async function applyUserFont(name, data) {
+  const face = new FontFace(USER_FONT, data);
+  await face.load();
+  document.fonts.add(face);
+  userFontName = name;
+}
+
+async function loadSavedFont() {
+  try {
+    const f = await fontDb("readonly", (st) => st.get("user"));
+    if (f && f.data) await applyUserFont(f.name, f.data);
+  } catch (e) {
+    /* no IndexedDB (private window) or a broken file: the stack is used */
+  }
+}
+
+function termFont() {
+  return userFontName ? `"${USER_FONT}", ${FONT_STACK}` : FONT_STACK;
+}
+
+// Firmware menus (ПНС/lintel, BIOS setup) erase only on ^H and ignore DEL,
+// which is what xterm.js sends; readline accepts both.
+const BS = () => (prefs.bs === "del" ? "\x7f" : "\b");
+
+function markBackspace() {
+  if (!root) return;
+  root.querySelector("#con-bs-bs").textContent = `${prefs.bs !== "del" ? "✓ " : ""}Backspace = ^H (BIOS, ПНС, большинство shell)`;
+  root.querySelector("#con-bs-del").textContent = `${prefs.bs === "del" ? "✓ " : ""}Backspace = ^? (DEL, как в xterm)`;
+}
+
+function applyFontToTerminals() {
+  ports.forEach((p) => {
+    if (!p.term) return;
+    p.term.options.fontFamily = termFont();
+    p.term.options.fontSize = prefs.fontSize;
+    if (!p.termWrap.classList.contains("hidden")) p.fit.fit();
+  });
+  if (root) root.querySelector("#con-font").title = `Шрифт терминала: ${userFontName || "системный (JetBrains Mono Nerd Font, если установлен)"}`;
+}
+
+async function pickFont() {
+  const input = h("input", { type: "file", accept: ".ttf,.otf,.woff,.woff2,font/*" });
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (file.size > 16 * 1024 * 1024) return toast("Файл шрифта больше 16 МБ", "err");
+    try {
+      const data = await file.arrayBuffer();
+      await applyUserFont(file.name, data);
+      await fontDb("readwrite", (st) => st.put({ name: file.name, data }, "user")).catch(() =>
+        toast("Шрифт применён, но браузер не дал его сохранить", "warn"),
+      );
+      applyFontToTerminals();
+      toast(`Шрифт терминала: ${file.name}`, "ok");
+    } catch (e) {
+      toast(`Не удалось загрузить шрифт: ${e.message || e}`, "err");
+    }
+  });
+  input.click();
+}
+
+async function resetFont() {
+  userFontName = null;
+  await fontDb("readwrite", (st) => st.delete("user")).catch(() => {});
+  applyFontToTerminals();
+  toast("Шрифт терминала: системный", "ok");
 }
 
 function tzValue(p) {
@@ -66,6 +163,21 @@ export async function mount(el) {
       h("button", { class: "btn small", id: "con-break", title: "Послать BREAK (SysRq на Linux)" }, "Break"),
       h("button", { class: "btn small", id: "con-download", title: "Скачать историю с метками времени" }, "Скачать"),
       h("button", { class: "btn small", id: "con-clear", title: "Очистить историю порта на BMC" }, "Очистить"),
+      h(
+        "div",
+        { class: "dropdown", id: "con-fontmenu" },
+        h("button", { class: "btn small", id: "con-font", title: "Шрифт терминала" }, "Терминал ▾"),
+        h(
+          "div",
+          { class: "dropdown-menu right" },
+          h("button", { "data-font": "pick" }, "Загрузить файл шрифта… (.ttf, .otf, .woff2)"),
+          h("button", { "data-font": "reset" }, "Системный (JetBrains Mono Nerd Font, если установлен)"),
+          h("button", { "data-font": "bigger" }, "Крупнее"),
+          h("button", { "data-font": "smaller" }, "Мельче"),
+          h("button", { "data-font": "bs", id: "con-bs-bs" }, "Backspace = ^H (BIOS, ПНС, большинство shell)"),
+          h("button", { "data-font": "del", id: "con-bs-del" }, "Backspace = ^? (DEL, как в xterm)"),
+        ),
+      ),
     ),
     h("div", { class: "console-body", id: "con-body" }),
     h(
@@ -113,6 +225,25 @@ export async function mount(el) {
   $("con-clear").addEventListener("click", () => {
     if (active && confirm(`Очистить историю порта «${active.title}» на BMC?`)) active.client.clearHistory();
   });
+  $("con-fontmenu").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-font]");
+    if (!b) return;
+    const a = b.dataset.font;
+    if (a === "pick") pickFont();
+    else if (a === "reset") resetFont();
+    else if (a === "bs" || a === "del") {
+      prefs.bs = a;
+      savePrefs();
+      markBackspace();
+    }
+    else {
+      prefs.fontSize = Math.max(9, Math.min(28, prefs.fontSize + (a === "bigger" ? 1 : -1)));
+      savePrefs();
+      applyFontToTerminals();
+    }
+  });
+  loadSavedFont().then(applyFontToTerminals);
+  markBackspace();
   $("con-download").addEventListener("click", () => {
     if (!active) return;
     const blob = new Blob([active.view.toText()], { type: "text/plain;charset=utf-8" });
@@ -179,7 +310,7 @@ function addPort(pi) {
   p.logWrap.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && window.getSelection().toString()) return; // copy
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return; // paste handled below
-    const seq = keyToBytes(e);
+    const seq = e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey ? BS() : keyToBytes(e);
     if (seq) {
       e.preventDefault();
       p.client.write(seq);
@@ -287,13 +418,21 @@ function createTerminal(p) {
     scrollback: p.client.maxLines || 20000,
     convertEol: false,
     cursorBlink: true,
-    fontFamily: "DejaVu Sans Mono, Liberation Mono, Consolas, monospace",
-    fontSize: 14,
+    fontFamily: termFont(),
+    fontSize: prefs.fontSize,
     theme: { background: "#111214", foreground: "#dcddde", cursor: "#5a8bb3" },
   });
   p.fit = new window.FitAddon.FitAddon();
   p.term.loadAddon(p.fit);
   p.term.open(p.termWrap);
+  p.term.attachCustomKeyEventHandler((e) => {
+    if (e.type === "keydown" && e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      p.client.write(BS());
+      e.preventDefault();
+      return false;
+    }
+    return true;
+  });
   p.term.onData((d) => p.client.write(d));
   p.term.onBinary((d) => p.client.write(Uint8Array.from(d, (c) => c.charCodeAt(0))));
   p.resizeObs = new ResizeObserver(() => !p.termWrap.classList.contains("hidden") && p.fit.fit());
