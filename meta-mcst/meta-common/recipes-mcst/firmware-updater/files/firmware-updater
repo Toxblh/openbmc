@@ -49,6 +49,15 @@ then
     fi
 fi
 
+# Reliable upgrade (boards with two BMC flash chips): keep the running image on
+# the backup chip and make the next boot confirm the new image, or fall back.
+guard_update()
+{
+    [ -x /usr/sbin/reimu-bootguard ] || return 0
+    echo "Preparing the backup flash chip (may take a few minutes)..."
+    /usr/sbin/reimu-bootguard prepare-update || error "Update refused by reimu-bootguard, see above."
+}
+
 # Upload the firmware to BMC filesystem
 DEST="/tmp/firmware"
 export WGET_PARAMS
@@ -105,6 +114,7 @@ then
     listimages full
 
     # Activate the desired image
+    guard_update
     echo -n "Activating image, ID 0x$IMAGEID..."
     busctl set-property xyz.openbmc_project.Software.BMC.Updater /xyz/openbmc_project/software/$IMAGEID xyz.openbmc_project.Software.Activation RequestedActivation s xyz.openbmc_project.Software.Activation.RequestedActivations.Active
     for SEC in `seq 1 30`
@@ -130,6 +140,7 @@ then
 fi
 
 # Non-DBus mode.
+guard_update
 # Note: we don't bother removing $DEST, since in case we need it, it's on /tmp and will vanish on reboot.
 cp /usr/bin/md5sum /usr/bin/pv /bin/dd /bin/sync /usr/bin/cut /bin/rm /bin/echo /libexec/firmware-updater.plain /libexec/libfirmware-updater /tmp
 mount / -o remount,ro

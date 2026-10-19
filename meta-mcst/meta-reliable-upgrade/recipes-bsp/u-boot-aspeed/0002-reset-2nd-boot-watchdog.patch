@@ -1,19 +1,41 @@
-diff a/board/aspeed/ast-g5/ast-g5.c b/board/aspeed/ast-g5/ast-g5.c
---- a/board/aspeed/ast-g5/ast-g5.c	2021-03-12 00:03:27.872730889 +0300
-+++ b/board/aspeed/ast-g5/ast-g5.c	2021-03-12 19:25:44.213767969 +0300
-@@ -58,6 +58,17 @@
+Reliable upgrade: arm WDT2 (2nd boot watchdog) for 300 s on every boot when
+the dual boot strap is set, so that reimu-bootguard confirms the boot from
+Linux; otherwise WDT2 restarts the board from the other BMC flash chip.
+Fixes the previous version, which tested register bits with '&&'.
+
+diff --git a/board/aspeed/ast-g5/ast-g5.c b/board/aspeed/ast-g5/ast-g5.c
+index 40944d60f0f..df0b5fa2854 100644
+--- a/board/aspeed/ast-g5/ast-g5.c
++++ b/board/aspeed/ast-g5/ast-g5.c
+@@ -11,6 +11,7 @@
+ #include <netdev.h>
+ 
+ #include <asm/arch/ast_scu.h>
++#include <asm/arch/regs-scu.h>
+ #include <asm/arch/ast-sdmc.h>
+ #include <asm/io.h>
+ 
+@@ -58,6 +59,25 @@ int board_init(void)
  	// Set RST_BTN# (P3) to 0
  	ast_gpio_set('p', 3, 0);
  
-+	int hwstrap    = (readl(AST_SCU_BASE  + 0x70) && 0x00020000) ? 1 : 0;
-+	int cs         = (readl(AST_WDT2_BASE + 0x10) && 0x00000002) ? 1 : 0;
-+	int wdcontinue = (getenv("wdcontinue") && getenv("wdcontinue")[0] == '1') ? 1 : 0;
-+
-+	if ((wdcontinue == 1) && (cs == 0) && (hwstrap == 1))
++	/*
++	 * Reliable upgrade (REIMU): with the "2nd boot by WDT2" hardware strap
++	 * the SoC boots from the other BMC flash chip when WDT2 expires. Give
++	 * Linux 300 seconds to come up; reimu-bootguard disarms WDT2 once the
++	 * system is healthy (and commits a pending update). If the image hangs
++	 * or is corrupt, WDT2 fires and the board starts from the other chip.
++	 */
++	if (readl(AST_SCU_BASE + 0x70) & SCU_HW_STRAP_2ND_BOOT_WDT)
 +	{
-+		printf("\n\n*** NOTE: don't forget to run `firmware-updater --commit` once Linux is booted normally!\n\n");
-+		/* Set WD2 timer to 300 seconds */
-+		writel(300000000, AST_WDT2_BASE + 0x04);
++		int secondary = (readl(AST_WDT2_BASE + 0x10) & 0x00000002) ? 1 : 0;
++		int pending   = (getenv("wdcontinue") && getenv("wdcontinue")[0] == '1') ? 1 : 0;
++
++		writel(300000000, AST_WDT2_BASE + 0x04); /* reload: 300 s at 1 MHz */
++		writel(0x4755, AST_WDT2_BASE + 0x08);    /* restart with the new value */
++		printf("WDT2:  armed for 300 s, booted from %s flash%s\n",
++		       secondary ? "BACKUP" : "primary",
++		       pending ? ", firmware update pending confirmation" : "");
 +	}
 +
  	writel(0x77744303, 0x1e78a0c4); // Set correct speed for I2C3

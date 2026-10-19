@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+
 
+/*
+ * Reliable upgrade: the second BMC flash chip holds a mirror of the first
+ * one (see reimu-bootguard). When the SoC boots from it after a WDT2
+ * timeout, the chips are swapped in hardware, so "bmc" is always the chip
+ * the system runs from and "bmc2" is the other one.
+ */
 &fmc {
 	flash@1 {
 		status = "okay";
@@ -7,4 +13,14 @@
 		label = "bmc2";
 		#include "openbmc-flash-layout-64-secondary.dtsi"
 	};
+};
+
+/*
+ * WDT2 is the "2nd boot" watchdog armed by U-Boot. aspeed_wdt would take it
+ * over (reprogram a 30 s timeout and keep pinging it from the kernel even if
+ * user space never comes up), defeating the fallback; reimu-bootguard
+ * disarms it from user space once the system is healthy.
+ */
+&wdt2 {
+	status = "disabled";
 };

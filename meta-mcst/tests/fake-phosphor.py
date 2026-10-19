@@ -10,7 +10,12 @@ Redfish code run in a VM without the ASPEED hardware.
 
 It is a test fixture only; it is not part of the firmware.
 """
+import hashlib
+import os
 import random
+import re
+import shutil
+import tarfile
 import time
 
 import dbus
@@ -141,7 +146,8 @@ def update_assoc():
 update_assoc()
 
 # mapper data for real services running in the VM
-REAL_SERVICES = {"/xyz/openbmc_project/reimu/pns": {"xyz.openbmc_project.Reimu.Pns": ["xyz.openbmc_project.Reimu.Pns", "org.freedesktop.DBus.Properties"]}}
+REAL_SERVICES = {"/xyz/openbmc_project/reimu/pns": {"xyz.openbmc_project.Reimu.Pns": ["xyz.openbmc_project.Reimu.Pns", "org.freedesktop.DBus.Properties"]},
+                 "/xyz/openbmc_project/reimu/firmware": {"xyz.openbmc_project.Reimu.Firmware": ["xyz.openbmc_project.Reimu.Firmware", "org.freedesktop.DBus.Properties"]}}
 
 NAMES = ["xyz.openbmc_project.State.Host", "xyz.openbmc_project.State.Chassis", "xyz.openbmc_project.State.BMC",
          "xyz.openbmc_project.Inventory.Manager", "xyz.openbmc_project.Hwmon-1.Hwmon1", "xyz.openbmc_project.Software.BMC.Updater",
@@ -198,11 +204,17 @@ class Fake(dbus.service.FallbackObject):
             raise dbus.exceptions.DBusException("unknown property", name="org.freedesktop.DBus.Error.UnknownProperty")
         cur[prop] = type(cur[prop])(value)
         self.PropertiesChanged(iface, {prop: cur[prop]}, [], path=path[1:])  # fallback at "/": relative path
+        if path.startswith("/xyz/openbmc_project/software/") and prop == "RequestedActivation" and str(value).endswith(".Active"):
+            GLib.timeout_add(300, activate_image, path)
         if path == HOST and prop == "RequestedHostTransition":
             GLib.timeout_add(1500, host_transition, str(value))
 
     @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as", rel_path_keyword="path")
     def PropertiesChanged(self, iface, changed, invalidated, path=None):
+        pass
+
+    @dbus.service.signal("org.freedesktop.DBus.ObjectManager", signature="oa{sa{sv}}", rel_path_keyword="path")
+    def InterfacesAdded(self, obj, ifaces, path=None):
         pass
 
     # ---- object manager (at "/") ----
@@ -311,6 +323,55 @@ def host_transition(req):
     return False
 
 
+# ---- static layout software updater (phosphor-image-updater) ----
+# bmcweb's UpdateService stores an uploaded tar in /tmp/images; the updater
+# unpacks it, publishes a Ready software object, and on activation copies the
+# image-* files to /run/initramfs, where the shutdown script flashes them.
+IMAGES, STAGE = "/tmp/images", "/run/initramfs"
+
+
+def scan_images():
+    os.makedirs(IMAGES, exist_ok=True)
+    for f in os.listdir(IMAGES):
+        p = os.path.join(IMAGES, f)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with tarfile.open(p) as t:
+                manifest = t.extractfile("MANIFEST").read().decode()
+                version = re.search(r"^version=(.*)$", manifest, re.M).group(1)
+                vid = hashlib.sha512(version.encode()).hexdigest()[:8]
+                t.extractall(os.path.join(IMAGES, vid))
+        except Exception as e:  # not an image: the real updater logs and drops it
+            print("bad image", f, e, flush=True)
+            os.unlink(p)
+            continue
+        os.unlink(p)
+        path = f"/xyz/openbmc_project/software/{vid}"
+        ifs = {"xyz.openbmc_project.Software.Version": {"Version": S(version), "Purpose": S("xyz.openbmc_project.Software.Version.VersionPurpose.BMC")},
+               "xyz.openbmc_project.Software.Activation": {"Activation": S("xyz.openbmc_project.Software.Activation.Activations.Ready"),
+                                                           "RequestedActivation": S("xyz.openbmc_project.Software.Activation.RequestedActivations.None")}}
+        add(path, ifs)
+        fake.InterfacesAdded(dbus.ObjectPath(path), dbus.Dictionary({i: dbus.Dictionary(v, signature="sv") for i, v in ifs.items()}, signature="sa{sv}"),
+                             path="xyz/openbmc_project/software")
+        print("image", version, "ready as", path, flush=True)
+    return True
+
+
+def activate_image(path):
+    vid = path.rsplit("/", 1)[1]
+    os.makedirs(STAGE, exist_ok=True)
+    src = os.path.join(IMAGES, vid)
+    for f in os.listdir(src):
+        if f.startswith("image-"):
+            shutil.copyfile(os.path.join(src, f), os.path.join(STAGE, f))
+    act = OBJ[path]["xyz.openbmc_project.Software.Activation"]
+    act["Activation"] = S("xyz.openbmc_project.Software.Activation.Activations.Active")
+    fake.PropertiesChanged("xyz.openbmc_project.Software.Activation", {"Activation": act["Activation"]}, [], path=path[1:])
+    print("image", vid, "staged in", STAGE, flush=True)
+    return False
+
+
 def jitter():
     for p, base, ifs, platform in SENSORS:
         if p in OBJ:
@@ -326,6 +387,7 @@ def main():
     names = [dbus.service.BusName(n, bus) for n in NAMES]  # noqa: F841 (keep names owned)
     fake = Fake(bus, "/")
     GLib.timeout_add(2000, jitter)
+    GLib.timeout_add(1000, scan_images)
     print("fake phosphor services ready", flush=True)
     GLib.MainLoop().run()
 

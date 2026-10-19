@@ -1,32 +1,37 @@
 // SPDX-License-Identifier: GPL-2.0+
 
+/*
+ * Same layout as the primary chip (mcst-reimu64-flash-layout.dtsi): the
+ * second chip is a byte-for-byte mirror of the first 48 MiB of the primary
+ * one, and the booted chip is always seen with the primary layout.
+ */
 partitions {
 	compatible = "fixed-partitions";
 	#address-cells = <1>;
 	#size-cells = <1>;
 
 	u-boot-sec@0 {
-		reg = <0x0 0x60000>; // 384KB
+		reg = <0x0 0xe0000>;
 		label = "u-boot-sec";
 	};
 
-	u-boot-env-sec@60000 {
-		reg = <0x60000 0x20000>; // 128KB
+	u-boot-env-sec@e0000 {
+		reg = <0xe0000 0x20000>;
 		label = "u-boot-env-sec";
 	};
 
-	kernel-sec@80000 {
-		reg = <0x80000 0x500000>; // 5MB
+	kernel-sec@100000 {
+		reg = <0x100000 0x580000>;
 		label = "kernel-sec";
 	};
 
-	rofs-sec@580000 {
-		reg = <0x580000 0x2a80000>; // 42.5MB
+	rofs-sec@680000 {
+		reg = <0x680000 0x2980000>;
 		label = "rofs-sec";
 	};
 
 	rwfs-sec@3000000 {
-		reg = <0x3000000 0x1000000>; // 16MB
+		reg = <0x3000000 0x1000000>;
 		label = "rwfs-sec";
 	};
 };

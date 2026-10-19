@@ -9,4 +9,8 @@ SRC_URI += " file://0001-create-logging-directory.patch file://0001-fix-power-co
 #  - larger timer queue: a burst of requests made bmcweb drop connections;
 #  - CSP allows inline styles (xterm.js) and data: images (noVNC cursor).
 SRC_URI += " file://0002-reimu-serial-websocket-vm-rw-csp.patch "
-EXTRA_OEMESON_append = " -Dreimu-serial-socket=enabled -Dvm-websocket=enabled"
+# firmware upload: wait up to 120 s (not 10) for the updater to accept the image
+SRC_URI += " file://0003-update-service-wait-for-image.patch "
+# firmware images (static 64 MiB layout, ~45 MB tar) are uploaded through
+# Redfish UpdateService in one request
+EXTRA_OEMESON_append = " -Dreimu-serial-socket=enabled -Dvm-websocket=enabled -Dhttp-body-limit=64"

@@ -1,0 +1,17 @@
+diff --git a/redfish-core/lib/update_service.hpp b/redfish-core/lib/update_service.hpp
+index 18b2db00..e0787e22 100644
+--- a/redfish-core/lib/update_service.hpp
++++ b/redfish-core/lib/update_service.hpp
+@@ -674,9 +674,10 @@ class UpdateService : public Node
+ 
+         std::shared_ptr<AsyncResp> asyncResp = std::make_shared<AsyncResp>(res);
+ 
+-        // Setup callback for when new software detected
++        // Setup callback for when new software detected. The BMC needs
++        // well over 10 seconds to unpack and verify a 64 MiB flash image.
+         monitorForSoftwareAvailable(asyncResp, req,
+-                                    "/redfish/v1/UpdateService");
++                                    "/redfish/v1/UpdateService", 120);
+ 
+         std::string filepath(
+             "/tmp/images/" +

@@ -1,0 +1,446 @@
+#!/bin/bash
+#
+# reimu-bootguard: reliable BMC firmware upgrade on boards with two BMC flash
+# chips and the AST2400/AST2500 "2nd boot by WDT2" hardware strap.
+#
+# The second chip ("bmc2") holds a mirror of the first 48 MiB (U-Boot, its
+# environment, kernel, rofs; the rwfs settings partition is per chip) of the
+# primary one. U-Boot arms WDT2 for 300 s on every boot; when it expires the
+# SoC restarts from the other chip. This script decides when it is safe to
+# disarm WDT2:
+#
+#  * a firmware update is pending confirmation (U-Boot env wdcontinue=1, set
+#    by "prepare-update"): WDT2 is disarmed only after the health check
+#    passes; the update is then committed and the backup chip is refreshed.
+#    If the new image doesn't become healthy, WDT2 restarts the board from
+#    the backup chip, which still holds the previous, known good image;
+#  * a normal boot: WDT2 is disarmed as soon as user space runs, so only a
+#    hung kernel or boot falls back to the backup (rebooting the BMC also
+#    resets the platform, a failing service alone must not do that);
+#  * booted from the backup chip: WDT2 is always disarmed (never bounce back
+#    and forth), the operator is told and can restore the primary chip.
+#
+# Commands:
+#   boot                    boot-time logic (reimu-bootguard.service)
+#   status [--json] [--verify]
+#   prepare-update          check preconditions, mirror if needed, set wdcontinue=1
+#   guard-activation        an image was staged in /run/initramfs (by any
+#                           updater): prepare-update, or drop the image when
+#                           it must not be flashed (reimu-bootguard-update.path)
+#   commit                  confirm the running image by hand (disarm, wdcontinue=0)
+#   cancel-update           wdcontinue=0
+#   sync-backup             mirror the running (primary) chip to the backup chip
+#   restore-primary         booted from backup: copy it onto the primary chip
+#   reboot-primary          booted from backup: switch back to the primary chip
+#                           and reboot (the hardware keeps booting the backup
+#                           chip until told otherwise)
+#   verify                  compare the image areas of both chips
+#   job <command>           run sync-backup/restore-primary/prepare-update/
+#                           verify in the background, progress in status
+#
+# Copyright (c) 2026 MCST REIMU contributors. Licensed under GPLv2.
+
+[ -f /etc/reimu-bootguard.conf ] && . /etc/reimu-bootguard.conf
+
+: "${HEALTH_DEADLINE:=240}"          # uptime (s) by which a new image must be healthy
+: "${HEALTH_UNITS=bmcweb.socket}"    # units that must be active
+: "${HEALTH_URL=https://127.0.0.1/redfish/v1}"
+: "${HEALTH_CMD:=}"                  # optional extra check command (exit 0 = healthy)
+: "${AUTO_SYNC:=yes}"                # refresh the backup after a committed update
+: "${MIRROR_SIZE:=50331648}"         # 48 MiB: everything but rwfs
+: "${RUN:=/run/reimu-bootguard}"
+: "${STATE:=/var/lib/reimu-bootguard}"
+: "${WDT2:=/usr/sbin/reimu-wdt2}"
+: "${FLASHCOPY:=/usr/sbin/reimu-flashcopy}"
+: "${FW_PRINTENV:=fw_printenv}"
+: "${FW_SETENV:=fw_setenv}"
+: "${MTD_BMC:=/dev/mtd/bmc}"
+: "${MTD_BMC2:=/dev/mtd/bmc2}"
+: "${ROFS_OTHER:=/dev/mtd/rofs-sec}"
+: "${OS_RELEASE:=/etc/os-release}"
+: "${STAGED:=/run/initramfs}"        # where the static layout updater stages images
+
+mkdir -p "$RUN" "$STATE"
+
+log() { echo "reimu-bootguard: $*" >&2; logger -t reimu-bootguard -- "$*" 2>/dev/null || true; }
+die() { log "$*"; exit 1; }
+
+# key=value from reimu-wdt2 status
+wdt() { "$WDT2" status 2>/dev/null | sed -n "s/^$1=//p"; }
+
+blockdev_of() # /dev/mtd/<label> -> /dev/mtdN, the MTD character device
+{             # (regular files and other block devices pass through)
+    local p=$1 t
+    [ -f "$p" ] && { echo "$p"; return 0; }
+    [ -e "$p" ] || return 1
+    t=$(readlink -f "$p")
+    case "$t" in
+        /dev/mtdblock*) echo "/dev/mtd${t#/dev/mtdblock}" ;;
+        /dev/mtd[0-9]*) echo "$t" ;;
+        *) [ -b "$t" ] && echo "$t" || return 1 ;;
+    esac
+}
+
+dev_size() # bytes
+{
+    local d=$1
+    if [ -f "$d" ]; then stat -c %s "$d"; return; fi
+    cat "/sys/class/mtd/${d#/dev/}/size"
+}
+
+pending() { [ "$($FW_PRINTENV -n wdcontinue 2>/dev/null)" = 1 ]; }
+dual() { blockdev_of "$MTD_BMC" >/dev/null && blockdev_of "$MTD_BMC2" >/dev/null; }
+booted_backup() { [ "$(wdt secondary)" = 1 ]; }
+running_version() { sed -n 's/^VERSION_ID=//p' "$OS_RELEASE" | tr -d '"'; }
+running_name() { sed -n 's/^PRETTY_NAME=//p' "$OS_RELEASE" | tr -d '"'; }
+
+json_esc() # var string: var=string quoted for JSON (builtins only, no fork)
+{
+    local v=${2//\\/\\\\}
+    v=${v//\"/\\\"}
+    v=${v//[$'\001'-$'\037']/ }
+    printf -v "$1" '"%s"' "$v"
+}
+
+json_str() { local q; json_esc q "$1"; printf '%s' "$q"; }
+
+job_update() # state message [progress]
+{
+    local a st m t
+    json_esc a "${JOB_ACTION:-}"; json_esc st "$1"; json_esc m "$2"
+    printf -v t '%(%s)T' -1
+    printf '{"action":%s,"state":%s,"message":%s,"progress":%s,"started":%s,"updated":%s}\n' \
+        "$a" "$st" "$m" "${3:-null}" "${JOB_STARTED:-null}" "$t" > "$RUN/job.json.tmp" &&
+        mv -f "$RUN/job.json.tmp" "$RUN/job.json"
+}
+
+# ---------------------------------------------------------------------
+# mirroring
+
+image_md5() # device -> md5 of the first MIRROR_SIZE bytes
+{
+    dd if="$1" bs=1M count=$((MIRROR_SIZE / 1048576)) 2>/dev/null | md5sum | cut -d' ' -f1
+}
+
+# Copies the first MIRROR_SIZE bytes of the running chip to the other one,
+# erasing and writing only the blocks that differ (reimu-flashcopy, which
+# reads every written block back), then compares both image areas.
+mirror() # what (for messages)
+{
+    local src dst w a b rc=1 changed=0 err="" s d
+    dual || die "no second BMC flash chip"
+    src=$(blockdev_of "$MTD_BMC") || die "can't find $MTD_BMC"
+    dst=$(blockdev_of "$MTD_BMC2") || die "can't find $MTD_BMC2"
+    log "$1: copying $src -> $dst ($((MIRROR_SIZE / 1048576)) MiB)"
+    rm -f "$RUN/other-version" "$RUN/insync"
+    job_update running "$1: 0%" 0
+    while read -r w a b; do
+        case "$w" in
+            progress) [ $((a % 10)) = 0 ] && job_update running "$1: $a%, changed $b blocks" "$a" ;;
+            done) changed=$a ;;
+            exit) rc=$a ;;
+            *) err="$w $a $b" ;;
+        esac
+    done < <("$FLASHCOPY" "$src" "$dst" "$MIRROR_SIZE" 2>&1; echo "exit $?")
+    [ "$rc" = 0 ] || die "$1: write failed${err:+: ${err% }}"
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    job_update running "$1: verifying" 99
+    s=$(image_md5 "$src")
+    d=$(image_md5 "$dst")
+    [ "$s" = "$d" ] || die "$1: verification failed ($s != $d)"
+    printf 'md5=%s\nversion=%s\ndate=%s\nchanged=%s\n' "$s" "$(running_version)" "$(date +%s)" "$changed" > "$STATE/mirror"
+    echo "$s" > "$RUN/verified-md5"
+    echo "true $(date +%s)" > "$RUN/insync"
+    log "$1: done, $changed blocks written, md5 $s"
+}
+
+# ---------------------------------------------------------------------
+# health
+
+healthy() # prints the reason when not healthy
+{
+    local u
+    for u in $HEALTH_UNITS; do
+        systemctl is-active --quiet "$u" || { echo "$u is not active"; return 1; }
+    done
+    if [ -n "$HEALTH_URL" ] && command -v wget >/dev/null; then
+        wget -q -T 10 --no-check-certificate -O /dev/null "$HEALTH_URL" 2>/dev/null ||
+            { echo "$HEALTH_URL does not answer"; return 1; }
+    fi
+    if [ -n "$HEALTH_CMD" ]; then
+        $HEALTH_CMD >/dev/null 2>&1 || { echo "$HEALTH_CMD failed"; return 1; }
+    fi
+    return 0
+}
+
+uptime_s() { cut -d. -f1 /proc/uptime; }
+
+disarm()
+{
+    "$WDT2" disarm || die "can't disarm WDT2"
+}
+
+do_commit()
+{
+    disarm
+    $FW_SETENV wdcontinue 0 || die "can't clear wdcontinue"
+    printf 'version=%s\ndate=%s\n' "$(running_version)" "$(date +%s)" > "$STATE/committed"
+    log "image $(running_version) committed"
+}
+
+cmd_boot()
+{
+    rm -f "$RUN/fallback" "$RUN/health"
+    if [ "$(wdt strap)" != 1 ]; then
+        log "no dual boot strap: nothing to guard"
+        exit 0
+    fi
+    if booted_backup; then
+        # never fall back again: stay on the working backup chip
+        disarm
+        date +%s > "$RUN/fallback"
+        log "WARNING: booted from the BACKUP flash chip (primary image failed); run 'reimu-bootguard restore-primary' or update again"
+        exit 0
+    fi
+    if ! pending; then
+        disarm
+        log "normal boot from the primary chip, WDT2 disarmed"
+        exit 0
+    fi
+    log "firmware update pending confirmation: waiting for the system to become healthy (deadline: uptime ${HEALTH_DEADLINE}s)"
+    local why
+    while :; do
+        if why=$(healthy); then
+            do_commit
+            echo ok > "$RUN/health"
+            # refresh the backup with the now confirmed image (synchronously:
+            # leftover processes of a finished service would be killed)
+            if [ "$AUTO_SYNC" = yes ] && dual && mkdir "$RUN/lock" 2>/dev/null; then
+                JOB_ACTION=sync-backup JOB_STARTED=$(date +%s) run_job_body sync-backup
+                rmdir "$RUN/lock"
+            fi
+            exit 0
+        fi
+        echo "$why" > "$RUN/health"
+        [ "$(uptime_s)" -ge "$HEALTH_DEADLINE" ] && break
+        sleep 5
+    done
+    log "new image is NOT healthy ($why): WDT2 is left running and will restart the BMC from the backup chip"
+    exit 1
+}
+
+# ---------------------------------------------------------------------
+# operator commands
+
+cmd_prepare_update()
+{
+    if [ "$(wdt strap)" != 1 ]; then
+        log "no dual boot strap: the update can't be guarded"
+        return 0
+    fi
+    booted_backup && die "running from the backup chip: restore the primary chip first (reimu-bootguard restore-primary)"
+    pending && die "a previous update is still pending confirmation"
+    if dual; then
+        local cur
+        cur=$(image_md5 "$(blockdev_of "$MTD_BMC")")
+        if [ "$(image_md5 "$(blockdev_of "$MTD_BMC2")")" != "$cur" ]; then
+            mirror "backup before update"
+        else
+            log "backup chip already holds the running image"
+            echo "$cur" > "$RUN/verified-md5"
+        fi
+    else
+        log "WARNING: no second flash chip, a failed update can't fall back"
+    fi
+    $FW_SETENV wdcontinue 1 || die "can't set wdcontinue"
+    log "ready: the next boot must become healthy within ${HEALTH_DEADLINE}s or the backup chip starts"
+}
+
+# An image was staged for flashing at the next reboot, by firmware-updater,
+# Redfish UpdateService or anything else: make sure the update is guarded.
+cmd_guard_activation()
+{
+    [ "$(wdt strap)" = 1 ] || exit 0
+    if booted_backup; then
+        # the flash script would overwrite the only working (backup) chip
+        rm -f "$STAGED"/image-*
+        die "running from the backup chip: the staged update was REMOVED; restore the primary chip first"
+    fi
+    pending && exit 0
+    # keep mirroring through shutdown: the staged image is flashed only after
+    # all services have stopped, and a half written backup is worse than none
+    trap '' TERM
+    while ! mkdir "$RUN/lock" 2>/dev/null; do sleep 1; done
+    trap 'rmdir "$RUN/lock"' EXIT
+    pending && exit 0
+    JOB_ACTION=prepare-update JOB_STARTED=$(date +%s) run_job_body prepare-update
+}
+
+cmd_status()
+{
+    local json=0 verify=0 a
+    for a; do
+        case "$a" in
+            --json) json=1 ;;
+            --verify) verify=1 ;;
+        esac
+    done
+    local strap secondary enabled reload counter pend=false isdual=false other="" insync=null job=null
+    # the job first: a job that finishes meanwhile is then seen with its results
+    [ -f "$RUN/job.json" ] && job=$(cat "$RUN/job.json")
+    strap=$(wdt strap); secondary=$(wdt secondary); enabled=$(wdt enabled)
+    reload=$(wdt reload); counter=$(wdt counter)
+    pending && pend=true
+    dual && isdual=true
+    if [ "$isdual" = true ]; then
+        other=$(other_version)
+        if [ "$verify" = 1 ]; then
+            if [ "$(image_md5 "$(blockdev_of "$MTD_BMC")")" = "$(image_md5 "$(blockdev_of "$MTD_BMC2")")" ]; then
+                insync=true
+            else
+                insync=false
+            fi
+            echo "$insync $(date +%s)" > "$RUN/insync"
+        elif [ -f "$RUN/insync" ]; then
+            insync=$(cut -d' ' -f1 "$RUN/insync")
+        fi
+    fi
+    if [ "$json" = 0 ]; then
+        echo "dual boot strap:   ${strap:-?}"
+        echo "second chip:       $isdual"
+        echo "booted from:       $([ "$secondary" = 1 ] && echo BACKUP || echo primary)"
+        echo "WDT2:              $([ "$enabled" = 1 ] && echo "armed, $((counter / 1000000)) s left" || echo disarmed)"
+        echo "update pending:    $pend"
+        echo "running image:     $(running_name)"
+        echo "other chip image:  ${other:-unknown}"
+        echo "chips identical:   $insync"
+        [ -f "$STATE/mirror" ] && echo "last mirror:       $(date -d @"$(sed -n 's/^date=//p' "$STATE/mirror")" 2>/dev/null)"
+        [ "$job" != null ] && echo "last job:          $job"
+        return 0
+    fi
+    printf '{"strap":%s,"dual":%s,"bootedFrom":%s,"wdt2":{"enabled":%s,"remaining":%s},' \
+        "$([ "$strap" = 1 ] && echo true || echo false)" "$isdual" \
+        "$(json_str "$([ "$secondary" = 1 ] && echo backup || echo primary)")" \
+        "$([ "$enabled" = 1 ] && echo true || echo false)" "$(( ${counter:-0} / 1000000 ))"
+    printf '"pending":%s,"running":{"version":%s,"name":%s},"other":{"version":%s},"inSync":%s,' \
+        "$pend" "$(json_str "$(running_version)")" "$(json_str "$(running_name)")" \
+        "$([ -n "$other" ] && json_str "$other" || echo null)" "$insync"
+    local staged="" f q
+    for f in "$STAGED"/image-*; do
+        [ -e "$f" ] || continue
+        json_esc q "${f##*/}"; staged+="${staged:+,}$q"
+    done
+    printf '"staged":[%s],"health":%s,"fallback":%s,"lastMirror":%s,"committed":%s,"job":%s}\n' "$staged" \
+        "$([ -f "$RUN/health" ] && json_str "$(cat "$RUN/health")" || echo null)" \
+        "$([ -f "$RUN/fallback" ] && cat "$RUN/fallback" || echo null)" \
+        "$([ -f "$STATE/mirror" ] && printf '{"date":%s,"version":%s}' "$(sed -n 's/^date=//p' "$STATE/mirror")" "$(json_str "$(sed -n 's/^version=//p' "$STATE/mirror")")" || echo null)" \
+        "$([ -f "$STATE/committed" ] && printf '{"date":%s,"version":%s}' "$(sed -n 's/^date=//p' "$STATE/committed")" "$(json_str "$(sed -n 's/^version=//p' "$STATE/committed")")" || echo null)" \
+        "$job"
+}
+
+# version of the image on the other chip, read from its rofs (cached)
+other_version()
+{
+    [ -f "$RUN/other-version" ] && { cat "$RUN/other-version"; return; }
+    [ -d "$RUN/lock" ] && return 0     # the other chip is being written
+    local dev mnt="$RUN/other" v=""
+    dev=$(blockdev_of "$ROFS_OTHER") || return 0
+    [ "$(dd if="$dev" bs=4 count=1 2>/dev/null)" = hsqs ] || { echo "no image" | tee "$RUN/other-version"; return; }
+    mkdir -p "$mnt"
+    if mount -t squashfs -o ro "$dev" "$mnt" 2>/dev/null; then
+        v=$(sed -n 's/^PRETTY_NAME=//p' "$mnt/etc/os-release" 2>/dev/null | tr -d '"')
+        umount "$mnt"
+    fi
+    echo "${v:-unknown}" | tee "$RUN/other-version"
+}
+
+cmd_verify()
+{
+    dual || die "no second flash chip"
+    local a b
+    a=$(image_md5 "$(blockdev_of "$MTD_BMC")"); b=$(image_md5 "$(blockdev_of "$MTD_BMC2")")
+    if [ "$a" = "$b" ]; then
+        echo "true $(date +%s)" > "$RUN/insync"
+        log "chips identical (md5 $a)"
+    else
+        echo "false $(date +%s)" > "$RUN/insync"
+        die "chips differ"
+    fi
+}
+
+cmd_sync_backup()
+{
+    booted_backup && die "running from the backup chip: use restore-primary"
+    pending && die "the running image isn't committed yet"
+    mirror "sync backup"
+}
+
+cmd_restore_primary()
+{
+    booted_backup || die "running from the primary chip: nothing to restore (use sync-backup)"
+    mirror "restore primary"
+    log "primary chip restored from the backup; start it with reboot-primary"
+}
+
+cmd_reboot_primary()
+{
+    booted_backup || die "running from the primary chip already"
+    [ -d "$RUN/lock" ] && die "a job is running"
+    log "switching back to the primary chip and rebooting"
+    sync
+    exec "$WDT2" boot-primary
+}
+
+run_job_body()
+{
+    local rc=0 out
+    job_update running "$1: starting" 0
+    case "$1" in
+        sync-backup) out=$(cmd_sync_backup 2>&1) || rc=$? ;;
+        restore-primary) out=$(cmd_restore_primary 2>&1) || rc=$? ;;
+        prepare-update) out=$(cmd_prepare_update 2>&1) || rc=$? ;;
+        verify) out=$(cmd_verify 2>&1) || rc=$? ;;
+        *) out="unknown job $1"; rc=1 ;;
+    esac
+    out=$(echo "$out" | tail -n 1 | sed 's/^reimu-bootguard: //')
+    if [ $rc = 0 ]; then job_update ok "$out" 100; else job_update failed "$out"; fi
+    return $rc
+}
+
+cmd_job()
+{
+    case "$1" in
+        sync-backup|restore-primary|prepare-update|verify) ;;
+        *) die "usage: reimu-bootguard job sync-backup|restore-primary|prepare-update|verify" ;;
+    esac
+    if ! mkdir "$RUN/lock" 2>/dev/null; then
+        die "another job is running"
+    fi
+    export JOB_ACTION=$1 JOB_STARTED
+    JOB_STARTED=$(date +%s)
+    job_update running "$1: queued" 0
+    (
+        trap 'rmdir "$RUN/lock"' EXIT
+        run_job_body "$1"
+    ) </dev/null >/dev/null 2>&1 &
+    echo "started $1"
+}
+
+case "$1" in
+    boot) cmd_boot ;;
+    status) shift; cmd_status "$@" ;;
+    prepare-update) cmd_prepare_update ;;
+    guard-activation) cmd_guard_activation ;;
+    commit) do_commit ;;
+    cancel-update) $FW_SETENV wdcontinue 0 && log "pending update cancelled" ;;
+    sync-backup) cmd_sync_backup ;;
+    verify) cmd_verify ;;
+    restore-primary) cmd_restore_primary ;;
+    reboot-primary) cmd_reboot_primary ;;
+    job) shift; cmd_job "$@" ;;
+    *)
+        sed -n '/^# Commands:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac

@@ -1,0 +1,10 @@
+[Unit]
+Description=Reliable upgrade: confirm the boot (WDT2) and guard firmware updates
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/reimu-bootguard boot
+
+[Install]
+WantedBy=multi-user.target

@@ -165,3 +165,6 @@ table.tbl { width: 100%; border-collapse: collapse; }
   .nav a { padding: 6px; }
   .power-chip span:last-child { display: none; }
 }
+.alert { margin: 8px 0; padding: 8px 10px; border-radius: 6px; font-size: 13px; border-left: 3px solid; }
+.alert.warn { background: rgba(107, 82, 20, .35); border-color: #d6a72a; }
+.alert.err { background: rgba(107, 33, 34, .35); border-color: #e05555; }

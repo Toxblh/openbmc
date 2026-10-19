@@ -1,0 +1,14 @@
+[Unit]
+Description=REIMU reliable upgrade state for the web UI
+After=reimu-bootguard.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Reimu.Firmware
+ExecStart=/usr/sbin/reimu-firmwared
+Restart=always
+# jobs started from the web keep running after a service restart
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

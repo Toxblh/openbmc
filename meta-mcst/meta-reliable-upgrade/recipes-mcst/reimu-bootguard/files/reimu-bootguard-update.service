@@ -1,0 +1,10 @@
+[Unit]
+Description=Reliable upgrade: back up the running image before a staged update is flashed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/reimu-bootguard guard-activation
+# the backup must be complete before the shutdown flashes the staged image
+TimeoutStartSec=900
+TimeoutStopSec=900

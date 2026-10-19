@@ -1,6 +1,7 @@
 import { api, h, toast } from "../api.js";
+import { firmwareCard } from "./firmware.js";
 
-let root;
+let root, fwCard;
 
 const field = (label, input) => h("label", {}, label, input);
 
@@ -18,7 +19,9 @@ async function render() {
     api.collection("/redfish/v1/AccountService/Accounts").catch(() => []),
   ]);
   if (!root) return;
-  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), bmcCard(mgr));
+  if (fwCard) fwCard.stop();
+  fwCard = firmwareCard(mgr, rebootBmc);
+  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), bmcCard(mgr), fwCard);
 }
 
 function networkCard(proto, ifaces) {
@@ -102,18 +105,20 @@ function usersCard(accounts) {
   );
 }
 
+async function rebootBmc() {
+  if (!confirm("Перезагрузить BMC? Веб-интерфейс будет недоступен около полутора минут (при записи нового образа — дольше).")) return;
+  try {
+    await api.post("/redfish/v1/Managers/bmc/Actions/Manager.Reset", { ResetType: "GracefulRestart" });
+    toast("BMC перезагружается", "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
 function bmcCard(mgr) {
   const reboot = h("button", { class: "btn danger" }, "Перезагрузить BMC");
-  reboot.addEventListener("click", async () => {
-    if (!confirm("Перезагрузить BMC? Платформа продолжит работать, веб-интерфейс будет недоступен около полутора минут.")) return;
-    try {
-      await api.post("/redfish/v1/Managers/bmc/Actions/Manager.Reset", { ResetType: "GracefulRestart" });
-      toast("BMC перезагружается", "ok");
-    } catch (e) {
-      toast(e.message, "err");
-    }
-  });
-  return h("div", { class: "card" }, h("h3", {}, "BMC"), h("dl", { class: "kv" }, h("dt", {}, "Прошивка"), h("dd", {}, (mgr && mgr.FirmwareVersion) || "—")), h("p", { class: "muted small" }, "Обновление прошивки BMC и ПНС выполняется утилитами firmware-updater и update-host-flash (см. руководство REIMU)."), h("div", { class: "row" }, reboot));
+  reboot.addEventListener("click", rebootBmc);
+  return h("div", { class: "card" }, h("h3", {}, "BMC"), h("dl", { class: "kv" }, h("dt", {}, "Прошивка"), h("dd", {}, (mgr && mgr.FirmwareVersion) || "—")), h("div", { class: "row" }, reboot));
 }
 
 async function patch(url, body, okText) {
@@ -127,5 +132,7 @@ async function patch(url, body, okText) {
 }
 
 export function unmount() {
+  if (fwCard) fwCard.stop();
+  fwCard = null;
   root = null;
 }

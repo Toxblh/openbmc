@@ -8,6 +8,11 @@ Unit tests (run on any Linux host, no BMC needed):
     gcc -DPARSER_ONLY -O2 -fsanitize=address,undefined -o /tmp/reimu-pnsd ../meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c
     python3 test_reimu_pns.py /tmp/reimu-pnsd /tmp/reimu-pns-test
 
+    F=../meta-reliable-upgrade/recipes-mcst/reimu-bootguard/files
+    gcc -O2 -fsanitize=address,undefined -o /tmp/reimu-wdt2 $F/reimu-wdt2.c
+    gcc -O2 -fsanitize=address,undefined -o /tmp/reimu-flashcopy $F/reimu-flashcopy.c
+    python3 test_reimu_bootguard.py $F/reimu-bootguard /tmp/reimu-wdt2 /tmp/reimu-flashcopy /tmp/bootguard-test
+
 End-to-end tests run a real browser (Playwright/Chromium) against a test
 "BMC": an x86 Ubuntu 20.04 VM with the *real* bmcweb of the REIMU revision
 (REIMU patches + web UI patch), reimu-serial, reimu-pnsd, jsnbd/nbd-proxy,
@@ -21,7 +26,11 @@ provide are replaced by fixtures (`testvm/fixtures`):
   `fake-phosphor.py` publishes D-Bus objects of the same shape, so the real
   bmcweb Redfish code runs on them;
 * PNS flash: `block2mtd` over a synthetic 16 MiB image, SPI switch GPIO: a stub
-  that logs its state.
+  that logs its state;
+* reliable upgrade (`testvm/fixtures/ab-stand.sh`): two 64 MiB BMC flash chips
+  (`block2mtd`) with images from `make-ab-images.py`, SCU/WDT registers and the
+  U-Boot environment in files; fake-phosphor plays the static layout
+  phosphor-image-updater behind bmcweb's UpdateService.
 
 Build and start the stand (root, docker, debootstrap, qemu-system-x86):
 
@@ -37,7 +46,15 @@ Run the tests:
     node vm-buffer.spec.mjs     # bmcweb NBD buffer overflow regression
     node kvm.spec.mjs           # web KVM through bmcweb /kvm/0
     node platform.spec.mjs      # power, sensors, inventory, PNS flash scan
+    node firmware.spec.mjs      # A/B update: upload, health check, fallback, restore
     node jpeg-bench.mjs         # JPEG decode path benchmark
 
 Environment: `BASE`, `VMSSH`, `COM1`, `CHROME`, `OUT` (screenshots), `WORK`;
 see `e2e/common.mjs`.
+
+The reliable upgrade stand needs, once per VM boot (reimu-bootguard,
+reimu-wdt2, reimu-flashcopy, reimu-firmwared and their units installed):
+
+    testvm/fixtures/make-ab-images.py /tmp/reimu-e2e/ab        # needs mksquashfs
+    scp chipA.img chipB.img and ab-stand.sh into the VM (/root/ab, /usr/local/sbin)
+    ab-stand.sh setup /root/ab/chipA.img /root/ab/chipB.img     # in the VM

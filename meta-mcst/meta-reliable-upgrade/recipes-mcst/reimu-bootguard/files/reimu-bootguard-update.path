@@ -1,0 +1,8 @@
+[Unit]
+Description=Reliable upgrade: guard firmware images staged for flashing
+
+[Path]
+PathExistsGlob=/run/initramfs/image-*
+
+[Install]
+WantedBy=multi-user.target
