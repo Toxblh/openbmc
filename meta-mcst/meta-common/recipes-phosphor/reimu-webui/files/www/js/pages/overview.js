@@ -1,5 +1,6 @@
 import { api, h, healthBadge } from "../api.js";
 import { powerAction } from "../app.js";
+import { platformSensors, rowOf } from "./sensors.js";
 
 let root, timer;
 
@@ -13,10 +14,11 @@ export async function mount(el) {
 }
 
 async function refresh() {
-  const [sys, mgr, chassis] = await Promise.all([
+  const [sys, mgr, chassis, plat] = await Promise.all([
     api.get("/redfish/v1/Systems/system").catch(() => null),
     api.get("/redfish/v1/Managers/bmc").catch(() => null),
     api.collection("/redfish/v1/Chassis").catch(() => []),
+    platformSensors(),
   ]);
   if (!root) return;
   const temps = [];
@@ -27,6 +29,13 @@ async function refresh() {
       if (t && t.Temperatures) temps.push(...t.Temperatures);
     }),
   );
+  if (plat && plat.sensors)
+    plat.sensors
+      .filter((s) => s.kind === "temp" && s.value !== null)
+      .forEach((s) => {
+        const r = rowOf(s);
+        temps.push({ Name: `${r.group}: ${r.name}`, ReadingCelsius: r.value, Status: r.status });
+      });
   temps.sort((a, b) => (b.ReadingCelsius || 0) - (a.ReadingCelsius || 0));
 
   const powerBtns = h(
@@ -90,7 +99,7 @@ async function refresh() {
               temps.slice(0, 8).map((t) => h("tr", {}, h("td", {}, t.Name), h("td", { class: "mono" }, t.ReadingCelsius !== undefined && t.ReadingCelsius !== null ? `${Number(t.ReadingCelsius).toFixed(1)} °C` : "—"), h("td", {}, healthBadge(t.Status)))),
             ),
           )
-        : h("div", { class: "muted" }, on ? "датчики не найдены" : "платформа выключена: датчики платформы появятся после включения"),
+        : h("div", { class: "muted" }, plat && plat.platform === "starting" ? "платформа включается: датчики появятся через ~30 с" : on ? "датчики не найдены" : "платформа выключена: датчики платформы появятся после включения"),
       h("div", { class: "row end" }, h("a", { href: "#/sensors" }, "все датчики →")),
     ),
     h(

@@ -7,6 +7,9 @@
  *     property Json (s)  - JSON document, see build_json()
  *     method   Rescan() -> s   JSON {"ok": bool, "message": string}
  *                         re-reads the flash partition table (host must be off)
+ *   object    /xyz/openbmc_project/reimu/sensors
+ *   interface xyz.openbmc_project.Reimu.Sensors
+ *     property Json (s)  - platform sensors, see sensors_doc() and reimu-sensors.c
  *
  * Data sources:
  *   /var/volatile/motherboard_info.xml   FRU ID, extracted at BMC boot by mcst-fruid
@@ -43,6 +46,8 @@
 #include <systemd/sd-bus.h>
 #endif
 
+#include "reimu-sensors.h"
+
 #define FRU_XML   "/var/volatile/motherboard_info.xml"
 #define DTS_FILE  "/var/volatile/motherboard_devtree.dts"
 #define SCAN_JSON "/var/lib/reimu-pns/scan.json"
@@ -57,15 +62,9 @@
 #define MAX_TEXT        (256 * 1024)
 
 /* ------------------------------------------------------------------ */
-/* small growable string                                               */
+/* small growable string (struct buf: reimu-sensors.h)                 */
 
-struct buf
-{
-    char *s;
-    size_t len, cap;
-};
-
-static void buf_add(struct buf *b, const char *s, size_t n)
+void buf_add(struct buf *b, const char *s, size_t n)
 {
     if (b->len + n + 1 > b->cap)
     {
@@ -81,13 +80,12 @@ static void buf_add(struct buf *b, const char *s, size_t n)
     b->s[b->len] = 0;
 }
 
-static void buf_str(struct buf *b, const char *s)
+void buf_str(struct buf *b, const char *s)
 {
     buf_add(b, s, strlen(s));
 }
 
-static void buf_printf(struct buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-static void buf_printf(struct buf *b, const char *fmt, ...)
+void buf_printf(struct buf *b, const char *fmt, ...)
 {
     char tmp[512];
     va_list ap;
@@ -98,7 +96,7 @@ static void buf_printf(struct buf *b, const char *fmt, ...)
 }
 
 /* JSON string literal; invalid UTF-8 bytes are replaced with U+FFFD */
-static void buf_json(struct buf *b, const char *s, size_t n)
+void buf_json(struct buf *b, const char *s, size_t n)
 {
     buf_add(b, "\"", 1);
     for (size_t i = 0; i < n; i++)
@@ -535,10 +533,11 @@ static sd_bus *g_bus; /* set by the daemon: lets the EEPROM read check host powe
  * (seen by two property reads at least that far apart), and at most once a
  * minute. */
 #define FRU_SETTLE_S 120
-static int fru_worth_trying(void)
+
+/* seconds the platform has been seen running: -1 off, -2 unknown (no
+ * D-Bus). Counted from the first call that saw it on */
+static long host_running_s(void)
 {
-    static time_t last_try;
-    time_t now = time(NULL);
 #ifndef PARSER_ONLY
     static time_t running_since;
     if (g_bus)
@@ -548,15 +547,25 @@ static int fru_worth_trying(void)
                                             "xyz.openbmc_project.State.Host", "CurrentHostState", NULL, &st) >= 0 &&
                  st && strstr(st, ".Running");
         free(st);
+        time_t now = time(NULL);
         if (!on)
         {
             running_since = 0;
-            return 0;
+            return -1;
         }
         if (!running_since) running_since = now;
-        if (now - running_since < FRU_SETTLE_S) return 0;
+        return now - running_since;
     }
 #endif
+    return -2;
+}
+
+static int fru_worth_trying(void)
+{
+    static time_t last_try;
+    time_t now = time(NULL);
+    long up = host_running_s();
+    if (up == -1 || (up >= 0 && up < FRU_SETTLE_S)) return 0;
     if (last_try && now - last_try < 60) return 0;
     last_try = now;
     return 1;
@@ -633,6 +642,49 @@ static char *build_json(void)
 }
 
 #ifndef PARSER_ONLY
+/* platform sensors (reimu-sensors.c): read only once the platform has run
+ * SENS_SETTLE_S seconds (its power-up must not see BMC traffic on the bus),
+ * at most every SENS_CACHE_S seconds whatever the number of viewers */
+#define SENS_SETTLE_S 30
+#define SENS_CACHE_S  3
+static char *sensors_doc(int force)
+{
+    static char *cached;
+    static time_t cached_at;
+    time_t now = time(NULL);
+    long up = force ? -2 : host_running_s();
+    const char *platform = up == -1 ? "off" : up >= 0 && up < SENS_SETTLE_S ? "starting" : "on";
+    if (!strcmp(platform, "on") && cached && now - cached_at < SENS_CACHE_S && !force) return strdup(cached);
+    struct buf b = { 0 };
+    buf_printf(&b, "{\"version\":1,\"now\":%lld,\"platform\":\"%s\",", (long long)now, platform);
+    if (!strcmp(platform, "on")) sensors_json(&b);
+    else buf_str(&b, "\"sensors\":[]");
+    buf_str(&b, "}");
+    if (!strcmp(platform, "on") && b.s)
+    {
+        free(cached);
+        cached = strdup(b.s);
+        cached_at = now;
+    }
+    return b.s;
+}
+
+static int prop_sensors(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
+                        void *ud, sd_bus_error *err)
+{
+    (void)bus; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    char *j = sensors_doc(0);
+    int r = sd_bus_message_append(reply, "s", j ? j : "{}");
+    free(j);
+    return r;
+}
+
+static const sd_bus_vtable sensors_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_PROPERTY("Json", "s", prop_sensors, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
+    SD_BUS_VTABLE_END
+};
+
 static char *last_json;
 
 static int prop_json(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
@@ -708,6 +760,9 @@ static int run_daemon(void)
     g_bus = bus;
     r = sd_bus_add_object_vtable(bus, &slot, "/xyz/openbmc_project/reimu/pns", "xyz.openbmc_project.Reimu.Pns",
                                  pns_vtable, NULL);
+    if (r >= 0)
+        r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/sensors", "xyz.openbmc_project.Reimu.Sensors",
+                                     sensors_vtable, NULL);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
     if (r < 0)
@@ -757,12 +812,20 @@ int main(int argc, char **argv)
         return 0;
     }
 #ifndef PARSER_ONLY
+    if (argc == 2 && !strcmp(argv[1], "--sensors"))
+    {
+        char *j = sensors_doc(1);
+        if (j) puts(j);
+        free(j);
+        return 0;
+    }
     if (argc == 1) return run_daemon();
 #endif
     fprintf(stderr, "Usage: %s                    run D-Bus service\n"
                     "       %s --parse <flash>    print ПНС flash partition table as JSON\n"
                     "       %s --fru <eeprom>     print FRU ID EEPROM image as XML\n"
-                    "       %s --json             print the D-Bus JSON document\n",
-            argv[0], argv[0], argv[0], argv[0]);
+                    "       %s --json             print the D-Bus JSON document\n"
+                    "       %s --sensors          read the platform sensors now (no power check)\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }

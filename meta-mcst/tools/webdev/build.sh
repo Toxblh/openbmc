@@ -222,7 +222,7 @@ $CC -O2 -Wall -fPIE -pie -I"$W/obj" -isystem "$SYS/usr/include" -isystem "$SYS/u
     -o "$W/obj/nbd-proxy" "$SRC/jsnbd/nbd-proxy.c" -L"$SYS/usr/lib" -ljson-c -ludev
 $CC -O2 -Wall -fPIE -pie -o "$W/obj/reimu-serial" "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c"
 $CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-pnsd" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c" \
-    -L"$SYS/usr/lib" -lsystemd
+    "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.c" -L"$SYS/usr/lib" -lsystemd -lm
 
 # ---------------------------------------------------------------- package
 VERSION=$(git -C "$MCST" describe --always --dirty 2>/dev/null || echo unknown)
