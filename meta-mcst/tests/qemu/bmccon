@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+# bmccon NAME "command" [timeout]: runs a shell command on the BMC console of run-bmc.sh NAME
+# (logs in as root/0penBmc if needed) and prints its output; exit code = the command's.
+import os, re, socket, sys, time
+name, cmd = sys.argv[1], sys.argv[2]; tmo = float(sys.argv[3]) if len(sys.argv) > 3 else 60
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ.get("RQ", "/tmp/rq") + f"/{name}.con"); s.settimeout(0.5)
+buf = b""
+def rd(until, t):
+    global buf
+    end = time.time() + t
+    while time.time() < end:
+        try:
+            c = s.recv(65536)
+            if c: buf += c
+        except socket.timeout: pass
+        if re.search(until, buf): return True
+    return False
+def wr(x): s.sendall(x.encode())
+wr("\n"); rd(rb"(login: |# )$", 10)
+if buf.rstrip().endswith(b"login:"):
+    buf = b""; wr("root\n"); rd(rb"Password: ", 10); wr("0penBmc\n"); rd(rb"# $", 20)
+buf = b""
+wr(f"stty -echo cols 200; {cmd}; echo __END$?__\n")
+ok = rd(rb"__END\d+__", tmo)
+out = buf.decode(errors="replace")
+out = re.sub(r"^.*?stty -echo[^\n]*\n", "", out, flags=re.S)
+print(out.split("__END")[0].replace("\r", ""), end="")
+m = re.search(r"__END(\d+)__", out)
+sys.exit(int(m.group(1)) if m else 124)

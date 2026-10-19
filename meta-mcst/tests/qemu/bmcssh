@@ -1,0 +1,7 @@
+#!/bin/sh
+# bmcssh PORT [command...]: ssh to a QEMU BMC as root (password 0penBmc)
+p=$1; shift
+a=$(mktemp); printf '#!/bin/sh\necho "%s"\n' "${BMC_PASSWORD:-0penBmc}" > "$a"; chmod +x "$a"
+SSH_ASKPASS=$a SSH_ASKPASS_REQUIRE=force DISPLAY=x ssh -p "$p" -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=90 root@127.0.0.1 "$@"
+rc=$?; rm -f "$a"; exit $rc

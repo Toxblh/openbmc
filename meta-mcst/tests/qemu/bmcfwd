@@ -1,0 +1,27 @@
+#!/bin/bash
+# bmcfwd NAME: points the ssh/https forwarding of run-bmc.sh NAME to the
+# address the BMC actually has (its DHCP lease can change after the first
+# boot of a fresh image). Asks the BMC on its console.
+set -eu
+name=$1; RQ=${RQ:-/tmp/rq}; HERE=$(cd "$(dirname "$0")" && pwd)
+IFS=. read -r _ ssh https < "$RQ/$name.ports"
+ip=$("$HERE/bmccon" "$name" "ip -4 -o addr show eth0" 60 | sed -n 's/.* inet \(10\.0\.2\.[0-9]*\)\/.*/\1/p' | head -1)
+[ -n "$ip" ] || { echo "bmcfwd: no 10.0.2.x address on eth0" >&2; exit 1; }
+python3 - "$RQ/$name.qmp2" "$ip" "$ssh" "$https" <<'PY'
+import json, socket, sys
+path, ip, ssh, https = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX); s.connect(path); f = s.makefile("rw"); f.readline()
+def hmp(line):
+    f.write(json.dumps({"execute": "human-monitor-command", "arguments": {"command-line": line}}) + "\n"); f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if "return" in r or "error" in r:
+            return r
+f.write('{"execute": "qmp_capabilities"}\n'); f.flush(); f.readline()
+for host, guest in ((ssh, 22), (https, 443)):
+    hmp(f"hostfwd_remove n0 tcp:127.0.0.1:{host}")
+    r = hmp(f"hostfwd_add n0 tcp:127.0.0.1:{host}-{ip}:{guest}")
+    if r.get("return"):
+        sys.exit(f"bmcfwd: {r['return'].strip()}")
+print(f"127.0.0.1:{ssh} -> {ip}:22, 127.0.0.1:{https} -> {ip}:443")
+PY
