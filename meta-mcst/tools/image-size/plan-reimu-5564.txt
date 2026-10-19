@@ -1,0 +1,20 @@
+# Cumulative removal steps for image-size.sh: <step>: <package or glob>...
+# [recipe change] steps need recipe work (dependencies), not just image config.
+1 python (obmc-system-mgmt reference daemon): obmc-phosphor-sysd
+2 kernel copy in /boot (already in the kernel partition): kernel-image-fitimage-* kernel-image-[0-9]*
+3 perf: perf
+4 mc: mc mc-fish mc-helpers mc-helpers-perl mc-locale-ru
+5 legacy web (phosphor-webui): phosphor-webui
+6 autofs + NFS client: autofs nfs-utils-client nfs-utils-mount
+7 LDAP users: packagegroup-obmc-apps-user-mgmt-ldap nss-pam-ldapd phosphor-ldap
+8 debug tools (to a tmpfs tools pack): tcpdump htop sysstat ethtool lrzsz ipmitool i2c-tools
+9 debug-collector/ffdc: packagegroup-obmc-apps-debug-collector ffdc
+10 telemetry + dbus-monitor + snmp: packagegroup-obmc-apps-telemetry packagegroup-obmc-apps-dbus-monitor phosphor-snmp
+11 remote logging (rsyslog): packagegroup-obmc-apps-remote-logging phosphor-rsyslog-config
+12 health monitor: packagegroup-obmc-apps-health-monitor
+13 locales except C.UTF-8 (web/serial are UTF-8 anyway): glibc-localedata-en-us glibc-localedata-ru-ru glibc-binary-localedata-en-us glibc-binary-localedata-ru-ru glibc-utils
+14 devtools packagegroup: packagegroup-obmc-apps-devtools
+15 packagegroup-base-extended: packagegroup-base-extended
+16 [recipe change] firmware-updater/bootguard without coreutils, GNU wget (gnutls), cifs: firmware-updater reimu-bootguard
+17 [recipe change] net-initial without xmlstarlet/libxml2: net-initial
+18 sudo + cracklib: sudo
