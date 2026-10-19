@@ -16,7 +16,9 @@ let active = null;
 let prefs;
 
 function loadPrefs() {
-  const def = { mode: "log", tz: "local", eol: "CR", date: true, active: 0, fontSize: 14, bs: "bs" };
+  // a phone has no room for the date in front of every line
+  const narrow = window.matchMedia && matchMedia("(max-width: 700px)").matches;
+  const def = { mode: "log", tz: "local", eol: "CR", date: !narrow, active: 0, fontSize: narrow ? 12 : 14, bs: "bs" };
   try {
     return Object.assign(def, JSON.parse(localStorage.getItem("reimu-console") || "{}"));
   } catch (e) {
@@ -151,18 +153,23 @@ export async function mount(el) {
       ),
       h("input", { id: "con-search", type: "search", placeholder: "Поиск…", size: 18 }),
       h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-only" }), "только найденное"),
+      h("button", { class: "btn small m-only-inline", id: "con-more", title: "Остальные настройки" }, "⋯"),
       h(
-        "select",
-        { id: "con-tz", title: "Часы, в которых показывается время строк" },
-        h("option", { value: "local" }, "Время: браузер"),
-        h("option", { value: "bmc" }, "Время: BMC"),
-        h("option", { value: "utc" }, "Время: UTC"),
+        "div",
+        { class: "con-extra" },
+        h(
+          "select",
+          { id: "con-tz", title: "Часы, в которых показывается время строк" },
+          h("option", { value: "local" }, "Время: браузер"),
+          h("option", { value: "bmc" }, "Время: BMC"),
+          h("option", { value: "utc" }, "Время: UTC"),
+        ),
+        h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-date" }), "дата"),
+        h("select", { id: "con-baud", title: "Скорость порта" }, BAUDS.map((b) => h("option", { value: b }, `${b}`))),
+        h("button", { class: "btn small", id: "con-break", title: "Послать BREAK (SysRq на Linux)" }, "Break"),
+        h("button", { class: "btn small", id: "con-download", title: "Скачать историю с метками времени" }, "Скачать"),
+        h("button", { class: "btn small", id: "con-clear", title: "Очистить историю порта на BMC" }, "Очистить"),
       ),
-      h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-date" }), "дата"),
-      h("select", { id: "con-baud", title: "Скорость порта" }, BAUDS.map((b) => h("option", { value: b }, `${b}`))),
-      h("button", { class: "btn small", id: "con-break", title: "Послать BREAK (SysRq на Linux)" }, "Break"),
-      h("button", { class: "btn small", id: "con-download", title: "Скачать историю с метками времени" }, "Скачать"),
-      h("button", { class: "btn small", id: "con-clear", title: "Очистить историю порта на BMC" }, "Очистить"),
       h(
         "div",
         { class: "dropdown", id: "con-fontmenu" },
@@ -188,11 +195,12 @@ export async function mount(el) {
       h("span", {}, "Строк: ", h("b", { id: "st-lines" }, "0")),
       h("span", {}, "Принято: ", h("b", { id: "st-rx" }, "0")),
       h("span", { class: "spacer" }),
-      h("span", { id: "st-hint", class: "muted" }, ""),
+      h("span", { id: "st-hint", class: "muted m-hide" }, ""),
     ),
   );
 
   const $ = (id) => el.querySelector("#" + id);
+  $("con-more").addEventListener("click", () => el.classList.toggle("con-extra-open"));
   $("con-tz").value = prefs.tz;
   $("con-date").checked = prefs.date;
   $("con-mode").addEventListener("click", (e) => {
@@ -277,7 +285,16 @@ function addPort(pi) {
   p.body = h("div", { class: "console-body hidden" });
   p.logWrap = h("div", { class: "logview" });
   p.followBtn = h("button", { class: "btn small primary follow-btn hidden" }, "↓ к последним строкам");
-  p.input = h("input", { placeholder: "Строка для отправки (Enter). Или кликните в лог и печатайте прямо в порт.", spellcheck: "false" });
+  const narrow = window.matchMedia && matchMedia("(max-width: 700px)").matches;
+  // phone keyboards must not capitalize or "correct" commands
+  p.input = h("input", {
+    placeholder: narrow ? "Строка для отправки" : "Строка для отправки (Enter). Или кликните в лог и печатайте прямо в порт.",
+    spellcheck: "false",
+    autocapitalize: "off",
+    autocorrect: "off",
+    autocomplete: "off",
+    enterkeyhint: "send",
+  });
   p.eol = h("select", { title: "Окончание строки" }, Object.keys(EOL).map((k) => h("option", { value: k }, k)));
   p.eol.value = prefs.eol;
   p.termWrap = h("div", { class: "console-term hidden" });

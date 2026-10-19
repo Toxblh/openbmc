@@ -69,7 +69,7 @@ label.inline > input, label.inline > select { display: inline-block; width: auto
 .login-box .btn { margin: 8px 0; }
 
 /* ---------- layout ---------- */
-.app { display: flex; flex-direction: column; height: 100%; }
+.app { display: flex; flex-direction: column; height: 100%; height: 100dvh; }
 .topbar { display: flex; align-items: center; gap: 16px; padding: 0 12px; height: 46px; background: var(--bg-2); border-bottom: 1px solid #111; flex-shrink: 0; }
 .brand { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; font-size: 16px; }
 .brand:hover { text-decoration: none; }
@@ -94,13 +94,16 @@ label.inline > input, label.inline > select { display: inline-block; width: auto
   background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; box-shadow: 0 6px 24px #0009; }
 .dropdown-menu.right { left: auto; right: 0; }
 .dropdown.open .dropdown-menu { display: block; }
+/* a tap beside an open menu closes it (iOS sends no click from plain page
+   areas) and does not reach what is under it */
+.dropdown.open::after { content: ""; position: fixed; inset: 0; z-index: 49; cursor: pointer; }
 .dropdown-menu button, .dropdown-menu a { display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text);
   padding: 7px 10px; border-radius: 4px; font: inherit; cursor: pointer; }
 .dropdown-menu button:hover, .dropdown-menu a:hover { background: var(--accent); text-decoration: none; }
 .dropdown-menu .danger { color: #ff7b7c; }
 
 /* ---------- cards / tables ---------- */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
 .card h3 { display: flex; align-items: center; gap: 8px; }
 .card.span2 { grid-column: span 2; }
@@ -165,6 +168,93 @@ table.tbl { width: 100%; border-collapse: collapse; }
   .nav a { padding: 6px; }
   .power-chip span:last-child { display: none; }
 }
+
+/* ---------- phones and touch screens ---------- */
+.nav-btn, .page-title, .nav-extra, .m-only, .m-only-inline { display: none; }
+.con-extra { display: contents; }
+
+/* finger-sized controls wherever the pointer is a finger */
+@media (pointer: coarse) {
+  .btn { min-height: 40px; padding: 8px 14px; }
+  .btn.small { min-height: 36px; padding: 6px 12px; }
+  .tabs button { min-height: 36px; padding: 6px 12px; }
+  .dropdown-menu button, .dropdown-menu a { padding: 12px; }
+  input[type=checkbox], input[type=radio] { width: 20px; height: 20px; }
+  input, select { min-height: 40px; }
+}
+
+@media (max-width: 700px) {
+  /* iOS zooms into any focused field with a font under 16px */
+  input, select, textarea { font-size: 16px; }
+  .topbar { gap: 6px; padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left));
+    height: calc(52px + env(safe-area-inset-top)); }
+  .brand span { display: none; }
+  .page-title { display: block; flex: 1; min-width: 0; font-weight: 600; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .topbar-right { margin-left: 0; gap: 6px; }
+  .user-dd, .m-hide-inline { display: none; }
+  .m-only-inline { display: inline; }
+  .m-only { display: block; }
+  .m-hide { display: none !important; }
+  .nav-btn { display: inline-flex; font-size: 20px; min-width: 44px; justify-content: center; }
+  .power-chip { padding: 6px; }
+  .nav { display: none; }
+  .nav-open .nav { display: flex; flex-direction: column; gap: 2px; position: fixed; z-index: 60; left: 0; right: 0; bottom: 0;
+    top: calc(52px + env(safe-area-inset-top)); overflow-y: auto; background: var(--bg-2);
+    padding: 8px max(12px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
+  .nav-open .nav a { font-size: 17px; padding: 13px 12px; color: var(--text); }
+  .nav-open .nav-extra { display: flex; flex-direction: column; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .nav-open .nav-extra a { color: var(--muted); }
+
+  .page { padding: 12px max(12px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
+  .page.fill { padding: 0 0 env(safe-area-inset-bottom); }
+  .card { padding: 12px; }
+  .kv { grid-template-columns: minmax(84px, max-content) 1fr; gap: 4px 10px; }
+  .tbl th, .tbl td { padding: 6px 5px; }
+  .tbl td.mono { white-space: nowrap; }
+
+  /* dropdowns open as a sheet under the top bar: inside scrolling
+     toolbars an absolutely placed menu would be clipped */
+  .dropdown-menu, .dropdown-menu.right { position: fixed; left: 8px; right: 8px; top: calc(56px + env(safe-area-inset-top)); min-width: 0;
+    max-height: calc(100dvh - 72px - env(safe-area-inset-top)); overflow-y: auto; }
+  .dropdown-menu button, .dropdown-menu a { font-size: 16px; }
+
+  .toasts { left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom)); }
+  .toast { max-width: none; }
+
+  .login-box { width: auto; flex: 1; max-width: 380px; margin: 16px; }
+  input[type=file] { max-width: 100%; min-width: 0; width: 100%; }
+  select { max-width: 100%; }
+  select:empty, select:has(> option:only-child) { min-width: 160px; }
+
+  /* toolbars: one swipeable row instead of three wrapped rows */
+  .kvm-toolbar, .console-toolbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding: 6px 8px; }
+  .kvm-toolbar::-webkit-scrollbar, .console-toolbar::-webkit-scrollbar { display: none; }
+  .kvm-toolbar > *, .console-toolbar > * { flex-shrink: 0; }
+  .kvm-toolbar .spacer, .console-toolbar .spacer { display: none; }
+  .console-toolbar input[type=search] { width: 150px; }
+  .con-extra { display: none; }
+  .con-extra-open .console-toolbar { flex-wrap: wrap; }
+  .con-extra-open .con-extra { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; width: 100%; }
+  .row > input[type=search] { flex: 1 1 160px; min-width: 0; }
+  .statusbar { flex-wrap: wrap; gap: 2px 12px; }
+
+  /* log lines keep their columns: pan sideways instead of clipping */
+  .logview { font-size: 12px; }
+  .logview-inner { min-width: 96ch; }
+  .follow-btn { right: 10px; bottom: 12px; }
+  .console-input { padding: 6px 8px; }
+  .console-input input { min-width: 0; }
+  .console-input select { width: 74px; flex-shrink: 0; }
+  .console-input .btn { flex-shrink: 0; }
+}
+
+/* ---------- KVM on touch screens ---------- */
+.kvm-kbd-input { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; font-size: 16px; resize: none; }
+.kvm-keys { display: flex; gap: 4px; padding: 6px 8px; overflow-x: auto; background: var(--bg-2); border-top: 1px solid #111; scrollbar-width: none; }
+.kvm-keys::-webkit-scrollbar { display: none; }
+.kvm-keys .btn { flex-shrink: 0; min-width: 44px; justify-content: center; font-family: var(--mono); }
+.touch-only { display: none; }
+@media (pointer: coarse), (max-width: 700px) { .touch-only { display: inline-flex; } }
 .alert { margin: 8px 0; padding: 8px 10px; border-radius: 6px; font-size: 13px; border-left: 3px solid; }
 .alert.warn { background: rgba(107, 82, 20, .35); border-color: #d6a72a; }
 .alert.err { background: rgba(107, 33, 34, .35); border-color: #e05555; }

@@ -34,6 +34,7 @@ async function showApp(user) {
   state.loggedIn = true;
   appState.user = user || appState.user || "root";
   $("user-btn").textContent = `${appState.user} ▾`;
+  $("nav-logout").textContent = `Выйти (${appState.user})`;
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   pollPower();
@@ -88,6 +89,10 @@ async function doRoute() {
   const name = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] || "overview").toLowerCase();
   const key = pages[name] ? name : "overview";
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === key));
+  const navLink = document.querySelector(`#nav a[data-page="${key}"]`);
+  $("page-title").textContent = navLink ? navLink.textContent : "";
+  setNavOpen(false);
+  document.querySelectorAll(".dropdown.open").forEach((d) => d.classList.remove("open"));
   $("page").querySelectorAll(".load-error").forEach((e) => e.remove());
 
   if (state.current && state.current !== key) {
@@ -138,9 +143,29 @@ async function doRoute() {
   entry.el.style.flexDirection = entry.mod.fill ? "column" : "";
 }
 
+// Narrow screens: the page links live in a drawer opened by the ☰ button
+function setNavOpen(open) {
+  document.body.classList.toggle("nav-open", open);
+  $("nav-btn").setAttribute("aria-expanded", String(open));
+  $("nav-btn").textContent = open ? "✕" : "☰";
+}
+
 function setupDropdowns() {
+  $("nav-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    setNavOpen(!document.body.classList.contains("nav-open"));
+  });
+  $("nav").addEventListener("click", (e) => e.target.closest("a") && setNavOpen(false));
+  $("nav-logout").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("logout-btn").click();
+  });
   document.addEventListener("click", (e) => {
     const dd = e.target.closest(".dropdown");
+    if (dd && e.target === dd) {
+      dd.classList.remove("open"); // the backdrop beside the open menu
+      return;
+    }
     document.querySelectorAll(".dropdown.open").forEach((d) => d !== dd && d.classList.remove("open"));
     if (dd && e.target.closest(".btn") && e.target.closest(".dropdown") === dd && !e.target.closest(".dropdown-menu")) {
       dd.classList.toggle("open");
@@ -148,6 +173,18 @@ function setupDropdowns() {
       dd && dd.classList.remove("open");
     }
   });
+  // the backdrop beside an open menu, on touch screens without waiting for a click
+  document.addEventListener(
+    "touchend",
+    (e) => {
+      const dd = e.target.closest && e.target.closest(".dropdown.open");
+      if (dd && e.target === dd) {
+        e.preventDefault();
+        dd.classList.remove("open");
+      }
+    },
+    { passive: false },
+  );
   $("power-menu").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-reset]");
     if (b) powerAction(b.dataset.reset);

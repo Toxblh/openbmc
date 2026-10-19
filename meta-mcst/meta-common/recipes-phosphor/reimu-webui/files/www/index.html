@@ -2,7 +2,10 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2b2d31">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>REIMU</title>
   <link rel="icon" href="img/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="css/reimu.css">
@@ -27,6 +30,7 @@
   <div id="app" class="app hidden">
     <header class="topbar">
       <a class="brand" href="#/"><img src="img/favicon.svg" alt=""><span>REIMU</span></a>
+      <span class="page-title" id="page-title"></span>
       <nav class="nav" id="nav">
         <a href="#/" data-page="overview">Обзор</a>
         <a href="#/kvm" data-page="kvm">KVM</a>
@@ -36,13 +40,17 @@
         <a href="#/hardware" data-page="hardware">Оборудование</a>
         <a href="#/logs" data-page="logs">Журнал</a>
         <a href="#/settings" data-page="settings">Настройки</a>
+        <div class="nav-extra">
+          <a href="legacy/">Старый интерфейс</a>
+          <a href="#" id="nav-logout">Выйти</a>
+        </div>
       </nav>
       <div class="topbar-right">
         <div class="power-chip" id="power-chip" title="Состояние питания платформы">
           <span class="led" id="power-led"></span><span id="power-text">…</span>
         </div>
         <div class="dropdown">
-          <button class="btn" id="power-menu-btn" aria-haspopup="true">Питание ▾</button>
+          <button class="btn" id="power-menu-btn" aria-haspopup="true"><span class="m-hide-inline">Питание </span><span class="m-only-inline" aria-label="Питание">⏻ </span>▾</button>
           <div class="dropdown-menu" id="power-menu">
             <button data-reset="On">Включить</button>
             <button data-reset="GracefulShutdown">Выключить (ACPI)</button>
@@ -51,13 +59,14 @@
             <button data-reset="ForceRestart" class="danger">Сброс (RESET)</button>
           </div>
         </div>
-        <div class="dropdown">
+        <div class="dropdown user-dd">
           <button class="btn ghost" id="user-btn">root ▾</button>
           <div class="dropdown-menu right">
             <a href="legacy/">Старый интерфейс</a>
             <button id="logout-btn">Выйти</button>
           </div>
         </div>
+        <button class="btn ghost nav-btn" id="nav-btn" aria-label="Меню" aria-expanded="false">☰</button>
       </div>
     </header>
     <main id="page" class="page"></main>

@@ -8,6 +8,8 @@ import { FatDirBackend, entriesFromHandle, entriesFromFileList, changedFiles, or
 const hasPicker = typeof window.showOpenFilePicker === "function";
 const hasOpfs = !!(navigator.storage && navigator.storage.getDirectory);
 const hasDirPicker = typeof window.showDirectoryPicker === "function";
+// iPhone/iPad Safari picks files, never folders (an iPad reports itself as a Mac)
+const isIOS = /iP(hone|od|ad)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const FOLDER_OVERLAY = 1024 * 1024 * 1024; // RAM for what the host writes to a folder drive
 
 const SLOTS = [
@@ -20,8 +22,8 @@ const MODES = [
   { id: "file-rw", label: "Локальный файл — чтение и запись", ok: () => hasPicker, why: "нужен Chromium-браузер (File System Access API)" },
   { id: "snapshot", label: "Локальный файл — запись в снимок (в памяти браузера)", ok: () => true },
   { id: "opfs", label: "Образ из хранилища браузера", ok: () => hasOpfs, why: "браузер не поддерживает OPFS" },
-  { id: "dir-ro", label: "Папка как флешка — только чтение", ok: () => true },
-  { id: "dir-rw", label: "Папка как флешка — с записью в папку", ok: () => hasDirPicker, why: "только Chrome/Edge: нужен File System Access API" },
+  { id: "dir-ro", label: "Папка как флешка — только чтение", ok: () => !isIOS, why: "на iPhone/iPad браузер не выбирает папки" },
+  { id: "dir-rw", label: "Папка как флешка — с записью в папку", ok: () => hasDirPicker, why: isIOS ? "на iPhone/iPad браузер не выбирает папки" : "только Chrome/Edge: нужен File System Access API" },
 ];
 const isDir = (m) => m === "dir-ro" || m === "dir-rw";
 
@@ -566,7 +568,15 @@ export async function refreshLibrary() {
   // several refreshes may overlap (page show, create, import): only the
   // latest one is allowed to render, otherwise a stale listing could win
   const gen = ++libGeneration;
-  const dir = await imagesDir();
+  let dir;
+  try {
+    dir = await imagesDir();
+  } catch (e) {
+    // e.g. Safari's private mode: the storage exists but refuses to open
+    if (gen === libGeneration)
+      lib.table.replaceChildren(h("tr", {}, h("td", { colspan: 4, class: "muted" }, `Хранилище браузера недоступно (${e.message}). В приватном режиме браузера оно не работает.`)));
+    return;
+  }
   const items = [];
   for await (const [name, handle] of dir.entries()) {
     if (handle.kind !== "file") continue;

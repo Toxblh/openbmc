@@ -43,7 +43,7 @@ export async function mount(el) {
     if (auto.checked) timer = setInterval(refresh, 5000);
   });
   el.append(
-    h("div", { class: "row section" }, h("h2", {}, "Датчики"), h("span", { class: "spacer" }), search, h("label", { class: "inline" }, auto, "автообновление 5 с")),
+    h("div", { class: "row section" }, h("h2", { class: "m-hide" }, "Датчики"), h("span", { class: "spacer m-hide" }), search, h("label", { class: "inline" }, auto, "автообновление 5 с")),
     h("div", { id: "sens-body" }, h("div", { class: "empty" }, "Загрузка…")),
   );
   await refresh();
@@ -105,7 +105,18 @@ function table(title, rows, unit, digits, opts = {}) {
           h(
             "thead",
             {},
-            h("tr", {}, h("th", {}, "Устройство"), h("th", {}, "Датчик"), h("th", {}, "Значение"), opts.duty ? h("th", {}, "Управление") : null, h("th", {}, "Состояние"), h("th", {}, "Предупр."), h("th", {}, "Авария"), h("th", {}, "Адрес")),
+            h(
+              "tr",
+              {},
+              h("th", { class: "m-hide" }, "Устройство"),
+              h("th", {}, "Датчик"),
+              h("th", {}, "Значение"),
+              opts.duty ? h("th", {}, "Упр.") : null,
+              h("th", {}, "Сост."),
+              h("th", { class: "m-hide" }, "Предупр."),
+              h("th", { class: "m-hide" }, "Авария"),
+              h("th", { class: "m-hide" }, "Адрес"),
+            ),
           ),
           h(
             "tbody",
@@ -114,14 +125,15 @@ function table(title, rows, unit, digits, opts = {}) {
               h(
                 "tr",
                 {},
-                h("td", {}, r.group),
-                h("td", {}, r.name),
+                h("td", { class: "m-hide" }, r.group),
+                // on a phone the device column is hidden: its name goes above the sensor's
+                h("td", {}, h("div", { class: "m-only muted small" }, r.group), r.name),
                 h("td", { class: "mono" }, value(r)),
                 opts.duty ? h("td", { class: "mono" }, r.duty === undefined || r.duty === null ? "—" : `${num(r.duty, 0)} %`) : null,
                 h("td", {}, healthBadge(r.status)),
-                h("td", { class: "mono muted" }, num(r.warn, digits)),
-                h("td", { class: "mono muted" }, num(r.crit, digits)),
-                h("td", { class: "mono muted small" }, r.src || ""),
+                h("td", { class: "mono muted m-hide" }, num(r.warn, digits)),
+                h("td", { class: "mono muted m-hide" }, num(r.crit, digits)),
+                h("td", { class: "mono muted small m-hide" }, r.src || ""),
               ),
             ),
           ),
