@@ -6,6 +6,7 @@
 . /libexec/gpio-funcs
 
 OUT=/var/lib/reimu-pns/scan.json
+PNSD=${REIMU_PNSD:-/usr/sbin/reimu-pnsd}
 
 state=$(busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 \
         xyz.openbmc_project.State.Host CurrentHostState 2>/dev/null | cut -d'"' -f2)
@@ -25,7 +26,7 @@ rv=1
 if [ -n "$mtd" ] && [ -e /dev/mtdblock$mtd ]
 then
     mkdir -p ${OUT%/*}
-    if /usr/sbin/reimu-pnsd --parse /dev/mtdblock$mtd > $OUT.tmp
+    if $PNSD --parse /dev/mtdblock$mtd > $OUT.tmp
     then
         mv $OUT.tmp $OUT
         echo "Флеш ПНС прочитан"

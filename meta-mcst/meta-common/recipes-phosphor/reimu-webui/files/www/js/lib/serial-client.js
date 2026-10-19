@@ -1,6 +1,10 @@
 // Client for reimu-serial websocket (/reimu/serial/<N>), newline-delimited
 // JSON protocol (see reimu-serial.c). Keeps a client-side ring of
 // timestamped lines and emits raw byte chunks for terminal emulators.
+//
+// On a BMC whose bmcweb has no /reimu/serial (stock firmware, e.g. under the
+// web devkit's --web-only mode) port 0 falls back to the obmc-console
+// websocket /console0: raw bytes, no history, timestamps taken on arrival.
 
 import { api } from "../api.js";
 
@@ -51,26 +55,58 @@ export class SerialClient extends EventTarget {
     this._rx = "";
     this._dec = new TextDecoder("utf-8");
     this.stats = { rxBytes: 0, txBytes: 0 };
+    this.legacy = false; // talking to /console0
+    this._everOpened = false;
+    this._failedOpens = 0;
   }
 
   connect() {
     this.closedByUser = false;
     this.historyDone = false;
-    const ws = (this.ws = api.websocket(`/reimu/serial/${this.index}`));
+    const ws = (this.ws = api.websocket(this.legacy ? "/console0" : `/reimu/serial/${this.index}`));
+    let opened = false;
     ws.onopen = () => {
+      opened = this._everOpened = true;
+      this._failedOpens = 0;
       this.connected = true;
       this.retry = 0;
       this._emit("connection", { connected: true });
+      if (this.legacy) this._legacyHello();
     };
-    ws.onmessage = (ev) => this._onData(ev.data);
+    ws.onmessage = (ev) => (this.legacy ? this._onLegacyData(ev.data) : this._onData(ev.data));
     ws.onclose = (ev) => {
       this.connected = false;
       this._emit("connection", { connected: false, reason: ev.reason });
+      // the route doesn't exist (bmcweb refuses the upgrade): try /console0
+      if (!opened && !this.legacy && !this._everOpened && this.index === 0 && ++this._failedOpens >= 2) {
+        this.legacy = true;
+        this.retry = 0;
+      }
       if (!this.closedByUser) {
         const delay = Math.min(10000, 500 * 2 ** this.retry++);
         this._timer = setTimeout(() => this.connect(), delay);
       }
     };
+  }
+
+  _legacyHello() {
+    if (this.info) return;
+    this._onMessage({
+      type: "hello",
+      legacy: true,
+      online: true,
+      device: "/console0",
+      maxLines: 20000,
+      ports: [{ index: 0, name: "console0", title: "Консоль платформы (obmc-console, без истории на BMC)" }],
+    });
+    this._onMessage({ type: "history_end", partial: [0, ""] });
+  }
+
+  _onLegacyData(data) {
+    const bytes = typeof data === "string" ? encoder.encode(data) : new Uint8Array(data);
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    this._onMessage({ type: "data", t: Date.now(), d: btoa(s) });
   }
 
   close() {
@@ -181,19 +217,24 @@ export class SerialClient extends EventTarget {
     const bytes = typeof data === "string" ? encoder.encode(data) : data;
     if (!bytes.length) return;
     this.stats.txBytes += bytes.length;
+    if (this.legacy) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(bytes);
+      return;
+    }
     this._send({ type: "write", d: b64enc(bytes) });
   }
 
   sendBreak() {
-    this._send({ type: "break" });
+    if (!this.legacy) this._send({ type: "break" });
   }
 
   setBaud(baud) {
-    this._send({ type: "baud", value: Number(baud) });
+    if (!this.legacy) this._send({ type: "baud", value: Number(baud) });
   }
 
   clearHistory() {
-    this._send({ type: "clear" });
+    if (this.legacy) this._onMessage({ type: "cleared" });
+    else this._send({ type: "clear" });
   }
 }
 

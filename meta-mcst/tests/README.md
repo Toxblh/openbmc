@@ -47,6 +47,7 @@ Run the tests:
     node kvm.spec.mjs           # web KVM through bmcweb /kvm/0
     node platform.spec.mjs      # power, sensors, inventory, PNS flash scan
     node firmware.spec.mjs      # A/B update: upload, health check, fallback, restore
+    node webdev.spec.mjs        # tmpfs web devkit on a "stock" BMC (DEVKIT, STOCK_BMCWEB)
     node jpeg-bench.mjs         # JPEG decode path benchmark
 
 Environment: `BASE`, `VMSSH`, `COM1`, `CHROME`, `OUT` (screenshots), `WORK`;
@@ -58,3 +59,11 @@ reimu-wdt2, reimu-flashcopy, reimu-firmwared and their units installed):
     testvm/fixtures/make-ab-images.py /tmp/reimu-e2e/ab        # needs mksquashfs
     scp chipA.img chipB.img and ab-stand.sh into the VM (/root/ab, /usr/local/sbin)
     ab-stand.sh setup /root/ab/chipA.img /root/ab/chipB.img     # in the VM
+
+The web devkit test turns the VM into a stock REIMU BMC (REIMU-revision
+bmcweb without this tree's patches, old UI page) and runs the devkit built
+for x86 on it:
+
+    STUB_LIBS=<dir with the VM's libsystemd.so.0, libudev.so.1, libpam.so.0> \
+        TARGET=x86_64 ../tools/webdev/build.sh /tmp/webdev-x86
+    DEVKIT=/tmp/webdev-x86/reimu-webdev-*-x86_64.tar.gz STOCK_BMCWEB=<stock bmcweb> node e2e/webdev.spec.mjs

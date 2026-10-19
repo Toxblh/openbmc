@@ -13,6 +13,8 @@
  *   /var/volatile/motherboard_devtree.dts device tree from the ПНС flash (mcst-fruid)
  *   /var/lib/reimu-pns/scan.json         last flash scan (reimu-pns-scan)
  *
+ * REIMU_PNS_SCAN overrides the scan tool path (tmpfs web devkit).
+ *
  * Parser mode: reimu-pnsd --parse <mtd device or image file>
  *   prints JSON with flash size and partition table of the ПНС flash.
  *
@@ -351,7 +353,9 @@ static int method_rescan(sd_bus_message *m, void *ud, sd_bus_error *err)
             dup2(pipefd[1], 1);
             dup2(pipefd[1], 2);
             close(pipefd[0]);
-            execl(SCAN_TOOL, SCAN_TOOL, (char *)NULL);
+            const char *tool = getenv("REIMU_PNS_SCAN");
+            if (!tool) tool = SCAN_TOOL;
+            execl(tool, tool, (char *)NULL);
             _exit(127);
         }
         close(pipefd[1]);

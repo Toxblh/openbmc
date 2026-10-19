@@ -317,11 +317,12 @@ function updateStatus() {
   const info = active.client.info;
   $("st-port").textContent = info ? `${active.title} (${info.device})` : active.title;
   const online = active.client.connected && info && info.online;
-  $("st-online").textContent = !active.client.connected ? "нет связи с BMC" : info && !info.online ? "устройство недоступно" : online ? `${info.baud} бод` : "…";
+  $("st-online").textContent = !active.client.connected ? "нет связи с BMC" : info && !info.online ? "устройство недоступно" : online ? (info.legacy ? "штатная прошивка: история только в браузере" : `${info.baud} бод`) : "…";
   $("st-online").style.color = online ? "" : "var(--warn)";
   $("st-lines").textContent = `${active.client.lines.length} / ${active.client.maxLines}`;
   $("st-rx").textContent = `${active.client.stats.rxBytes} Б`;
-  if (info) $("con-baud").value = info.baud;
+  if (info && !info.legacy) $("con-baud").value = info.baud;
+  $("con-baud").disabled = !!(info && info.legacy);
   $("st-hint").textContent = prefs.mode === "log" ? "Клик в ленту — ввод прямо в порт; выделение мышью — копирование" : "";
 }
 
