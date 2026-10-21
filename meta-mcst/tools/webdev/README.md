@@ -13,7 +13,7 @@ back the stock firmware.
     tar xf obmc-phosphor-image-reimu-5564.static.mtd.tar image-rofs
     unsquashfs -d /tmp/stock-rofs image-rofs
     BMC_ROOTFS=/tmp/stock-rofs meta-mcst/tools/webdev/build.sh /tmp/webdev
-    # -> /tmp/webdev/reimu-webdev-<git describe>.tar.gz (~3.3 MiB)
+    # -> /tmp/webdev/reimu-webdev-<git describe>.tar.gz (~2.5 MiB)
 
 Needs `git curl python3 python3-venv cmake ninja-build pkg-config dpkg-dev
 binutils-arm-linux-gnueabi squashfs-tools`. `BMC_ROOTFS` is optional but
@@ -30,6 +30,8 @@ Contents:
 | `bin/nbd-proxy` | jsnbd; `-L` (no netlink) only for an nbd-client built with netlink, REIMU's has none; its configuration and state hook are in `etc/nbd-proxy` |
 | `bin/reimu-serial` | consoles with a 20000-line timestamped history |
 | `bin/reimu-pnsd`, `libexec/reimu-pns-scan` | ПНС information |
+| `bin/reimu-kvm` | KVM straight to the browser: the video engine's JPEG (or the host's H.264) over its own TLS websocket on :8443, keyboard and mouse into the USB HID gadget; obmc-ikvm runs at 60 frames/s next to it for VNC |
+| `libexec/reimu-hid-wheel` | gives the KVM mouse a wheel (the host sees the USB keyboard and mouse reconnect once at start and at stop) |
 | `reimu-webdev` | the control script |
 
 Cross-compilation without the BMC's sysroot:
@@ -47,8 +49,13 @@ Cross-compilation without the BMC's sysroot:
   (reimu-serial crashed in `getopt()`). The build refuses copy relocations;
 * C++ uses zig's libc++, linked statically. The BMC's libstdc++ isn't
   involved, so ABI differences don't matter;
-* openssl 1.1.1, zlib, tinyxml2 and json-c are built from source and linked
-  statically;
+* zlib, tinyxml2 and json-c are built from source and linked statically;
+  openssl 1.1.1 only for its headers: bmcweb and reimu-kvm link against the
+  BMC's own libssl/libcrypto (stubs as below), whose ARM assembler makes TLS
+  much cheaper than a portable (no-asm) build;
+* zig's compiler-rt puts weak byte-by-byte memcpy/memmove/memset into every
+  executable, and they win over glibc's tuned ARM ones (bmcweb spent a fifth
+  of its time there). `fastmem.c` forwards them to glibc;
 * libsystemd, libudev and libpam are linked against stubs made by
   `mkstub.py` from the BMC's libraries (`BMC_ROOTFS`) or Ubuntu 20.04
   packages, with the same sonames and symbol versions (`LIBSYSTEMD_209`…,

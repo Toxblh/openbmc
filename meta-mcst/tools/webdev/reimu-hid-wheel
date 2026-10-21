@@ -1,0 +1,37 @@
+#!/bin/sh
+# reimu-hid-wheel on|off: the KVM's USB mouse (obmc_hid hid.1, made by
+# create_usbhid.sh) with or without a scroll wheel.
+#
+# The stock mouse report is 5 bytes: buttons, x, y (absolute 0..32767). "on"
+# adds two relative bytes, wheel and AC Pan (7 bytes). The host reads the
+# descriptor when the device connects, so the gadget is disconnected for a
+# moment (keyboard and mouse reconnect). Writers of /dev/hidg* (obmc-ikvm,
+# reimu-kvm) must be stopped meanwhile: a 5.10 f_hid file left open across
+# the unbind points to a freed function. obmc-ikvm keeps writing 5-byte
+# reports to the 7-byte mouse; the host takes the missing bytes as 0.
+G=/sys/kernel/config/usb_gadget/obmc_hid
+F=$G/functions/hid.1
+STOCK='\005\001\011\002\241\001\011\001\241\000\005\011\031\001\051\003\025\000\045\001\225\003\165\001\201\002\225\001\165\005\201\003\005\001\011\060\011\061\065\000\106\377\177\025\000\046\377\177\145\021\125\000\165\020\225\002\201\002\300\300'
+WHEEL='\005\001\011\002\241\001\011\001\241\000\005\011\031\001\051\003\025\000\045\001\225\003\165\001\201\002\225\001\165\005\201\003\005\001\011\060\011\061\065\000\106\377\177\025\000\046\377\177\145\021\125\000\165\020\225\002\201\002\011\070\065\000\105\000\145\000\025\201\045\177\165\010\225\001\201\006\005\014\012\070\002\025\201\045\177\165\010\225\001\201\006\300\300'
+
+case "${1:-}" in
+    on) len=7; desc=$WHEEL ;;
+    off) len=5; desc=$STOCK ;;
+    *) echo "usage: $0 on|off" >&2; exit 2 ;;
+esac
+[ -d $F ] || { echo "no KVM mouse gadget ($F)" >&2; exit 1; }
+# one write(): configfs takes each write as the whole descriptor, and bash's
+# printf splits its output at a 0x0a byte
+tmp=/run/reimu-hid-desc.$$
+printf "$desc" > $tmp
+if [ "$(cat $F/report_length)" = $len ] && cmp -s $tmp $F/report_desc; then rm -f $tmp; exit 0; fi
+
+udc=$(cat $G/UDC)
+[ -n "$udc" ] && echo "" > $G/UDC
+rm $G/configs/c.1/hid.1
+echo $len > $F/report_length
+cat $tmp > $F/report_desc
+rm -f $tmp
+ln -s $F $G/configs/c.1/hid.1
+[ -n "$udc" ] && echo "$udc" > $G/UDC
+echo "KVM mouse: $len-byte reports$([ $len = 7 ] && echo ', with wheel')"

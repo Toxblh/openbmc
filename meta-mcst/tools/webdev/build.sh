@@ -19,10 +19,11 @@
 #
 # Needs: git, curl, python3 + pip, ninja, pkg-config, cmake, readelf/strip for ARM
 # (binutils-arm-linux-gnueabi), dpkg-deb. No Yocto: the compiler is zig
-# (from PyPI), which links against any glibc version; libsystemd, libudev
-# and libpam are linked as stubs with the real symbol versions (the BMC's
-# libraries are used at run time); openssl, zlib, tinyxml2 and json-c are
-# linked statically.
+# (from PyPI), which links against any glibc version; libsystemd, libudev,
+# libpam and openssl are linked as stubs with the real symbol versions (the
+# BMC's libraries are used at run time: its openssl has the ARM assembler,
+# much cheaper TLS than a portable build); zlib, tinyxml2 and json-c are linked
+# statically. fastmem.c puts glibc's memcpy back in place of zig's byte loops.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -47,6 +48,7 @@ p/pam/libpam0g-dev_1.3.1-5ubuntu4_armhf.deb 117ebb881ee1030e3fb4cd9e80b4e49a45fe
 p/pam/libpam0g_1.3.1-5ubuntu4_armhf.deb 6d6248683668f770cd79764ae75630285af7b52540d6a62bb103edab2b35dd84
 s/systemd/libudev-dev_245.4-4ubuntu3_armhf.deb fa6e1ca02604f21b39670d3e2eee80df37b70dc121a07e7ee71ef259624a91b8
 s/systemd/libudev1_245.4-4ubuntu3_armhf.deb 557a2bbf182c52712e7f36a48998258bb440528329b270d53c86a4e2a5ee27dd
+o/openssl/libssl1.1_1.1.1f-1ubuntu2_armhf.deb fde1628edbebc3b4aba18f2568b703a4c2003e4903c4e01f899b489f4e426d3f
 "
 TARGET=${TARGET:-arm}
 case "$TARGET" in
@@ -108,7 +110,7 @@ CC=arm-zig-cc
 
 # ---------------------------------------------------------------- sysroot
 step "sysroot: headers and link stubs of libsystemd, libudev and libpam (Ubuntu focal)"
-mkdir -p "$W/debs"
+mkdir -p "$W/debs" && rm -rf "$W/debs/root"
 echo "$DEBS" | while read -r f sha; do
     [ -n "$f" ] || continue
     d="$W/debs/${f##*/}"
@@ -135,7 +137,7 @@ Version: 246
 systemdsystemunitdir=/lib/systemd/system
 EOF
 
-step "static zlib, tinyxml2, openssl"
+step "static zlib, tinyxml2; openssl headers"
 gitat https://github.com/madler/zlib.git "$SRC/zlib" v1.2.13
 (cd "$SRC/zlib" && CC=$CC AR=arm-zig-ar RANLIB=arm-zig-ranlib CFLAGS=-O2 ./configure --static --prefix="$SYS/usr" >/dev/null &&
     make -s -j"$(nproc)" libz.a >/dev/null && make -s install >/dev/null)
@@ -153,6 +155,17 @@ gitat https://github.com/openssl/openssl.git "$SRC/openssl" OpenSSL_1_1_1w
 (cd "$SRC/openssl" && ./Configure $SSLTARGET no-asm no-shared no-tests no-engine no-dso no-async -O2 \
     --prefix="$SYS/usr" --openssldir=/etc/ssl CC=$CC AR=arm-zig-ar RANLIB=arm-zig-ranlib >/dev/null &&
     make -s -j"$(nproc)" build_libs >/dev/null 2>&1 && make -s install_dev >/dev/null 2>&1)
+# link against the BMC's own libssl/libcrypto (1.1.1, same ABI as these
+# headers); the x86 test VM build keeps the static ones
+if [ "$TARGET" = arm ]; then
+    rm -f "$SYS"/usr/lib/libssl.a "$SYS"/usr/lib/libcrypto.a
+    ssl_libs=${BMC_ROOTFS:+$BMC_ROOTFS/usr/lib}
+    for l in libssl.so.1.1 libcrypto.so.1.1; do
+        python3 "$HERE/mkstub.py" "${ssl_libs:-$W/debs/root/usr/lib/arm-linux-gnueabihf}/$l" "$SYS/usr/lib" $CC
+    done
+fi
+mkdir -p "$W/obj"
+$CC -O2 -fPIE -c "$HERE/fastmem.c" -o "$W/obj/fastmem.o"
 gitat https://github.com/json-c/json-c.git "$SRC/json-c" json-c-0.15-20200726
 (mkdir -p "$SRC/json-c/build" && cd "$SRC/json-c/build" &&
     cmake .. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=$MCPU -DCMAKE_C_COMPILER="$BIN/arm-zig-cc" \
@@ -175,8 +188,8 @@ pkg_config_libdir = '$SYS/usr/lib/pkgconfig'
 [built-in options]
 c_args = ['-isystem', '$SYS/usr/include']
 cpp_args = ['-isystem', '$SYS/usr/include']
-c_link_args = ['-L$SYS/usr/lib']
-cpp_link_args = ['-L$SYS/usr/lib']
+c_link_args = ['-L$SYS/usr/lib', '$W/obj/fastmem.o', '-ldl']
+cpp_link_args = ['-L$SYS/usr/lib', '$W/obj/fastmem.o', '-ldl']
 
 [host_machine]
 system = 'linux'
@@ -207,10 +220,9 @@ fi
     ninja -C build bmcweb >/dev/null)
 
 # ---------------------------------------------------------------- daemons
-step "nbd-proxy $JSNBD_REV + REIMU patch, reimu-serial, reimu-pnsd"
+step "nbd-proxy $JSNBD_REV + REIMU patch, reimu-serial, reimu-pnsd, reimu-kvm"
 gitat https://github.com/openbmc/jsnbd.git "$SRC/jsnbd" "$JSNBD_REV"
 for p in "$MCST"/meta-common/recipes-connectivity/jsnbd/files/*.patch; do patch -s -d "$SRC/jsnbd" -p1 < "$p"; done
-mkdir -p "$W/obj"
 # All programs are built as PIE (here and bmcweb's -Db_pie=true): zig 0.13's
 # glibc link stub puts every data object (environ, stderr, optarg...) at one
 # address, so a non-PIE executable gets one copy relocation for all of them
@@ -222,7 +234,9 @@ $CC -O2 -Wall -fPIE -pie -I"$W/obj" -isystem "$SYS/usr/include" -isystem "$SYS/u
     -o "$W/obj/nbd-proxy" "$SRC/jsnbd/nbd-proxy.c" -L"$SYS/usr/lib" -ljson-c -ludev
 $CC -O2 -Wall -fPIE -pie -o "$W/obj/reimu-serial" "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c"
 $CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-pnsd" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c" \
-    "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.c" -L"$SYS/usr/lib" -lsystemd -lm
+    "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.c" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-journal.c" -L"$SYS/usr/lib" -lsystemd -lm
+$CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-kvm" "$MCST/meta-common/recipes-mcst/reimu-kvm/files/reimu-kvm.c" \
+    "$W/obj/fastmem.o" -L"$SYS/usr/lib" -lssl -lcrypto -lsystemd -ldl
 
 # ---------------------------------------------------------------- package
 VERSION=$(git -C "$MCST" describe --always --dirty 2>/dev/null || echo unknown)
@@ -233,9 +247,13 @@ $STRIP -o "$P/bin/bmcweb" "$SRC/bmcweb/build/bmcweb"
 $STRIP -o "$P/bin/nbd-proxy" "$W/obj/nbd-proxy"
 $STRIP -o "$P/bin/reimu-serial" "$W/obj/reimu-serial"
 $STRIP -o "$P/bin/reimu-pnsd" "$W/obj/reimu-pnsd"
+$STRIP -o "$P/bin/reimu-kvm" "$W/obj/reimu-kvm"
+install -m755 "$HERE/reimu-hid-wheel" "$P/libexec/"
 install -m755 "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pns-scan" "$P/libexec/"
 install -m644 "$MCST/meta-common/recipes-mcst/reimu-pns/files/xyz.openbmc_project.Reimu.Pns.conf" "$P/etc/dbus/"
+install -m644 "$MCST/meta-common/recipes-mcst/reimu-kvm/files/xyz.openbmc_project.Reimu.Kvm.conf" "$P/etc/dbus/"
 install -m644 "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.conf" "$P/etc/"
+install -m755 "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-ssh-host" "$P/libexec/"
 install -m644 "$MCST/meta-common/recipes-connectivity/jsnbd/files/config.json" "$P/etc/nbd-proxy/"
 install -m755 "$MCST/meta-common/recipes-connectivity/jsnbd/files/reimu_state_hook" "$P/etc/nbd-proxy/state"
 cp -r "$MCST/meta-common/recipes-phosphor/reimu-webui/files/www" "$P/www"

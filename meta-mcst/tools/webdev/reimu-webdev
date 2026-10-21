@@ -18,8 +18,13 @@
 #   * stops tmux-logger and obmc-console (they own the platform UART; the
 #     list can be replaced with REIMU_WEBDEV_STOP="unit ...") and
 #     starts reimu-serial instead, with a tmux/minicom "SoL" session on its
-#     pty for SSH users, as the new firmware does;
+#     pty for SSH users, as the new firmware does, and the console tab
+#     «SSH: платформа» (its key and target live in /run, lost on reboot);
 #   * starts reimu-pnsd (ПНС information) with its D-Bus policy;
+#   * KVM: starts reimu-kvm (frames straight to the browser on :8443) and
+#     obmc-ikvm at 60 frames/s instead of start-ipkvm, and gives the KVM
+#     mouse a wheel (reimu-hid-wheel: the host sees the USB keyboard and
+#     mouse reconnect once, at start and at stop);
 #   * restarts bmcweb and checks that the web answers; if it doesn't,
 #     everything is rolled back.
 # --web-only replaces only the web UI files (stock bmcweb and daemons): to
@@ -67,10 +72,12 @@ do_stop()
 {
     [ -d $R ] || { log "not running"; return 0; }
     local m u
-    for u in reimu-webdev-pnsd reimu-webdev-serial; do
+    for u in reimu-webdev-kvm reimu-webdev-ikvm reimu-webdev-pnsd reimu-webdev-serial; do
         systemctl stop $u 2>/dev/null
         systemctl reset-failed $u 2>/dev/null
     done
+    # no /dev/hidg* writer is left: the stock mouse again
+    [ -f $R/wheel ] && "$(cat $R/dir)/libexec/reimu-hid-wheel" off
     [ -f $R/tmux ] && tmux kill-session -t SoL 2>/dev/null
     # the bound binaries must not be running while they are unmounted
     systemctl stop bmcweb.service 2>/dev/null
@@ -114,9 +121,12 @@ do_start()
             fi
         done
         # the BMC's own port list wins (a board with more COM ports)
-        conf="$D/etc/reimu-serial.conf"
+        # (the devkit copy of the list runs its own reimu-ssh-host; state on tmpfs)
+        conf=$R/reimu-serial.conf
+        sed "s|exec:/usr/libexec/reimu-ssh-host|exec:$D/libexec/reimu-ssh-host|" "$D/etc/reimu-serial.conf" > $conf
         [ -f /etc/reimu-serial.conf ] && conf=/etc/reimu-serial.conf
         systemd-run -q --unit=reimu-webdev-serial -p Restart=always -p RestartSec=2 \
+            --setenv=REIMU_SERIAL_STATE=$R/serial-state --setenv=REIMU_SSH_STATE=$R/ssh \
             "$D/bin/reimu-serial" -c "$conf"
 
         # D-Bus policy of reimu-pnsd: a tmpfs copy of the policy directory
@@ -131,6 +141,18 @@ do_start()
         systemd-run -q --unit=reimu-webdev-pnsd -p Restart=on-failure --setenv=REIMU_PNS_SCAN="$D/libexec/reimu-pns-scan" \
             --setenv=REIMU_PNSD="$D/bin/reimu-pnsd" --setenv=REIMU_FRU_CACHE=$R/fru.xml --setenv=REIMU_PNS_SCAN_OUT=$R/scan.json "$D/bin/reimu-pnsd" ||
             log "WARNING: reimu-pnsd didn't start (ПНС page will be empty)"
+
+        # KVM: obmc-ikvm (VNC) at the engine's rate, reimu-kvm for the
+        # browser; the mouse gets its wheel while nothing writes /dev/hidg*
+        if unit_active start-ipkvm.service; then
+            systemctl stop start-ipkvm.service && echo start-ipkvm.service >> $R/stopped
+        fi
+        /usr/bin/create_usbhid.sh 2>/dev/null
+        "$D/libexec/reimu-hid-wheel" on && touch $R/wheel
+        systemd-run -q --unit=reimu-webdev-ikvm -p Restart=always -p RestartSec=2 \
+            /usr/bin/obmc-ikvm -v /dev/video0 -k /dev/hidg0 -p /dev/hidg1 -f 60
+        systemd-run -q --unit=reimu-webdev-kvm -p Restart=always -p RestartSec=2 "$D/bin/reimu-kvm" ||
+            log "WARNING: reimu-kvm didn't start (KVM falls back to VNC)"
 
         # SoL for SSH users, like the new tmux-logger
         if command -v tmux >/dev/null && command -v minicom >/dev/null; then
@@ -159,7 +181,7 @@ do_status()
     log "running $(cat "$(cat $R/dir)/VERSION") from $(cat $R/dir)"
     echo "bind mounts:"; sed 's/^/  /' $R/mounts
     echo "units:"
-    for u in reimu-webdev-serial reimu-webdev-pnsd bmcweb.service; do
+    for u in reimu-webdev-serial reimu-webdev-pnsd reimu-webdev-kvm reimu-webdev-ikvm bmcweb.service; do
         printf '  %-22s %s\n' $u "$(systemctl is-active $u 2>/dev/null)"
     done
     [ -s $R/stopped ] && { echo "stopped stock units:"; sed 's/^/  /' $R/stopped; }
