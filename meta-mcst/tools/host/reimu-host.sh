@@ -144,6 +144,9 @@ RestartSec=3
 ProtectHome=yes
 ProtectSystem=strict
 PrivateTmp=yes
+# Mesa's shader cache (the home directory is hidden from the service)
+CacheDirectory=reimu
+Environment=XDG_CACHE_HOME=/var/cache/reimu
 
 [Install]
 WantedBy=multi-user.target

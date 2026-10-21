@@ -26,7 +26,7 @@ key frame.
 Stream to the BMC: one JSON line {"codec","w","h","fps"}, then frames as
 u32 length (big endian), u8 key frame, H.264 access unit (Annex B).
 """
-import argparse, glob, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
+import argparse, ctypes, glob, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
 
 ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 ap.add_argument("--port", type=int, default=8555)
@@ -54,14 +54,61 @@ def gpu():
     return None
 
 
-def kms_size(card):
-    """Size of the buffer on screen: ffmpeg's kmsgrab tells it when opening."""
-    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-device", card, "-f", "kmsgrab", "-i", "-",
-                          "-frames:v", "1", "-f", "null", "-"], capture_output=True, text=True, timeout=10).stderr
-    m = re.search(r"Video: .*?(\d{3,5})x(\d{3,5})", out)
-    if not m:
-        raise RuntimeError("kmsgrab: " + (out.strip().splitlines() or ["no output"])[-1])
-    return int(m.group(1)), int(m.group(2))
+class _Plane(ctypes.Structure):
+    _fields_ = [("count_formats", ctypes.c_uint32), ("formats", ctypes.c_void_p), ("plane_id", ctypes.c_uint32),
+                ("crtc_id", ctypes.c_uint32), ("fb_id", ctypes.c_uint32), ("crtc_x", ctypes.c_uint32),
+                ("crtc_y", ctypes.c_uint32), ("x", ctypes.c_uint32), ("y", ctypes.c_uint32),
+                ("possible_crtcs", ctypes.c_uint32), ("gamma_size", ctypes.c_uint32)]
+
+
+class _PlaneRes(ctypes.Structure):
+    _fields_ = [("count_planes", ctypes.c_uint32), ("planes", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class _Props(ctypes.Structure):
+    _fields_ = [("count_props", ctypes.c_uint32), ("props", ctypes.POINTER(ctypes.c_uint32)),
+                ("prop_values", ctypes.POINTER(ctypes.c_uint64))]
+
+
+class _Prop(ctypes.Structure):
+    _fields_ = [("prop_id", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("name", ctypes.c_char * 32)]
+
+
+class _FB(ctypes.Structure):
+    _fields_ = [("fb_id", ctypes.c_uint32), ("width", ctypes.c_uint32), ("height", ctypes.c_uint32)]
+
+
+def kms_screen(card):
+    """(plane id, width, height) of the primary plane on screen. kmsgrab by
+    itself takes the first plane with a buffer, which can be the 256x256
+    hardware cursor."""
+    drm = ctypes.CDLL("libdrm.so.2")
+    for f, res in (("drmModeGetPlaneResources", _PlaneRes), ("drmModeGetPlane", _Plane),
+                   ("drmModeObjectGetProperties", _Props), ("drmModeGetProperty", _Prop), ("drmModeGetFB", _FB)):
+        getattr(drm, f).restype = ctypes.POINTER(res)
+    fd = os.open(card, os.O_RDWR)
+    try:
+        drm.drmSetClientCap(fd, ctypes.c_uint64(2), ctypes.c_uint64(1))  # DRM_CLIENT_CAP_UNIVERSAL_PLANES
+        pr = drm.drmModeGetPlaneResources(fd)
+        if not pr:
+            raise RuntimeError(f"{card}: no planes")
+        for i in range(pr.contents.count_planes):
+            pl = drm.drmModeGetPlane(fd, pr.contents.planes[i])
+            if not pl or not pl.contents.fb_id:
+                continue
+            props = drm.drmModeObjectGetProperties(fd, pl.contents.plane_id, ctypes.c_uint32(0xeeeeeeee))
+            kind = None
+            for k in range(props.contents.count_props if props else 0):
+                pp = drm.drmModeGetProperty(fd, props.contents.props[k])
+                if pp and pp.contents.name == b"type":
+                    kind = props.contents.prop_values[k]
+            if kind == 1:  # DRM_PLANE_TYPE_PRIMARY
+                fb = drm.drmModeGetFB(fd, pl.contents.fb_id)
+                if fb:
+                    return pl.contents.plane_id, fb.contents.width, fb.contents.height
+        raise RuntimeError(f"{card}: nothing on screen (blanked?)")
+    finally:
+        os.close(fd)
 
 
 def find_x():
@@ -95,17 +142,22 @@ def x11_size():
 
 GRAB = None  # "kms" or "x11", chosen in main()
 CARD = None
+PLANE = None
 
 
 def size():
-    return kms_size(CARD) if GRAB == "kms" else x11_size()
+    global PLANE
+    if GRAB != "kms":
+        return x11_size()
+    PLANE, w, h = kms_screen(CARD)
+    return w, h
 
 
 def ffmpeg_cmd(w, h, out):
     b = args.bitrate
     if GRAB == "kms":
         # the scanout buffer as a DRM PRIME frame, mapped into VAAPI on the same card
-        src = ["-device", CARD, "-f", "kmsgrab", "-framerate", str(args.fps), "-i", "-",
+        src = ["-device", CARD, "-f", "kmsgrab", "-plane_id", str(PLANE), "-framerate", str(args.fps), "-i", "-",
                "-vf", f"hwmap=derive_device=vaapi,scale_vaapi=w={w}:h={h}:format=nv12"]
     else:
         src = ["-vaapi_device", "/dev/dri/renderD128",
@@ -156,7 +208,7 @@ def is_key(au):
 def serve(conn, peer):
     try:
         w, h = size()
-    except (RuntimeError, subprocess.TimeoutExpired) as e:
+    except (RuntimeError, OSError) as e:
         log(f"{peer}: {e}")
         conn.close()
         return
