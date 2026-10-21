@@ -9,7 +9,8 @@
 #     (only the changed rows, pointer drawn in).
 #   * H.264 from the video card's own encoder (VAAPI), 60 frames/s at a few
 #     Mbit/s: reimu-h264 takes the buffer on screen (KMS) without a copy through
-#     the CPU; the BMC relays it to the browser (Источник: «H.264 с хоста»).
+#     the CPU, with the sound of the logged-in user (Opus); the BMC relays it
+#     to the browser (Источник: «H.264 с хоста», button «Звук»).
 # Also: an EDID for the ASPEED VGA, so it runs 1920x1080 without a monitor.
 #
 #   sudo ./reimu-host.sh install [--bmc IP] [--fps N] [--bitrate MBIT]
@@ -141,7 +142,9 @@ After=network.target
 ExecStart=/usr/bin/python3 $LIB/reimu-h264.py --allow $bmc --bitrate $bitrate
 Restart=always
 RestartSec=3
-ProtectHome=yes
+# /run/user stays visible: the sound comes from the logged-in user's PipeWire
+# (ffmpeg for it runs as that user); its home must stay readable for that
+InaccessiblePaths=-/root
 ProtectSystem=strict
 PrivateTmp=yes
 # Mesa's shader cache (the home directory is hidden from the service)

@@ -12,7 +12,7 @@ import { RFB, KeyTable } from "../../vendor/novnc/novnc.js";
 import { installAccel, accelStats } from "../lib/novnc-accel.js";
 import { keyBar, ARROWS, FKEYS } from "../lib/keybar.js";
 import { touchpad } from "../lib/touchpad.js";
-import { DirectKvm, directTicket, directStats, h264Supported } from "../lib/directkvm.js";
+import { DirectKvm, directTicket, directStats, h264Supported, audioSupported } from "../lib/directkvm.js";
 
 export const fill = true;
 
@@ -128,6 +128,7 @@ export async function mount(el) {
         h("div", { class: "dropdown-menu", id: "kvm-combos" }, COMBOS.map((c, i) => h("button", { "data-i": i }, c.label))),
       ),
       h("span", { class: "m-hide-inline" }, btn("kvm-paste", "Вставить текст", "Напечатать текст из буфера на платформе (только латиница/ASCII)"), " ", btn("kvm-shot", "Снимок", "Сохранить снимок экрана в PNG")),
+      btn("kvm-sound", "Звук", "Звук платформы (идёт вместе с H.264 с хоста: reimu-h264 на платформе)"),
       btn("kvm-scale", "Масштаб", "Вписать в окно / 1:1"),
       h("span", { class: "m-hide-inline" }, btn("kvm-view", "Только просмотр", "Не передавать клавиатуру и мышь")),
       h("button", { class: "btn small", id: "kvm-full", title: "Полный экран" }, icon("fullscreen"), h("span", { class: "m-hide-inline" }, "Полный экран")),
@@ -207,6 +208,15 @@ export async function mount(el) {
   tp = touchpad(screen, () => rfb);
   $("kvm-paste").addEventListener("click", pasteText);
   $("kvm-shot").addEventListener("click", screenshot);
+  // a click is what lets the browser start sound
+  $("kvm-sound").addEventListener("click", () => {
+    if (!audioSupported()) return toast("Браузер не умеет WebCodecs (AudioDecoder): звука не будет", "err");
+    prefs.audio = !prefs.audio;
+    savePrefs();
+    applyPrefs();
+    if (rfb && rfb.setAudio) rfb.setAudio(prefs.audio);
+    if (prefs.audio && source !== "h264") toast("Звук идёт только вместе с H.264 с хоста", "ok");
+  });
   $("kvm-scale").addEventListener("click", () => {
     prefs.scale = !prefs.scale;
     savePrefs();
@@ -231,6 +241,7 @@ export async function mount(el) {
 function applyPrefs() {
   const $ = (id) => root.querySelector("#" + id);
   $("kvm-scale").classList.toggle("active", prefs.scale);
+  $("kvm-sound").classList.toggle("active", !!prefs.audio);
   $("kvm-view").classList.toggle("active", prefs.viewOnly);
   $("kvm-tp").classList.toggle("active", prefs.touchpad);
   $("kvm-more").querySelector('[data-for="kvm-view"]').textContent = `${prefs.viewOnly ? "✓ " : ""}Только просмотр`;
@@ -377,6 +388,8 @@ function connectDirect(ticket) {
     // H.264: the address set by hand, or the host that announces itself to
     // reimu-kvm (stat.host, picked up in the status handler below)
     hostRetryAt = 0;
+    // sound on from before: it starts at the first click or key in the screen
+    if (prefs.audio && audioSupported()) r.setAudio(true);
     if (wantH264() && !h264Supported()) {
       if (prefs.source === "h264") toast("Браузер не умеет WebCodecs (H.264): показываю JPEG видеодвижка", "err");
     } else if (wantH264() && prefs.h264Host) {
@@ -392,7 +405,7 @@ function connectDirect(ticket) {
     if (m.t === "h264") {
       setSource("h264");
       setState("подключено", false);
-      toast(`KVM: H.264 с хоста, ${m.w}×${m.h} до ${m.fps} к/с`, "ok");
+      toast(`KVM: H.264 с хоста, ${m.w}×${m.h} до ${m.fps} к/с${m.audio ? ", со звуком" : ""}`, "ok");
       return;
     }
     if (m.t === "stat") {

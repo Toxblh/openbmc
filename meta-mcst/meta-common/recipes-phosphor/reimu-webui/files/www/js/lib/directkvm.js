@@ -55,6 +55,7 @@ ASCII[" "] = ["Space", false];
 export const directStats = { frames: 0, bytes: 0, dropped: 0, decodeMs: 0, server: null, codec: "jpeg" };
 
 export const h264Supported = () => typeof VideoDecoder === "function" && typeof EncodedVideoChunk === "function";
+export const audioSupported = () => typeof AudioDecoder === "function" && typeof AudioContext === "function";
 
 // a ticket for one connection, or null when reimu-kvm does not run
 export async function directTicket() {
@@ -222,6 +223,7 @@ export class DirectKvm extends EventTarget {
   }
 
   _h264Frame(key, au, size) {
+    if (key === 2) return this._audioPacket(au, size);
     const dec = this._dec;
     if (!dec || dec.state !== "configured") return;
     directStats.bytes += size;
@@ -236,6 +238,61 @@ export class DirectKvm extends EventTarget {
     this._t0.push(performance.now());
     if (this._t0.length > 30) this._t0.shift();
     dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (this._ts += 16667), data: au }));
+  }
+
+  // ---- sound of the host (Opus packets next to the H.264 frames)
+  // on: true/false; a browser starts sound only after a click or a key, so
+  // call it from one (a suspended context resumes on the next input)
+  setAudio(on) {
+    this._audioOff();
+    if (!on || !audioSupported()) return;
+    const ctx = (this._actx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" }));
+    if (ctx.state === "suspended") {
+      const resume = () => ctx.state === "suspended" && ctx.resume();
+      for (const ev of ["pointerdown", "keydown"]) this._canvas.addEventListener(ev, resume, { once: true });
+    }
+    this._at = 0;
+    const adec = (this._adec = new AudioDecoder({
+      output: (data) => {
+        if (this._adec !== adec || ctx.state === "closed") return data.close();
+        const buf = ctx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+        for (let ch = 0; ch < data.numberOfChannels; ch++) {
+          data.copyTo(buf.getChannelData(ch), { planeIndex: ch, format: "f32-planar" });
+        }
+        data.close();
+        directStats.audioFrames = (directStats.audioFrames || 0) + 1;
+        // a small jitter buffer; when it has grown (a stall), start over at
+        // the present instead of lagging behind the picture
+        const now = ctx.currentTime;
+        if (this._at < now + 0.02 || this._at > now + 0.4) this._at = now + 0.08;
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(this._at);
+        this._at += buf.duration;
+      },
+      error: (e) => console.warn("Opus decoder:", e.message),
+    }));
+    adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2 });
+    this._ats = 0;
+  }
+
+  _audioOff() {
+    for (const x of [this._adec, this._actx]) {
+      try {
+        x && x.close();
+      } catch (e) {
+        /* closed */
+      }
+    }
+    this._adec = this._actx = null;
+  }
+
+  _audioPacket(pkt, size) {
+    directStats.audioBytes = (directStats.audioBytes || 0) + size;
+    const adec = this._adec;
+    if (!adec || adec.state !== "configured") return;
+    adec.decode(new EncodedAudioChunk({ type: "key", timestamp: (this._ats += 20000), data: pkt }));
   }
 
   // ---- view
@@ -414,6 +471,7 @@ export class DirectKvm extends EventTarget {
 
   disconnect() {
     this._closing = true;
+    this._audioOff();
     try {
       this.releaseAll();
     } catch (e) {

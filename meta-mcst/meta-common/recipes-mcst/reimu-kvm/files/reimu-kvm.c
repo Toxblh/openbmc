@@ -32,6 +32,7 @@
 // (DHCP or not) and the stats carry it as "host" while it keeps coming.
 // And for H.264 (from the host's GPU encoder, while its OS runs), server -> browser:
 //   {"t":"h264","codec":...,"w":..,"h":..}  then  6  u8 type, u8 key frame, access unit
+//   (u8 2 instead of the key flag: an Opus packet of the host's sound, 48 kHz stereo)
 //   {"t":"h264off","reason":...}            the host stream ended: JPEG again
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -701,18 +702,18 @@ static void up_io(struct upstream *u, uint32_t events)
             if (u->len - off < 5 + len) break;
             const unsigned char *au = u->buf + off + 5;
             // H.264 frames depend on each other: when the viewer falls behind,
-            // drop until the next key frame (one a second)
-            size_t backlog = c->outlen - c->outoff;
-            if (backlog > (1u << 20)) u->need_key = 1;
-            if (u->need_key && !key) u->dropped++;
+            // drop until the next key frame (one a second). Sound packets
+            // (key 2) stand alone: dropped only while the backlog is large.
+            int audio = key == 2, behind = c->outlen - c->outoff > (1u << 20);
+            if (!audio && behind) u->need_key = 1;
+            if (audio ? behind : u->need_key && !key) u->dropped++;
             else {
-                u->need_key = 0;
+                if (!audio) u->need_key = 0;
                 unsigned char h[2] = { 6, (unsigned char)key };
                 ws_header(c, 2, sizeof h + len);
                 out_put(c, h, sizeof h);
                 out_put(c, au, len);
-                u->frames++;
-                c->frames++;
+                if (!audio) u->frames++, c->frames++;
                 if (flush(c) < 0) { client_close(c); return; }
             }
             off += 5 + len;

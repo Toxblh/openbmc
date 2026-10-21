@@ -24,8 +24,12 @@ The encoder runs only while the BMC is connected; each connection starts with a
 key frame. Every 5 s a UDP datagram "REIMU-H264 <port>" goes to the BMC's
 reimu-kvm (port 8443): that is how the KVM page finds this host by itself.
 
-Stream to the BMC: one JSON line {"codec","w","h","fps"}, then frames as
-u32 length (big endian), u8 key frame, H.264 access unit (Annex B).
+Sound: what plays on the default output of the logged-in user's PipeWire/
+PulseAudio (its monitor), as Opus 48 kHz stereo; off with --no-audio.
+
+Stream to the BMC: one JSON line {"codec","w","h","fps","audio"}, then frames
+as u32 length (big endian), u8 kind, payload: kind 0/1 = H.264 access unit
+(Annex B; 1 = key frame), kind 2 = one Opus packet.
 """
 import argparse, ctypes, glob, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
 
@@ -35,6 +39,8 @@ ap.add_argument("--allow", default="192.168.10.79", help="BMC address allowed to
 ap.add_argument("--fps", type=int, default=60)
 ap.add_argument("--bitrate", type=float, default=8, help="Mbit/s")
 ap.add_argument("--gop", type=float, default=1.0, help="seconds between key frames")
+ap.add_argument("--no-audio", action="store_true")
+ap.add_argument("--audio-bitrate", type=int, default=96, help="kbit/s")
 ap.add_argument("--announce-port", type=int, default=8443, help="reimu-kvm's port on the BMC (UDP)")
 ap.add_argument("--grab", choices=["auto", "kms", "x11"], default="auto")
 ap.add_argument("--test", action="store_true")
@@ -207,6 +213,78 @@ def is_key(au):
         i += 3
 
 
+def pulse_user():
+    """How to reach the sound server of the user on the screen (seat0): as root,
+    run as that user with its XDG_RUNTIME_DIR (PipeWire may turn away other
+    users); otherwise our own session. None: nobody's sound to take."""
+    if os.geteuid() != 0:
+        return {}
+    try:
+        sess = subprocess.run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession", "--value"],
+                              capture_output=True, text=True).stdout.strip()
+        uid = subprocess.run(["loginctl", "show-session", sess, "-p", "User", "--value"],
+                             capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return None
+    if not uid.isdigit() or not os.path.exists(f"/run/user/{uid}/pulse/native"):
+        return None
+    import pwd
+    pw = pwd.getpwuid(int(uid))
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": pw.pw_dir, "XDG_RUNTIME_DIR": f"/run/user/{uid}"}
+    return {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": [], "env": env}
+
+
+def ogg_packets(stream):
+    """Packets of an Ogg stream (pages: 27-byte header, segment table, data)."""
+    def read(n):
+        b = b""
+        while len(b) < n:
+            c = stream.read(n - len(b))
+            if not c:
+                raise EOFError
+            b += c
+        return b
+    pkt = b""
+    try:
+        while True:
+            h = read(27)
+            if h[:4] != b"OggS":
+                return
+            segs = read(h[26])
+            data = read(sum(segs))
+            off = 0
+            for l in segs:
+                pkt += data[off:off + l]
+                off += l
+                if l < 255:
+                    yield pkt
+                    pkt = b""
+    except EOFError:
+        return
+
+
+def audio_cmd():
+    # fatal only: stopping it mid-stream makes ffmpeg complain about the pipe
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "fatal",
+            "-f", "pulse", "-fragment_size", "3840", "-i", "@DEFAULT_MONITOR@",
+            "-ac", "2", "-ar", "48000", "-c:a", "libopus", "-b:a", f"{args.audio_bitrate}k",
+            "-application", "lowdelay", "-frame_duration", "20",
+            "-f", "ogg", "-page_duration", "20000", "-flush_packets", "1", "-"]
+
+
+def send_audio(conn, lock, p, stop):
+    n = 0
+    for pkt in ogg_packets(p.stdout):
+        n += 1
+        if n <= 2 or stop.is_set():  # OpusHead, OpusTags
+            continue
+        try:
+            with lock:
+                conn.sendall(struct.pack(">IB", len(pkt), 2) + pkt)
+        except OSError:
+            return
+
+
 def serve(conn, peer):
     try:
         w, h = size()
@@ -215,13 +293,19 @@ def serve(conn, peer):
         conn.close()
         return
     p = subprocess.Popen(ffmpeg_cmd(w, h, "-"), stdout=subprocess.PIPE)
-    hdr = {"codec": "avc1.640028", "w": w, "h": h, "fps": args.fps}
-    log(f"{peer}: streaming {w}x{h}@{args.fps} H.264 {args.bitrate} Mbit/s ({GRAB})")
+    who = None if args.no_audio else pulse_user()
+    a = subprocess.Popen(audio_cmd(), stdout=subprocess.PIPE, cwd="/", **who) if who is not None else None
+    hdr = {"codec": "avc1.640028", "w": w, "h": h, "fps": args.fps, "audio": "opus" if a else ""}
+    log(f"{peer}: streaming {w}x{h}@{args.fps} H.264 {args.bitrate} Mbit/s ({GRAB}){', Opus sound' if a else ''}")
     n = 0
+    lock, stop = threading.Lock(), threading.Event()
     try:
         conn.sendall((json.dumps(hdr) + "\n").encode())
+        if a:
+            threading.Thread(target=send_audio, args=(conn, lock, a, stop), daemon=True).start()
         for au in access_units(p.stdout):
-            conn.sendall(struct.pack(">IB", len(au), 1 if is_key(au) else 0) + au)
+            with lock:
+                conn.sendall(struct.pack(">IB", len(au), 1 if is_key(au) else 0) + au)
             n += 1
             # a size change of the desktop: start over with the new size
             # (kmsgrab stops by itself when the buffer on screen changes)
@@ -231,11 +315,15 @@ def serve(conn, peer):
     except OSError as e:
         log(f"{peer}: {e}")
     finally:
-        p.terminate()
-        try:
-            p.wait(2)
-        except subprocess.TimeoutExpired:
-            p.kill()
+        stop.set()
+        for proc in (p, a):
+            if not proc:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         conn.close()
         log(f"{peer}: closed after {n} frames")
 
