@@ -128,7 +128,7 @@ export async function mount(el) {
         h("div", { class: "dropdown-menu", id: "kvm-combos" }, COMBOS.map((c, i) => h("button", { "data-i": i }, c.label))),
       ),
       h("span", { class: "m-hide-inline" }, btn("kvm-paste", "Вставить текст", "Напечатать текст из буфера на платформе (только латиница/ASCII)"), " ", btn("kvm-shot", "Снимок", "Сохранить снимок экрана в PNG")),
-      btn("kvm-sound", "Звук", "Звук платформы (идёт вместе с H.264 с хоста: reimu-h264 на платформе)"),
+      btn("kvm-sound", "Звук", "Звук платформы: от reimu-h264 на платформе, и с H.264, и с JPEG видеодвижка"),
       btn("kvm-scale", "Масштаб", "Вписать в окно / 1:1"),
       h("span", { class: "m-hide-inline" }, btn("kvm-view", "Только просмотр", "Не передавать клавиатуру и мышь")),
       h("button", { class: "btn small", id: "kvm-full", title: "Полный экран" }, icon("fullscreen"), h("span", { class: "m-hide-inline" }, "Полный экран")),
@@ -215,7 +215,6 @@ export async function mount(el) {
     savePrefs();
     applyPrefs();
     if (rfb && rfb.setAudio) rfb.setAudio(prefs.audio);
-    if (prefs.audio && source !== "h264") toast("Звук идёт только вместе с H.264 с хоста", "ok");
   });
   $("kvm-scale").addEventListener("click", () => {
     prefs.scale = !prefs.scale;
@@ -415,6 +414,8 @@ function connectDirect(ticket) {
         r.useHost("");
       }
     }
+    if (m.t === "audio") return toast("Звук с хоста", "ok");
+    if (m.t === "audiooff") return;
     if (m.t === "h264off") {
       hostRetryAt = Date.now() + 30000;
       if (source === "h264" || prefs.source === "h264") toast(`H.264 с хоста недоступен (${m.reason}): показываю JPEG видеодвижка`, "err");

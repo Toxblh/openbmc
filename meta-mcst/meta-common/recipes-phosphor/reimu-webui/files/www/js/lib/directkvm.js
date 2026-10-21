@@ -245,6 +245,8 @@ export class DirectKvm extends EventTarget {
   // call it from one (a suspended context resumes on the next input)
   setAudio(on) {
     this._audioOff();
+    // with the engine's JPEG the host's sound comes as a stream of its own
+    if (this._ws.readyState === 1) this._ws.send(new Uint8Array([11, on && audioSupported() ? 1 : 0]));
     if (!on || !audioSupported()) return;
     const ctx = (this._actx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" }));
     if (ctx.state === "suspended") {

@@ -24,6 +24,8 @@
 //   7  u8 type, "host:port"                  take H.264 from reimu-h264 on the host
 //                                            (empty: the host that announced itself)
 //   8  u8 type                               back to the engine's JPEG
+//  11  u8 type, u8 on                         the host's sound while on the engine's JPEG
+//                                            (an audio-only stream from reimu-h264)
 //   9  u8 type, i8 wheel, i8 pan             scroll (the mouse report has a wheel and pan
 //                                            byte when the gadget was made with them;
 //                                            a 5-byte gadget just drops them)
@@ -335,12 +337,15 @@ struct client {
     size_t outcap, outlen, outoff;
     int want_out;
     long frames, skipped;
-    struct upstream *up; // H.264 from the host instead of JPEG
+    struct upstream *up; // H.264 from the host instead of JPEG, or its sound only
+    int want_audio;      // the viewer wants the host's sound
+    double audio_retry;  // no new audio-only attempt before this
 };
 enum { K_CLIENT = 1, K_UP };
 struct upstream {
     int kind; // K_UP
     int fd, connected, need_key, have_hdr;
+    int audio_only; // the host's sound next to the engine's JPEG
     struct client *c;
     unsigned char *buf;
     size_t len, cap;
@@ -367,11 +372,17 @@ static int ws_clients(void)
     return n;
 }
 
+// a viewer of the engine's JPEG (perhaps with the host's sound)
+static int on_jpeg(const struct client *c)
+{
+    return c && c->state == C_WS && (!c->up || c->up->audio_only);
+}
+
 static int jpeg_clients(void)
 {
     int n = 0;
     for (int i = 0; i < MAX_CLIENTS; i++)
-        if (clients[i] && clients[i]->state == C_WS && !clients[i]->up) n++;
+        if (on_jpeg(clients[i])) n++;
     return n;
 }
 
@@ -572,11 +583,15 @@ static void up_close(struct client *c, const char *why)
     if (!u) return;
     epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL);
     close(u->fd);
-    LOG("host stream closed (%ld frames, %ld dropped)%s%s", u->frames, u->dropped, why ? ": " : "", why ? why : "");
+    LOG("host %s closed (%ld frames, %ld dropped)%s%s", u->audio_only ? "sound" : "stream", u->frames, u->dropped,
+        why ? ": " : "", why ? why : "");
+    int audio_only = u->audio_only;
     free(u->buf);
     bury(u, &u->kind);
     c->up = NULL;
-    if (why && c->kind == K_CLIENT) ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", why);
+    if (why && c->kind == K_CLIENT)
+        ws_text(c, "{\"t\":\"%s\",\"reason\":\"%s\"}", audio_only ? "audiooff" : "h264off", why);
+    if (audio_only) { c->audio_retry = now() + 10; return; }
     // this viewer is back on JPEG: capture right away, not at the next retry
     if (c->kind == K_CLIENT && c->state == C_WS && !streaming) {
         const char *err = NULL;
@@ -619,11 +634,12 @@ static void announce_read(int ufd)
     }
 }
 
-static void up_open(struct client *c, const char *addr)
+static void up_open(struct client *c, const char *addr, int audio_only)
 {
     char host[128], port[16] = "8555";
+    const char *off = audio_only ? "audiooff" : "h264off";
     if (!*addr) addr = announced_host();
-    if (!*addr) { ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "no host announced"); return; }
+    if (!*addr) { ws_text(c, "{\"t\":\"%s\",\"reason\":\"%s\"}", off, "no host announced"); return; }
     const char *colon = strrchr(addr, ':');
     if (colon && !strchr(colon, ']')) {
         snprintf(host, sizeof host, "%.*s", (int)(colon - addr), addr);
@@ -632,24 +648,25 @@ static void up_open(struct client *c, const char *addr)
     if (host[0] == '[') { memmove(host, host + 1, strlen(host)); host[strcspn(host, "]")] = 0; }
     if (c->up) up_close(c, NULL);
     struct addrinfo hints = { .ai_socktype = SOCK_STREAM }, *ai = NULL;
-    if (getaddrinfo(host, port, &hints, &ai) || !ai) { ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "address not found"); return; }
+    if (getaddrinfo(host, port, &hints, &ai) || !ai) { ws_text(c, "{\"t\":\"%s\",\"reason\":\"%s\"}", off, "address not found"); return; }
     int fd = socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     int r = fd < 0 ? -1 : connect(fd, ai->ai_addr, ai->ai_addrlen);
     freeaddrinfo(ai);
     if (fd < 0 || (r && errno != EINPROGRESS)) {
         if (fd >= 0) close(fd);
-        ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "connect failed");
+        ws_text(c, "{\"t\":\"%s\",\"reason\":\"%s\"}", off, "connect failed");
         return;
     }
     int one = 1, rb = 1 << 20;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
     struct upstream *u = calloc(1, sizeof *u);
-    u->kind = K_UP, u->fd = fd, u->c = c, u->need_key = 1;
+    u->kind = K_UP, u->fd = fd, u->c = c, u->need_key = 1, u->audio_only = audio_only;
     c->up = u;
     struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.ptr = u };
     epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
-    LOG("host stream: connecting to %s:%s", host, port);
+    LOG("host %s: connecting to %s:%s", audio_only ? "sound" : "stream", host, port);
+    if (audio_only) return;
     // the JPEG capture may not be needed any more
     if (!jpeg_clients() && streaming) video_stop();
 }
@@ -663,6 +680,10 @@ static void up_io(struct upstream *u, uint32_t events)
         getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &err, &l);
         if (err) { up_close(c, strerror(err)); return; }
         u->connected = 1;
+        // the request: "AUDIO" for the sound alone (anything else, or nothing
+        // within a moment, is the picture with its sound)
+        const char *req = u->audio_only ? "AUDIO\n" : "VIDEO\n";
+        if (write(u->fd, req, strlen(req)) < 0) { up_close(c, strerror(errno)); return; }
         struct epoll_event ev = { .events = EPOLLIN, .data.ptr = u };
         epoll_ctl(ep, EPOLL_CTL_MOD, u->fd, &ev);
         if (!(events & EPOLLIN)) return;
@@ -690,7 +711,7 @@ static void up_io(struct upstream *u, uint32_t events)
             *nl = 0;
             // forward the host's JSON header with a type tag
             char msg[600];
-            snprintf(msg, sizeof msg, "{\"t\":\"h264\",%s", (char *)u->buf + 1);
+            snprintf(msg, sizeof msg, "{\"t\":\"%s\",%s", u->audio_only ? "audio" : "h264", (char *)u->buf + 1);
             if (ws_text(c, "%s", msg) < 0) return;
             u->have_hdr = 1;
             off = nl + 1 - u->buf;
@@ -750,10 +771,16 @@ static void handle_ws(struct client *c)
                 size_t n = len - 1 < sizeof addr - 1 ? len - 1 : sizeof addr - 1;
                 memcpy(addr, d + 1, n);
                 addr[n] = 0;
-                up_open(c, addr);
+                up_open(c, addr, 0);
                 break;
             }
             case 8: up_close(c, NULL); break;
+            case 11:
+                if (len < 2) break;
+                c->want_audio = d[1];
+                c->audio_retry = 0;
+                if (!c->want_audio && c->up && c->up->audio_only) up_close(c, NULL);
+                break;
             }
         }
         size_t used = h + 4 + len;
@@ -884,7 +911,7 @@ static void video_ready(uint32_t events)
         unsigned char h[9] = { 1, vw & 0xff, vw >> 8, vh & 0xff, vh >> 8, seq & 0xff, seq >> 8 & 0xff, seq >> 16 & 0xff, seq >> 24 };
         for (int i = 0; i < MAX_CLIENTS; i++) {
             struct client *c = clients[i];
-            if (!c || c->state != C_WS || c->up) continue;
+            if (!on_jpeg(c)) continue;
             if (c->outlen - c->outoff > 0) { c->skipped++; continue; }
             ws_header(c, 2, sizeof h + len);
             out_put(c, h, sizeof h);
@@ -1009,6 +1036,14 @@ int main(int argc, char **argv)
         ngrave = 0;
         while (sd_bus_process(bus, NULL) > 0) ;
         double t = now();
+        // the host's sound for JPEG viewers who want it
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            struct client *c = clients[i];
+            if (on_jpeg(c) && c->want_audio && !c->up && t > c->audio_retry && *announced_host()) {
+                c->audio_retry = t + 10;
+                up_open(c, "", 1);
+            }
+        }
         if (jpeg_clients()) {
             if (!streaming && t - last_try > 2) {
                 const char *err = NULL;

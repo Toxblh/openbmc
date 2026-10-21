@@ -27,6 +27,9 @@ reimu-kvm (port 8443): that is how the KVM page finds this host by itself.
 Sound: what plays on the default output of the logged-in user's PipeWire/
 PulseAudio (its monitor), as Opus 48 kHz stereo; off with --no-audio.
 
+The BMC starts with a line "VIDEO" (the picture and its sound) or "AUDIO" (the
+sound alone, while the KVM page shows the BMC's own JPEG of the screen).
+
 Stream to the BMC: one JSON line {"codec","w","h","fps","audio"}, then frames
 as u32 length (big endian), u8 kind, payload: kind 0/1 = H.264 access unit
 (Annex B; 1 = key frame), kind 2 = one Opus packet.
@@ -123,7 +126,7 @@ def find_x():
     """DISPLAY/XAUTHORITY of this user's X session (works from ssh too)."""
     d = os.environ.get("DISPLAY", "")
     if d.startswith(":") and subprocess.run(["xrandr", "-q"], capture_output=True).returncode == 0:
-        return
+        return True
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -138,11 +141,13 @@ def find_x():
             if "XAUTHORITY" in env:
                 os.environ["XAUTHORITY"] = env["XAUTHORITY"]
             if subprocess.run(["xrandr", "-q"], capture_output=True).returncode == 0:
-                return
-    sys.exit("no X session of this user found (log in to the desktop, X11)")
+                return True
+    return False
 
 
 def x11_size():
+    if "DISPLAY" not in os.environ and not find_x():
+        raise RuntimeError("no X session (log in to the desktop, X11)")
     out = subprocess.run(["xrandr", "-q"], capture_output=True, text=True).stdout
     m = re.search(r"current (\d+) x (\d+)", out)
     return (int(m.group(1)), int(m.group(2))) if m else (1920, 1080)
@@ -285,7 +290,44 @@ def send_audio(conn, lock, p, stop):
             return
 
 
+def request(conn):
+    """The BMC's first line; reimu-kvm before 2026-10 sent none: the picture."""
+    conn.settimeout(0.3)
+    try:
+        line = conn.recv(16)
+    except (socket.timeout, OSError):
+        line = b""
+    conn.settimeout(None)
+    return "AUDIO" if line.startswith(b"AUDIO") else "VIDEO"
+
+
+def serve_audio(conn, peer):
+    who = None if args.no_audio else pulse_user()
+    if who is None:
+        log(f"{peer}: sound asked, but nobody's sound to take")
+        conn.close()
+        return
+    a = subprocess.Popen(audio_cmd(), stdout=subprocess.PIPE, cwd="/", **who)
+    log(f"{peer}: streaming the sound (Opus {args.audio_bitrate} kbit/s)")
+    stop = threading.Event()
+    try:
+        conn.sendall((json.dumps({"codec": "opus", "audio": "opus"}) + "\n").encode())
+        send_audio(conn, threading.Lock(), a, stop)
+    except OSError as e:
+        log(f"{peer}: {e}")
+    finally:
+        a.terminate()
+        try:
+            a.wait(2)
+        except subprocess.TimeoutExpired:
+            a.kill()
+        conn.close()
+        log(f"{peer}: sound closed")
+
+
 def serve(conn, peer):
+    if request(conn) == "AUDIO":
+        return serve_audio(conn, peer)
     try:
         w, h = size()
     except (RuntimeError, OSError) as e:
@@ -351,8 +393,9 @@ def main():
         CARD = gpu()
         if not CARD:
             sys.exit("no video card with a monitor (besides the ASPEED)")
-    else:
-        find_x()
+    elif not find_x():
+        # the sound alone can still be served; the picture waits for a login
+        log("no X session of this user yet: sound only until one appears")
     if args.test:
         w, h = size()
         t = time.time()
@@ -374,7 +417,7 @@ def main():
     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
     s.bind(("::", args.port))
     s.listen(4)
-    what = CARD if GRAB == "kms" else "display " + os.environ["DISPLAY"]
+    what = CARD if GRAB == "kms" else "display " + os.environ.get("DISPLAY", "(none yet)")
     log(f"reimu-h264 on :{args.port}, {GRAB} grab of {what}, allowed: {', '.join(sorted(allow))}")
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     threading.Thread(target=announce, args=(sorted(allow),), daemon=True).start()
