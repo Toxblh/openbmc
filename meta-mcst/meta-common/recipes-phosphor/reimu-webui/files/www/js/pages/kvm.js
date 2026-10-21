@@ -237,7 +237,7 @@ function applyPrefs() {
   for (const b of root.querySelectorAll("#kvm-src-menu [data-src]")) b.textContent = `${b.dataset.src === prefs.source ? "✓ " : ""}${SOURCES[b.dataset.src]}`;
   for (const b of root.querySelectorAll("#kvm-src-menu [data-q]")) b.textContent = `${+b.dataset.q === prefs.quality ? "✓ " : ""}${QUALITY[b.dataset.q][0]}`;
   $("kvm-src-btn").textContent = { auto: "Источник", h264: "H.264", direct: "JPEG", vnc: "VNC" }[prefs.source];
-  $("kvm-src-menu").querySelector("[data-host]").textContent = `Адрес хоста: ${prefs.h264Host || "не задан"}…`;
+  $("kvm-src-menu").querySelector("[data-host]").textContent = `Адрес хоста: ${prefs.h264Host || `авто${hostAddr ? `, ${hostAddr}` : ""}`}…`;
   const hint = $("kvm-touch-hint");
   if (hint) hint.textContent = prefs.touchpad ? "тап — клик · 2 пальца — правый клик, прокрутка · двойной тап и вести — перетащить" : "тап — клик · 2 пальца — правый клик, прокрутка";
   if (tp) tp.set(coarse && prefs.touchpad && !prefs.viewOnly);
@@ -279,7 +279,7 @@ const ENGINE_TEXT = {
 };
 
 function askHost() {
-  const v = prompt("Адрес reimu-h264 на платформе (IP[:порт], порт по умолчанию 8555). На платформе один раз: sudo reimu-host.sh install (tools/host)", prefs.h264Host || "");
+  const v = prompt("Адрес reimu-h264 на платформе (IP[:порт], порт по умолчанию 8555). Пусто — автоматически: хост сам сообщает BMC свой адрес (на платформе один раз: sudo reimu-host.sh install)", prefs.h264Host || "");
   if (v === null) return false;
   prefs.h264Host = v.trim() && !/:\d+$/.test(v.trim()) ? `${v.trim()}:8555` : v.trim();
   savePrefs();
@@ -361,6 +361,9 @@ async function connect() {
 }
 
 let connecting = false;
+let hostAddr = ""; // reimu-h264 that announced itself to reimu-kvm
+let hostRetryAt = 0; // no new H.264 attempt before this (after one failed)
+const wantH264 = () => prefs.source === "h264" || prefs.source === "auto";
 
 function connectDirect(ticket) {
   const r = (rfb = new DirectKvm(screen, ticket));
@@ -371,11 +374,18 @@ function connectDirect(ticket) {
     r.settings(QUALITY[prefs.quality][1]);
     if (tp) tp.connected();
     r.focus();
-    const wantH264 = prefs.source === "h264" || (prefs.source === "auto" && prefs.h264Host);
-    if (wantH264 && !h264Supported()) toast("Браузер не умеет WebCodecs (H.264): показываю JPEG видеодвижка", "err");
-    else if (prefs.source === "h264" && !prefs.h264Host && !askHost()) toast("Адрес хоста не задан: показываю JPEG видеодвижка", "err");
-    if (wantH264 && h264Supported() && prefs.h264Host) r.useHost(prefs.h264Host);
-    else toast("KVM подключён: прямой поток", "ok");
+    // H.264: the address set by hand, or the host that announces itself to
+    // reimu-kvm (stat.host, picked up in the status handler below)
+    hostRetryAt = 0;
+    if (wantH264() && !h264Supported()) {
+      if (prefs.source === "h264") toast("Браузер не умеет WebCodecs (H.264): показываю JPEG видеодвижка", "err");
+    } else if (wantH264() && prefs.h264Host) {
+      r.useHost(prefs.h264Host);
+      return;
+    } else if (prefs.source === "h264") {
+      setTimeout(() => rfb === r && source === "direct" && !hostAddr && toast("Хост не найден: reimu-h264 на платформе не запущен (sudo reimu-host.sh install). Показываю JPEG видеодвижка", "err"), 4000);
+    }
+    toast("KVM подключён: прямой поток", "ok");
   });
   r.addEventListener("status", (e) => {
     const m = e.detail;
@@ -385,7 +395,15 @@ function connectDirect(ticket) {
       toast(`KVM: H.264 с хоста, ${m.w}×${m.h} до ${m.fps} к/с`, "ok");
       return;
     }
+    if (m.t === "stat") {
+      hostAddr = m.host || "";
+      if (hostAddr && !prefs.h264Host && source === "direct" && wantH264() && h264Supported() && Date.now() > hostRetryAt) {
+        hostRetryAt = Date.now() + 30000;
+        r.useHost("");
+      }
+    }
     if (m.t === "h264off") {
+      hostRetryAt = Date.now() + 30000;
       if (source === "h264" || prefs.source === "h264") toast(`H.264 с хоста недоступен (${m.reason}): показываю JPEG видеодвижка`, "err");
       setSource("direct");
       return;

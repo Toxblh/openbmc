@@ -21,7 +21,8 @@ The picture is taken in one of two ways:
   ./reimu-h264.py --test              encode 5 s locally and print the rate
 
 The encoder runs only while the BMC is connected; each connection starts with a
-key frame.
+key frame. Every 5 s a UDP datagram "REIMU-H264 <port>" goes to the BMC's
+reimu-kvm (port 8443): that is how the KVM page finds this host by itself.
 
 Stream to the BMC: one JSON line {"codec","w","h","fps"}, then frames as
 u32 length (big endian), u8 key frame, H.264 access unit (Annex B).
@@ -34,6 +35,7 @@ ap.add_argument("--allow", default="192.168.10.79", help="BMC address allowed to
 ap.add_argument("--fps", type=int, default=60)
 ap.add_argument("--bitrate", type=float, default=8, help="Mbit/s")
 ap.add_argument("--gop", type=float, default=1.0, help="seconds between key frames")
+ap.add_argument("--announce-port", type=int, default=8443, help="reimu-kvm's port on the BMC (UDP)")
 ap.add_argument("--grab", choices=["auto", "kms", "x11"], default="auto")
 ap.add_argument("--test", action="store_true")
 args = ap.parse_args()
@@ -238,6 +240,20 @@ def serve(conn, peer):
         log(f"{peer}: closed after {n} frames")
 
 
+def announce(bmcs):
+    """Tell the BMCs where this agent is (they may not know the host's address)."""
+    msg = f"REIMU-H264 {args.port}".encode()
+    while True:
+        for b in bmcs:
+            try:
+                for fam, _, _, _, sa in socket.getaddrinfo(b, args.announce_port, type=socket.SOCK_DGRAM):
+                    with socket.socket(fam, socket.SOCK_DGRAM) as u:
+                        u.sendto(msg, sa)
+            except OSError:
+                pass  # no route yet (boot): next round
+        time.sleep(5)
+
+
 def main():
     global GRAB, CARD
     GRAB = args.grab
@@ -273,6 +289,7 @@ def main():
     what = CARD if GRAB == "kms" else "display " + os.environ["DISPLAY"]
     log(f"reimu-h264 on :{args.port}, {GRAB} grab of {what}, allowed: {', '.join(sorted(allow))}")
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    threading.Thread(target=announce, args=(sorted(allow),), daemon=True).start()
     while True:
         conn, addr = s.accept()
         peer = addr[0].removeprefix("::ffff:")

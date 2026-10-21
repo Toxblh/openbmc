@@ -22,11 +22,15 @@
 //   4  u8 type                               release all keys and buttons
 //   5  u8 type, u8 fps, u8 quality, u8 420   capture settings (0 keeps one)
 //   7  u8 type, "host:port"                  take H.264 from reimu-h264 on the host
+//                                            (empty: the host that announced itself)
 //   8  u8 type                               back to the engine's JPEG
 //   9  u8 type, i8 wheel, i8 pan             scroll (the mouse report has a wheel and pan
 //                                            byte when the gadget was made with them;
 //                                            a 5-byte gadget just drops them)
-// and for H.264 (from the host's GPU encoder, while its OS runs), server -> browser:
+// reimu-h264 announces itself every few seconds with a UDP datagram
+// "REIMU-H264 <port>" to this port: the BMC learns the host's address from it
+// (DHCP or not) and the stats carry it as "host" while it keeps coming.
+// And for H.264 (from the host's GPU encoder, while its OS runs), server -> browser:
 //   {"t":"h264","codec":...,"w":..,"h":..}  then  6  u8 type, u8 key frame, access unit
 //   {"t":"h264off","reason":...}            the host stream ended: JPEG again
 #define _GNU_SOURCE
@@ -579,9 +583,46 @@ static void up_close(struct client *c, const char *why)
     }
 }
 
+// the host's reimu-h264 as announced over UDP
+static char announced[64];
+static double announced_at;
+#define ANNOUNCE_TTL 15.0
+
+static const char *announced_host(void)
+{
+    return announced[0] && now() - announced_at < ANNOUNCE_TTL ? announced : "";
+}
+
+static void announce_read(int ufd)
+{
+    char buf[64];
+    struct sockaddr_storage sa;
+    socklen_t sl = sizeof sa;
+    ssize_t n;
+    while ((n = recvfrom(ufd, buf, sizeof buf - 1, 0, (struct sockaddr *)&sa, &sl)) > 0) {
+        buf[n] = 0;
+        int hport;
+        char ip[INET6_ADDRSTRLEN];
+        if (sscanf(buf, "REIMU-H264 %d", &hport) != 1 || hport < 1 || hport > 65535) continue;
+        if (sa.ss_family == AF_INET6) {
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&sa;
+            if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr)) inet_ntop(AF_INET, &a6->sin6_addr.s6_addr[12], ip, sizeof ip);
+            else inet_ntop(AF_INET6, &a6->sin6_addr, ip, sizeof ip);
+        } else inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, ip, sizeof ip);
+        char was[64];
+        snprintf(was, sizeof was, "%s", announced_host());
+        snprintf(announced, sizeof announced, strchr(ip, ':') ? "[%s]:%d" : "%s:%d", ip, hport);
+        announced_at = now();
+        if (strcmp(was, announced)) LOG("host announced: %s", announced);
+        sl = sizeof sa;
+    }
+}
+
 static void up_open(struct client *c, const char *addr)
 {
     char host[128], port[16] = "8555";
+    if (!*addr) addr = announced_host();
+    if (!*addr) { ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "no host announced"); return; }
     const char *colon = strrchr(addr, ':');
     if (colon && !strchr(colon, ']')) {
         snprintf(host, sizeof host, "%.*s", (int)(colon - addr), addr);
@@ -941,6 +982,13 @@ int main(int argc, char **argv)
     // tags; clients carry a pointer (heap pointers on the BMC are never these)
     struct epoll_event bev = { .events = EPOLLIN, .data.u32 = 0xfffffff2 };
     epoll_ctl(ep, EPOLL_CTL_ADD, sd_bus_get_fd(bus), &bev);
+    // the same port number over UDP: reimu-h264's announcements
+    int ufd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    setsockopt(ufd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+    if (ufd >= 0 && !bind(ufd, (struct sockaddr *)&a, sizeof a)) {
+        struct epoll_event uev = { .events = EPOLLIN, .data.u32 = 0xfffffff3 };
+        epoll_ctl(ep, EPOLL_CTL_ADD, ufd, &uev);
+    } else LOG("UDP %d: %s (no host announcements)", port, strerror(errno));
     LOG("reimu-kvm on :%d", port);
 
     double stat_t = now();
@@ -951,6 +999,7 @@ int main(int argc, char **argv)
             uint32_t tag = evs[i].data.u32;
             if (tag == 0xfffffff1) accept_client(lfd);
             else if (tag == 0xfffffff2) while (sd_bus_process(bus, NULL) > 0) ;
+            else if (tag == 0xfffffff3) announce_read(ufd);
             else if (tag == 0xfffffff0) { if (vfd >= 0) video_ready(evs[i].events); }
             else if (*(int *)evs[i].data.ptr == K_UP) up_io(evs[i].data.ptr, evs[i].events);
             else if (*(int *)evs[i].data.ptr == K_CLIENT) client_io(evs[i].data.ptr, evs[i].events);
@@ -973,9 +1022,9 @@ int main(int argc, char **argv)
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 struct client *c = clients[i];
                 if (!c || c->state != C_WS) continue;
-                char s[300];
-                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d}",
-                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming);
+                char s[400];
+                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d,\"host\":\"%s\"}",
+                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming, announced_host());
                 c->frames = c->skipped = 0;
                 // stats go out only between frames, never into the middle of one
                 if (c->outlen == c->outoff) ws_text(c, "%s", s);
