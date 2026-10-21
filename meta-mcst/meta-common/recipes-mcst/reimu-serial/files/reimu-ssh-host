@@ -1,0 +1,50 @@
+#!/bin/bash
+# reimu-ssh-host: SSH from the BMC to the platform's OS, run by reimu-serial
+# as an "exec:" port (web UI: Консоль, tab «SSH: платформа»). A way in when
+# the COM console is stuck.
+#
+# State in $REIMU_SSH_STATE (default /var/lib/reimu-ssh): the BMC's key
+# (made once), the target user@host and known_hosts. Login is by that key or,
+# without it, by password typed in the terminal (never stored).
+STATE=${REIMU_SSH_STATE:-/var/lib/reimu-ssh}
+KEY=$STATE/id_ed25519
+mkdir -p "$STATE" && chmod 700 "$STATE"
+# ^C ends ssh (it is in the same process group), not this script; a read it
+# interrupts returns > 128 and is asked again
+trap : INT
+[ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "reimu-bmc@$(hostname)" -f "$KEY" || exit 1
+
+ask_target()
+{
+    local t
+    while :; do
+        printf 'Адрес платформы для SSH (пользователь@IP): '
+        read -r t
+        case $? in 0) ;; 1) exit 0 ;; *) echo; continue ;; esac
+        case $t in
+            *@?*) echo "$t" > "$STATE/target"; return ;;
+            '') ;;
+            *) echo "нужно в виде пользователь@IP, например user@192.168.1.10" ;;
+        esac
+    done
+}
+
+echo "Ключ BMC (добавьте его в ~/.ssh/authorized_keys на платформе, чтобы входить без пароля;"
+echo "без него ssh спросит пароль, он нигде не сохраняется):"
+cat "$KEY.pub"
+[ -s "$STATE/target" ] || ask_target
+
+while :; do
+    target=$(cat "$STATE/target")
+    echo "ssh $target"
+    ssh -tt -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
+        -o ServerAliveInterval=15 -o ConnectTimeout=10 "$target"
+    rc=$?
+    echo
+    while :; do
+        printf 'SSH завершён (код %s). Enter: войти снова; пользователь@IP: другой адрес: ' $rc
+        read -r t
+        case $? in 0) break ;; 1) exit 0 ;; *) echo ;; esac
+    done
+    case $t in *@?*) echo "$t" > "$STATE/target" ;; esac
+done

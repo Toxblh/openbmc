@@ -17,6 +17,7 @@ SRC_URI = " \
             file://reimu-serial.c \
             file://reimu-serial.conf \
             file://reimu-serial.service \
+            file://reimu-ssh-host \
           "
 
 S = "${WORKDIR}"
@@ -28,7 +29,10 @@ do_install() {
   install -m 755 reimu-serial ${D}/usr/sbin
   install -m 644 reimu-serial.conf ${D}${sysconfdir}
   install -m 644 reimu-serial.service ${D}${systemd_system_unitdir}
+  install -d ${D}/usr/libexec
+  install -m 755 reimu-ssh-host ${D}/usr/libexec
 }
 
 CONFFILES_${PN} = "${sysconfdir}/reimu-serial.conf"
-FILES_${PN} = "/usr/sbin ${sysconfdir} ${systemd_system_unitdir}"
+FILES_${PN} = "/usr/sbin /usr/libexec ${sysconfdir} ${systemd_system_unitdir}"
+RDEPENDS_${PN} += "bash openssh-ssh openssh-keygen"

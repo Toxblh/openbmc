@@ -12,6 +12,9 @@
  *   - optionally serves raw clients on abstract socket "\0obmc-console"
  *     (compatibility with bmcweb /console0 and obmc-console-client).
  *
+ * A port whose device is "exec:COMMAND" runs COMMAND in a pty instead of
+ * owning a tty (e.g. SSH to the platform's OS), restarted when it exits.
+ *
  * Client mode: reimu-serial --dump <name|index> [-n lines] [-f] [-u]
  *
  * Copyright (c) 2026 MCST REIMU contributors. Licensed under GPLv2.
@@ -30,9 +33,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -40,7 +45,7 @@
 #define DEFAULT_CONF     "/etc/reimu-serial.conf"
 #define RUN_DIR          "/run/reimu-serial"
 #define HIST_DIR         "/var/log/reimu-serial"
-#define STATE_DIR        "/var/lib/reimu-serial"
+#define STATE_DIR        "/var/lib/reimu-serial"  /* or $REIMU_SERIAL_STATE */
 #define MAX_PORTS        8
 #define MAX_CLIENTS      64
 #define MAX_LINE         2048
@@ -69,7 +74,10 @@ struct port
     int console_compat;
     char rawlog[256];
 
-    int fd;              /* tty, -1 when it can't be opened */
+    int is_exec;         /* dev is "exec:COMMAND" */
+    pid_t pid;           /* its process while it runs */
+
+    int fd;              /* tty (or the command's pty), -1 when it can't be opened */
     int64_t reopen_at;   /* when to retry opening tty */
 
     struct line *ring;
@@ -279,7 +287,8 @@ static int load_config(const char *path)
             }
             field++;
         }
-        if (field < 3 || !baud_const(p->baud))
+        p->is_exec = !strncmp(p->dev, "exec:", 5);
+        if (field < 3 || (!p->is_exec && !baud_const(p->baud)))
         {
             msg("bad config line for port '%s' (need: name device baud)", p->name);
             continue;
@@ -293,12 +302,18 @@ static int load_config(const char *path)
     return nports ? 0 : -1;
 }
 
+static const char *state_dir(void)
+{
+    const char *d = getenv("REIMU_SERIAL_STATE");
+    return d && *d ? d : STATE_DIR;
+}
+
 static void load_baud_override(struct port *p)
 {
     char path[256];
     FILE *f;
     int b;
-    snprintf(path, sizeof(path), STATE_DIR "/%s.baud", p->name);
+    snprintf(path, sizeof(path), "%s/%s.baud", state_dir(), p->name);
     f = fopen(path, "r");
     if (!f) return;
     if (fscanf(f, "%d", &b) == 1 && baud_const(b)) p->baud = b;
@@ -309,8 +324,8 @@ static void save_baud_override(struct port *p)
 {
     char path[256];
     FILE *f;
-    mkdir(STATE_DIR, 0755);
-    snprintf(path, sizeof(path), STATE_DIR "/%s.baud", p->name);
+    mkdir(state_dir(), 0755);
+    snprintf(path, sizeof(path), "%s/%s.baud", state_dir(), p->name);
     f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "%d\n", p->baud);
@@ -334,8 +349,57 @@ static int tty_setup(int fd, int baud)
     return tcsetattr(fd, TCSANOW, &t);
 }
 
+/* exec: port: the command on a new pty, as the session leader with it as the
+ * controlling terminal (so ^C reaches it); the master is our "tty" */
+static void exec_spawn(struct port *p)
+{
+    int m = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (m < 0 || grantpt(m) || unlockpt(m))
+    {
+        msg("%s: can't create pty", p->name);
+        if (m >= 0) close(m);
+        p->reopen_at = mono_ms() + 5000;
+        return;
+    }
+    char slave[64];
+    snprintf(slave, sizeof(slave), "%s", ptsname(m));
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(m);
+        p->reopen_at = mono_ms() + 5000;
+        return;
+    }
+    if (pid == 0)
+    {
+        struct winsize ws = { .ws_row = 24, .ws_col = 80 };
+        setsid();
+        int s = open(slave, O_RDWR);
+        if (s < 0) _exit(127);
+        ioctl(s, TIOCSCTTY, 0);
+        ioctl(s, TIOCSWINSZ, &ws);
+        dup2(s, 0);
+        dup2(s, 1);
+        dup2(s, 2);
+        if (s > 2) close(s);
+        signal(SIGPIPE, SIG_DFL);
+        umask(022);
+        setenv("TERM", "xterm-256color", 1);
+        execl("/bin/sh", "sh", "-c", p->dev + 5, (char *)NULL);
+        _exit(127);
+    }
+    set_nonblock(m);
+    p->fd = m;
+    p->pid = pid;
+}
+
 static void tty_open(struct port *p)
 {
+    if (p->is_exec)
+    {
+        exec_spawn(p);
+        return;
+    }
     p->fd = open(p->dev, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (p->fd < 0)
     {
@@ -707,6 +771,7 @@ static int json_get(const char *s, const char *key, char *out, size_t outsz)
 static void apply_baud(struct port *p, int baud)
 {
     if (!baud_const(baud)) return;
+    if (p->is_exec) return;
     p->baud = baud;
     if (p->fd >= 0) tty_setup(p->fd, baud);
     save_baud_override(p);
@@ -736,7 +801,7 @@ static void framed_command(struct client *c, char *line)
     }
     else if (!strcmp(type, "break"))
     {
-        if (p->fd >= 0) tcsendbreak(p->fd, 0);
+        if (p->fd >= 0 && !p->is_exec) tcsendbreak(p->fd, 0);
     }
     else if (!strcmp(type, "baud"))
     {
@@ -916,7 +981,8 @@ static void port_input(struct port *p)
     if (n <= 0)
     {
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        msg("%s: tty read failed (%s), reopening", p->name, n ? strerror(errno) : "EOF");
+        if (p->is_exec) msg("%s: the command ended, starting it again", p->name);
+        else msg("%s: tty read failed (%s), reopening", p->name, n ? strerror(errno) : "EOF");
         close(p->fd);
         p->fd = -1;
         p->reopen_at = mono_ms() + 2000;
@@ -994,6 +1060,8 @@ static int run_daemon(const char *conf)
         int n = 0, timeout = 1000;
         int64_t mnow = mono_ms();
 
+        while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
         for (int i = 0; i < nports; i++)
         {
             struct port *p = &ports[i];
@@ -1045,6 +1113,7 @@ static int run_daemon(const char *conf)
 
     for (int i = 0; i < nports; i++)
     {
+        if (ports[i].is_exec && ports[i].fd >= 0) kill(ports[i].pid, SIGHUP);
         if (ports[i].plen) line_finish(&ports[i]);
         if (ports[i].hist) fclose(ports[i].hist);
     }
