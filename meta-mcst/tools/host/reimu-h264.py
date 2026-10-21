@@ -49,7 +49,7 @@ def gpu():
         drv = os.path.basename(os.path.realpath(card + "/device/driver"))
         if drv == "ast":
             continue
-        if any(open(c + "/status").read().strip() == "connected" for c in glob.glob(card + "-*/status")):
+        if any(open(st).read().strip() == "connected" for st in glob.glob(card + "-*/status")):
             return "/dev/dri/" + os.path.basename(card)
     return None
 

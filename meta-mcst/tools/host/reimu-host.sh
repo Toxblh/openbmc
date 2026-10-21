@@ -156,6 +156,7 @@ EOF
     fi
     pkill -f "f fbdev /dev/fb" 2>/dev/null
 
+    sync  # a sudden reset (the BMC rebooting resets this host) left empty files
     systemctl daemon-reload
     systemctl enable --now $UNITS
     sleep 2
