@@ -176,12 +176,19 @@ function termFont() {
 }
 
 // Firmware menus (ПНС/lintel, BIOS setup) erase only on ^H and ignore DEL,
-// which is what xterm.js sends; readline accepts both.
-const BS = () => (prefs.bs === "del" ? "\x7f" : "\b");
+// which is what xterm.js sends; readline accepts both. But login(1) reads its
+// own "login:" (after a failed login) and "Password:" in the tty's line mode,
+// which erases only on DEL: there DEL is sent.
+const LINE_MODE_PROMPT = /(login|password|пароль):\s/i;
+function BS(p) {
+  if (prefs.bs === "del") return "\x7f";
+  const part = p && p.client.partialLine();
+  return part && LINE_MODE_PROMPT.test(part.text) ? "\x7f" : "\b";
+}
 
 function markBackspace() {
   if (!root) return;
-  root.querySelector("#con-bs-bs").textContent = `${prefs.bs !== "del" ? "✓ " : ""}Backspace = ^H (BIOS, ПНС, большинство shell)`;
+  root.querySelector("#con-bs-bs").textContent = `${prefs.bs !== "del" ? "✓ " : ""}Backspace = ^H (BIOS, ПНС, shell; ^? после login:)`;
   root.querySelector("#con-bs-del").textContent = `${prefs.bs === "del" ? "✓ " : ""}Backspace = ^? (DEL, как в xterm)`;
 }
 
@@ -278,7 +285,7 @@ export async function mount(el) {
           h("button", { "data-font": "reset" }, "Системный (JetBrains Mono Nerd Font, если установлен)"),
           h("button", { "data-font": "bigger" }, "Крупнее"),
           h("button", { "data-font": "smaller" }, "Мельче"),
-          h("button", { "data-font": "bs", id: "con-bs-bs" }, "Backspace = ^H (BIOS, ПНС, большинство shell)"),
+          h("button", { "data-font": "bs", id: "con-bs-bs" }, "Backspace = ^H (BIOS, ПНС, shell; ^? после login:)"),
           h("button", { "data-font": "del", id: "con-bs-del" }, "Backspace = ^? (DEL, как в xterm)"),
         ),
       ),
@@ -494,7 +501,7 @@ function addPort(pi) {
   p.logWrap.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && window.getSelection().toString()) return; // copy
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return; // paste handled below
-    const seq = e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey ? BS() : keyToBytes(e);
+    const seq = e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey ? BS(p) : keyToBytes(e);
     if (seq) {
       e.preventDefault();
       p.client.write(seq);
@@ -612,7 +619,7 @@ function createTerminal(p) {
   p.term.open(p.termWrap);
   p.term.attachCustomKeyEventHandler((e) => {
     if (e.type === "keydown" && e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      p.client.write(BS());
+      p.client.write(BS(p));
       e.preventDefault();
       return false;
     }
