@@ -14,3 +14,6 @@ SRC_URI += " file://0003-update-service-wait-for-image.patch "
 # firmware images (static 64 MiB layout, ~45 MB tar) are uploaded through
 # Redfish UpdateService in one request
 EXTRA_OEMESON_append = " -Dreimu-serial-socket=enabled -Dvm-websocket=enabled -Dhttp-body-limit=64"
+# KVM: no Nagle on the websocket and VNC sockets, ChaCha20 preferred (no AES
+# instructions on the ARM11)
+SRC_URI += " file://0004-kvm-nodelay-chacha20.patch "

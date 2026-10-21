@@ -1,0 +1,57 @@
+diff --git a/http/http_server.hpp b/http/http_server.hpp
+index 20b4e508..868201c5 100644
+--- a/http/http_server.hpp
++++ b/http/http_server.hpp
+@@ -192,6 +192,12 @@ class Server
+                                    [this, p](boost::system::error_code ec) {
+                                        if (!ec)
+                                        {
++                                           // no Nagle: the tail of a KVM frame
++                                           // must not wait for a delayed ACK
++                                           boost::system::error_code ignored;
++                                           p->socket().next_layer().set_option(
++                                               boost::asio::ip::tcp::no_delay(true),
++                                               ignored);
+                                            boost::asio::post(
+                                                *this->ioService,
+                                                [p] { p->start(); });
+diff --git a/include/kvm_websocket.hpp b/include/kvm_websocket.hpp
+index 8bc955db..6798e76a 100644
+--- a/include/kvm_websocket.hpp
++++ b/include/kvm_websocket.hpp
+@@ -35,6 +35,9 @@ class KvmSession
+                     return;
+                 }
+ 
++                boost::system::error_code ignored;
++                hostSocket.set_option(boost::asio::ip::tcp::no_delay(true),
++                                      ignored);
+                 doRead();
+             });
+     }
+diff --git a/include/ssl_key_handler.hpp b/include/ssl_key_handler.hpp
+index 24e40a48..3695f65e 100644
+--- a/include/ssl_key_handler.hpp
++++ b/include/ssl_key_handler.hpp
+@@ -389,10 +389,18 @@ inline std::shared_ptr<boost::asio::ssl::context>
+         BMCWEB_LOG_ERROR << "Error setting tmp ecdh list\n";
+     }
+ 
+-    std::string mozillaModern = "ECDHE-ECDSA-AES256-GCM-SHA384:"
+-                                "ECDHE-RSA-AES256-GCM-SHA384:"
+-                                "ECDHE-ECDSA-CHACHA20-POLY1305:"
++    // ChaCha20 first and chosen by the server: the BMC's ARM11 has no AES
++    // instructions, and ChaCha20-Poly1305 costs it less CPU than AES-GCM
++    SSL_CTX_set_options(mSslContext->native_handle(),
++                        SSL_OP_CIPHER_SERVER_PREFERENCE);
++    SSL_CTX_set_ciphersuites(mSslContext->native_handle(),
++                             "TLS_CHACHA20_POLY1305_SHA256:"
++                             "TLS_AES_128_GCM_SHA256:"
++                             "TLS_AES_256_GCM_SHA384");
++    std::string mozillaModern = "ECDHE-ECDSA-CHACHA20-POLY1305:"
+                                 "ECDHE-RSA-CHACHA20-POLY1305:"
++                                "ECDHE-ECDSA-AES256-GCM-SHA384:"
++                                "ECDHE-RSA-AES256-GCM-SHA384:"
+                                 "ECDHE-ECDSA-AES128-GCM-SHA256:"
+                                 "ECDHE-RSA-AES128-GCM-SHA256:"
+                                 "ECDHE-ECDSA-AES256-SHA384:"

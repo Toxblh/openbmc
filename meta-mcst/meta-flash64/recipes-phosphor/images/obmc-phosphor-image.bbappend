@@ -41,6 +41,7 @@ OBMC_IMAGE_EXTRA_INSTALL_append += " \
   rtcread \
   reimu-webui \
   reimu-pns \
+  reimu-kvm \
   "
 
 # Platform COM ports are owned by reimu-serial, which also serves the

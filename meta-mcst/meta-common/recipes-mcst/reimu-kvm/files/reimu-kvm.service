@@ -1,0 +1,12 @@
+[Unit]
+Description=REIMU KVM: screen and HID straight to the browser (wss :8443)
+After=start-ipkvm.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Reimu.Kvm
+ExecStart=/usr/sbin/reimu-kvm
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

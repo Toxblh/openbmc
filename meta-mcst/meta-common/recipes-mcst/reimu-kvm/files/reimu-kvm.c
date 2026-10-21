@@ -1,0 +1,987 @@
+// reimu-kvm: the platform's screen straight from the ASPEED video engine to the
+// browser, and its keyboard/mouse back into the USB HID gadget.
+//
+// obmc-ikvm + bmcweb (VNC pulled frame by frame through a websocket proxy) gets
+// 6-8 frames/s to a browser on the AST2500; the engine itself gives ~44 at
+// 1920x1080. Here each JPEG frame the engine makes is pushed as one websocket
+// message over our own TLS (ChaCha20: the ARM11 has no AES instructions), and a
+// client that is still busy with the previous frame skips frames instead of
+// queueing them, so the picture stays current.
+//
+// A browser connects to wss://BMC:8443/kvm?t=TICKET; the ticket comes from the
+// D-Bus method Ticket() of /xyz/openbmc_project/reimu/kvm, which a logged-in
+// web page calls through bmcweb (so bmcweb does the authentication). A ticket
+// is good for one connection within 30 s.
+//
+// Messages, server -> browser (binary):
+//   1  u8 type, u16 width, u16 height, u32 sequence, JPEG bytes   a frame
+// server -> browser (text): {"t":"stat",...} once a second, {"t":"nosignal"}
+// browser -> server (binary):
+//   2  u8 type, u8 HID usage, u8 down        a key (usages 0xe0..0xe7: modifiers)
+//   3  u8 type, u8 buttons, u16 x, u16 y     the pointer, x/y 0..32767 (LE)
+//   4  u8 type                               release all keys and buttons
+//   5  u8 type, u8 fps, u8 quality, u8 420   capture settings (0 keeps one)
+//   7  u8 type, "host:port"                  take H.264 from reimu-h264 on the host
+//   8  u8 type                               back to the engine's JPEG
+//   9  u8 type, i8 wheel, i8 pan             scroll (the mouse report has a wheel and pan
+//                                            byte when the gadget was made with them;
+//                                            a 5-byte gadget just drops them)
+// and for H.264 (from the host's GPU encoder, while its OS runs), server -> browser:
+//   {"t":"h264","codec":...,"w":..,"h":..}  then  6  u8 type, u8 key frame, access unit
+//   {"t":"h264off","reason":...}            the host stream ended: JPEG again
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <linux/videodev2.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <systemd/sd-bus.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_CLIENTS 4
+#define NBUF 3
+#define TICKETS 8
+#define TICKET_TTL 30.0
+
+static const char *video_path = "/dev/video0", *kbd_path = "/dev/hidg0", *ptr_path = "/dev/hidg1";
+static const char *cert_path = "/etc/ssl/certs/https/server.pem";
+static int port = 8443, want_fps = 60, quality = 0, sub420 = 1, verbose;
+
+static int ep;
+static void logf_(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+#define LOG(...) logf_(__VA_ARGS__)
+#define DBG(...) do { if (verbose) logf_(__VA_ARGS__); } while (0)
+
+static double now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+// ------------------------------------------------------------------ tickets
+static struct { char id[33]; double until; } tickets[TICKETS];
+
+static const char *ticket_new(void)
+{
+    int slot = 0;
+    for (int i = 0; i < TICKETS; i++)
+        if (tickets[i].until < tickets[slot].until) slot = i;
+    unsigned char r[16];
+    RAND_bytes(r, sizeof r);
+    for (int i = 0; i < 16; i++) sprintf(tickets[slot].id + 2 * i, "%02x", r[i]);
+    tickets[slot].until = now() + TICKET_TTL;
+    return tickets[slot].id;
+}
+
+static int ticket_take(const char *id)
+{
+    double t = now();
+    for (int i = 0; i < TICKETS; i++)
+        if (tickets[i].until > t && strlen(id) == 32 && !CRYPTO_memcmp(tickets[i].id, id, 32)) {
+            tickets[i].until = 0;
+            return 1;
+        }
+    return 0;
+}
+
+// ------------------------------------------------------------------ HID
+static int kbd_fd = -1, ptr_fd = -1;
+// buttons, x (LE), y (LE), wheel, pan: f_hid cuts a write to the gadget's
+// report_length, so the same 7 bytes suit the stock 5-byte mouse
+static uint8_t keys[8], ptr_rep[7];
+
+static void hid_open(void)
+{
+    if (kbd_fd < 0) kbd_fd = open(kbd_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (ptr_fd < 0) ptr_fd = open(ptr_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+}
+
+static void hid_write(int *fd, const uint8_t *rep, size_t n)
+{
+    hid_open();
+    if (*fd < 0) return;
+    if (write(*fd, rep, n) != (ssize_t)n && errno == ESHUTDOWN) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+static void key_event(uint8_t usage, int down)
+{
+    if (usage >= 0xe0 && usage <= 0xe7) {
+        uint8_t bit = 1 << (usage - 0xe0);
+        keys[0] = down ? keys[0] | bit : keys[0] & ~bit;
+    } else if (usage) {
+        int at = 0;
+        for (int i = 2; i < 8; i++)
+            if (keys[i] == usage) at = i;
+        if (down && !at)
+            for (int i = 2; i < 8; i++)
+                if (!keys[i]) { keys[i] = usage; break; }
+        if (!down && at) {
+            memmove(keys + at, keys + at + 1, 7 - at);
+            keys[7] = 0;
+        }
+    }
+    hid_write(&kbd_fd, keys, 8);
+}
+
+static void ptr_event(uint8_t buttons, uint16_t x, uint16_t y)
+{
+    // browser: bit0 left, bit1 middle, bit2 right; HID: bit0 left, bit1 right, bit2 middle
+    ptr_rep[0] = (buttons & 1) | ((buttons & 4) >> 1) | ((buttons & 2) << 1);
+    if (x > 32767) x = 32767;
+    if (y > 32767) y = 32767;
+    ptr_rep[1] = x & 0xff, ptr_rep[2] = x >> 8, ptr_rep[3] = y & 0xff, ptr_rep[4] = y >> 8;
+    hid_write(&ptr_fd, ptr_rep, 7);
+}
+
+static void wheel_event(int8_t wheel, int8_t pan)
+{
+    // relative: one report per scroll, the next ones carry 0 again
+    ptr_rep[5] = (uint8_t)wheel, ptr_rep[6] = (uint8_t)pan;
+    hid_write(&ptr_fd, ptr_rep, 7);
+    ptr_rep[5] = ptr_rep[6] = 0;
+}
+
+static void release_all(void)
+{
+    memset(keys, 0, sizeof keys);
+    hid_write(&kbd_fd, keys, 8);
+    ptr_rep[0] = 0;
+    hid_write(&ptr_fd, ptr_rep, 7);
+}
+
+// ------------------------------------------------------------------ video
+static int vfd = -1, streaming, signal_ok = 1, fresh_viewer;
+// a still picture is captured at IDLE_FPS (the engine then costs a third of
+// the CPU); a changed frame or any key/pointer input goes back to want_fps
+#define IDLE_FPS 15
+#define IDLE_AFTER 1.0
+static int cur_fps;
+static double last_change;
+static unsigned vw, vh;
+static struct { void *p; size_t len; } vbuf[NBUF];
+static uint32_t seq;
+static double last_frame, last_try, last_sent;
+static long n_frames, n_bytes, n_same;
+// the engine compresses every frame, changed or not: a frame equal to the
+// previous one is not sent (one in a second still is, for a client that
+// connected in between or lost one)
+// The engine's buffers are mapped uncached: each frame is read from them once,
+// with one burst copy into cur, and compared and sent from there.
+static unsigned char *prev, *cur;
+static size_t prev_len, buf_cap;
+
+static int same_bytes(const unsigned char *a, const unsigned char *b, size_t n)
+{
+    // both buffers come from malloc (8-byte aligned) and start at the same offset
+    while (n && ((uintptr_t)a & 3)) { if (*a++ != *b++) return 0; n--; }
+    const uint32_t *x = (const uint32_t *)a, *y = (const uint32_t *)b;
+    for (; n >= 16; n -= 16, x += 4, y += 4)
+        if ((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) return 0;
+    a = (const unsigned char *)x, b = (const unsigned char *)y;
+    while (n--) if (*a++ != *b++) return 0;
+    return 1;
+}
+
+// where the picture data starts: past the comment segment (FF FE) the
+// engine puts near the start of each frame, which holds a frame counter
+static size_t jpeg_skip(const unsigned char *p, size_t len)
+{
+    for (size_t i = 2; i + 4 < len && i < 128;) {
+        if (p[i] != 0xff) break;
+        size_t seg = 2 + (p[i + 2] << 8 | p[i + 3]);
+        if (p[i + 1] == 0xfe) return i + seg;
+        if (p[i + 1] == 0xda) break;
+        i += seg;
+    }
+    return 0;
+}
+
+static void video_ctl(unsigned id, int v)
+{
+    struct v4l2_control c = { .id = id, .value = v };
+    if (ioctl(vfd, VIDIOC_S_CTRL, &c)) DBG("ctrl %x=%d: %s", id, v, strerror(errno));
+}
+
+static void set_rate(int fps)
+{
+    if (vfd < 0 || fps == cur_fps) return;
+    struct v4l2_streamparm sp = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+    sp.parm.capture.timeperframe.numerator = 1;
+    sp.parm.capture.timeperframe.denominator = fps;
+    if (!ioctl(vfd, VIDIOC_S_PARM, &sp)) cur_fps = fps;
+    DBG("capture rate %d", fps);
+}
+
+static void activity(void)
+{
+    last_change = now();
+    set_rate(want_fps);
+}
+
+static void video_stop(void)
+{
+    if (vfd < 0) return;
+    if (streaming) {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(vfd, VIDIOC_STREAMOFF, &type);
+    }
+    for (int i = 0; i < NBUF; i++)
+        if (vbuf[i].p) munmap(vbuf[i].p, vbuf[i].len), vbuf[i].p = NULL;
+    epoll_ctl(ep, EPOLL_CTL_DEL, vfd, NULL);
+    close(vfd);
+    vfd = -1;
+    streaming = 0;
+}
+
+// 0 streaming, -1 failed (no signal, busy...); err gets a reason
+static int video_start(const char **err)
+{
+    video_stop();
+    last_try = now();
+    vfd = open(video_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (vfd < 0) { *err = "no video device"; return -1; }
+    struct v4l2_dv_timings tm = { 0 };
+    if (ioctl(vfd, VIDIOC_QUERY_DV_TIMINGS, &tm) || !tm.bt.width) {
+        *err = "nosignal";
+        signal_ok = 0;
+        video_stop();
+        return -1;
+    }
+    ioctl(vfd, VIDIOC_S_DV_TIMINGS, &tm);
+    video_ctl(V4L2_CID_JPEG_COMPRESSION_QUALITY, quality);
+    video_ctl(V4L2_CID_JPEG_CHROMA_SUBSAMPLING, sub420 ? V4L2_JPEG_CHROMA_SUBSAMPLING_420 : V4L2_JPEG_CHROMA_SUBSAMPLING_444);
+    struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+    ioctl(vfd, VIDIOC_G_FMT, &f);
+    vw = f.fmt.pix.width, vh = f.fmt.pix.height;
+    struct v4l2_streamparm sp = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+    sp.parm.capture.timeperframe.numerator = 1;
+    sp.parm.capture.timeperframe.denominator = want_fps;
+    ioctl(vfd, VIDIOC_S_PARM, &sp);
+    cur_fps = want_fps;
+    last_change = now();
+    struct v4l2_requestbuffers rb = { .count = NBUF, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
+    if (ioctl(vfd, VIDIOC_REQBUFS, &rb)) {
+        *err = errno == EBUSY ? "video busy (a VNC client is connected)" : "video REQBUFS failed";
+        video_stop();
+        return -1;
+    }
+    for (unsigned i = 0; i < rb.count && i < NBUF; i++) {
+        struct v4l2_buffer b = { .type = rb.type, .memory = rb.memory, .index = i };
+        ioctl(vfd, VIDIOC_QUERYBUF, &b);
+        vbuf[i].len = b.length;
+        vbuf[i].p = mmap(NULL, b.length, PROT_READ, MAP_SHARED, vfd, b.m.offset);
+        if (vbuf[i].p == MAP_FAILED) vbuf[i].p = NULL;
+        ioctl(vfd, VIDIOC_QBUF, &b);
+    }
+    struct v4l2_event_subscription sub = { .type = V4L2_EVENT_SOURCE_CHANGE };
+    ioctl(vfd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(vfd, VIDIOC_STREAMON, &type)) { *err = "STREAMON failed"; video_stop(); return -1; }
+    streaming = 1;
+    signal_ok = 1;
+    last_frame = now();
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLPRI, .data.u32 = 0xfffffff0 };
+    epoll_ctl(ep, EPOLL_CTL_ADD, vfd, &ev);
+    LOG("video %ux%u, %d fps asked, quality %d, %s", vw, vh, want_fps, quality, sub420 ? "4:2:0" : "4:4:4");
+    return 0;
+}
+
+// ------------------------------------------------------------------ clients
+enum { C_TLS, C_HTTP, C_WS };
+struct upstream;
+struct client {
+    int kind; // K_CLIENT; epoll data points at a client or an upstream
+    int fd;
+    SSL *ssl;
+    int state;
+    unsigned char in[4096];
+    size_t inlen;
+    unsigned char *out;
+    size_t outcap, outlen, outoff;
+    int want_out;
+    long frames, skipped;
+    struct upstream *up; // H.264 from the host instead of JPEG
+};
+enum { K_CLIENT = 1, K_UP };
+struct upstream {
+    int kind; // K_UP
+    int fd, connected, need_key, have_hdr;
+    struct client *c;
+    unsigned char *buf;
+    size_t len, cap;
+    long frames, dropped;
+};
+static struct client *clients[MAX_CLIENTS];
+static SSL_CTX *ctx;
+
+// objects closed while handling a batch of epoll events are freed after it:
+// a later event of the batch may still point at them (kind is 0 by then)
+static void *grave[4 * MAX_CLIENTS + 4];
+static int ngrave;
+static void bury(void *p, int *kind)
+{
+    *kind = 0;
+    if (ngrave < (int)(sizeof grave / sizeof grave[0])) grave[ngrave++] = p;
+}
+
+static int ws_clients(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i] && clients[i]->state == C_WS) n++;
+    return n;
+}
+
+static int jpeg_clients(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i] && clients[i]->state == C_WS && !clients[i]->up) n++;
+    return n;
+}
+
+static void up_close(struct client *c, const char *why);
+
+static void client_close(struct client *c)
+{
+    int was_ws = c->state == C_WS;
+    c->state = -2; // closing: up_close must not restart the capture for it
+    if (c->up) up_close(c, NULL);
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i] == c) clients[i] = NULL;
+    epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+    if (c->ssl) SSL_free(c->ssl);
+    close(c->fd);
+    free(c->out);
+    c->out = NULL;
+    bury(c, &c->kind);
+    if (was_ws && !ws_clients()) release_all();
+    if (was_ws && !jpeg_clients() && streaming) {
+        video_stop();
+        LOG("no JPEG viewer left, capture stopped");
+    }
+}
+
+static void client_poll(struct client *c, int out)
+{
+    struct epoll_event ev = { .events = EPOLLIN | (out ? EPOLLOUT : 0), .data.ptr = c };
+    (void)0;
+    if (c->want_out != out) epoll_ctl(ep, EPOLL_CTL_MOD, c->fd, &ev);
+    c->want_out = out;
+}
+
+// append raw bytes to the client's output; 0 if it does not fit
+static int out_put(struct client *c, const void *p, size_t n)
+{
+    if (c->outoff && c->outoff == c->outlen) c->outoff = c->outlen = 0;
+    if (c->outlen + n > c->outcap) {
+        size_t cap = c->outcap ? c->outcap : 65536;
+        while (cap < c->outlen + n) cap *= 2;
+        if (cap > (4u << 20)) return 0;
+        unsigned char *o = realloc(c->out, cap);
+        if (!o) return 0;
+        c->out = o, c->outcap = cap;
+    }
+    memcpy(c->out + c->outlen, p, n);
+    c->outlen += n;
+    return 1;
+}
+
+static int flush(struct client *c)
+{
+    while (c->outoff < c->outlen) {
+        int n = SSL_write(c->ssl, c->out + c->outoff, (int)(c->outlen - c->outoff));
+        if (n > 0) { c->outoff += n; continue; }
+        int e = SSL_get_error(c->ssl, n);
+        if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) { client_poll(c, 1); return 0; }
+        return -1;
+    }
+    c->outoff = c->outlen = 0;
+    client_poll(c, 0);
+    return 0;
+}
+
+static void ws_header(struct client *c, int op, size_t len)
+{
+    unsigned char h[10];
+    size_t n = 2;
+    h[0] = 0x80 | op;
+    if (len < 126) h[1] = len;
+    else if (len < 65536) h[1] = 126, h[2] = len >> 8, h[3] = len, n = 4;
+    else {
+        h[1] = 127;
+        memset(h + 2, 0, 4);
+        h[6] = len >> 24, h[7] = len >> 16, h[8] = len >> 8, h[9] = len, n = 10;
+    }
+    out_put(c, h, n);
+}
+
+static int ws_text(struct client *c, const char *fmt, ...)
+{
+    char s[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    ws_header(c, 1, n);
+    out_put(c, s, n);
+    if (flush(c) < 0) {
+        client_close(c);
+        return -1;
+    }
+    return 0;
+}
+
+static void broadcast_text(const char *fmt, const char *a)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i] && clients[i]->state == C_WS) ws_text(clients[i], fmt, a);
+}
+
+static void http_reply(struct client *c, const char *status, const char *body)
+{
+    char h[256];
+    int n = snprintf(h, sizeof h, "HTTP/1.1 %s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n", status, strlen(body));
+    out_put(c, h, n);
+    out_put(c, body, strlen(body));
+    flush(c);
+}
+
+static const char *hdr(const char *req, const char *name, char *val, size_t cap)
+{
+    size_t nl = strlen(name);
+    for (const char *p = strstr(req, "\r\n"); p && p[2]; p = strstr(p + 2, "\r\n")) {
+        const char *l = p + 2;
+        if (!strncasecmp(l, name, nl) && l[nl] == ':') {
+            l += nl + 1;
+            while (*l == ' ') l++;
+            size_t n = strcspn(l, "\r\n");
+            if (n >= cap) n = cap - 1;
+            memcpy(val, l, n);
+            val[n] = 0;
+            return val;
+        }
+    }
+    return NULL;
+}
+
+static void handle_http(struct client *c)
+{
+    char *req = (char *)c->in;
+    char *end = strstr(req, "\r\n\r\n");
+    if (!end) {
+        if (c->inlen >= sizeof c->in - 1) client_close(c);
+        return;
+    }
+    char key[128], up[64], path[256] = "";
+    sscanf(req, "GET %255s", path);
+    if (!hdr(req, "Upgrade", up, sizeof up) || strcasecmp(up, "websocket")) {
+        // a plain visit: the page that lets the browser accept this port's certificate
+        http_reply(c, "200 OK", "<!doctype html><meta charset=utf-8><title>REIMU KVM</title>"
+                                "<p>Сертификат для прямого видеопотока KVM принят. Эту вкладку можно закрыть.</p>"
+                                "<script>try{window.opener&&window.opener.postMessage('reimu-kvm-cert','*')}catch(e){}setTimeout(()=>window.close(),800)</script>");
+        c->state = -1;
+        return;
+    }
+    const char *t = strstr(path, "t=");
+    char tk[40] = "";
+    if (t) sscanf(t + 2, "%39[0-9a-f]", tk);
+    if (strncmp(path, "/kvm", 4) || !ticket_take(tk) || !hdr(req, "Sec-WebSocket-Key", key, sizeof key)) {
+        http_reply(c, "403 Forbidden", "forbidden");
+        c->state = -1;
+        return;
+    }
+    if (ws_clients() >= MAX_CLIENTS - 1) {
+        http_reply(c, "503 Service Unavailable", "too many viewers");
+        c->state = -1;
+        return;
+    }
+    char cat[200];
+    unsigned char sha[20];
+    char acc[64];
+    snprintf(cat, sizeof cat, "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    SHA1((unsigned char *)cat, strlen(cat), sha);
+    EVP_EncodeBlock((unsigned char *)acc, sha, 20);
+    char resp[256];
+    int n = snprintf(resp, sizeof resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+    out_put(c, resp, n);
+    size_t used = end + 4 - req;
+    memmove(c->in, c->in + used, c->inlen - used);
+    c->inlen -= used;
+    c->state = C_WS;
+    if (flush(c) < 0) { client_close(c); return; }
+    LOG("viewer connected (%d)", ws_clients());
+    fresh_viewer = 1;
+    if (!streaming) {
+        const char *err = NULL;
+        if (video_start(&err)) ws_text(c, "{\"t\":\"%s\"}", !strcmp(err, "nosignal") ? "nosignal" : err);
+    }
+}
+
+static void apply_settings(int fps, int q, int s)
+{
+    int changed = 0;
+    if (fps > 0 && fps <= 60 && fps != want_fps) want_fps = fps, changed = 1;
+    if (q > 0 && q - 1 <= 11 && q - 1 != quality) quality = q - 1, changed = 1;
+    if (s > 0 && (s - 1) != sub420) sub420 = s - 1, changed = 1;
+    if (changed && streaming) {
+        const char *err;
+        video_start(&err);
+    }
+}
+
+// ------------------------------------------------------------------ H.264 from the host
+static void up_close(struct client *c, const char *why)
+{
+    struct upstream *u = c->up;
+    if (!u) return;
+    epoll_ctl(ep, EPOLL_CTL_DEL, u->fd, NULL);
+    close(u->fd);
+    LOG("host stream closed (%ld frames, %ld dropped)%s%s", u->frames, u->dropped, why ? ": " : "", why ? why : "");
+    free(u->buf);
+    bury(u, &u->kind);
+    c->up = NULL;
+    if (why && c->kind == K_CLIENT) ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", why);
+    // this viewer is back on JPEG: capture right away, not at the next retry
+    if (c->kind == K_CLIENT && c->state == C_WS && !streaming) {
+        const char *err = NULL;
+        video_start(&err);
+    }
+}
+
+static void up_open(struct client *c, const char *addr)
+{
+    char host[128], port[16] = "8555";
+    const char *colon = strrchr(addr, ':');
+    if (colon && !strchr(colon, ']')) {
+        snprintf(host, sizeof host, "%.*s", (int)(colon - addr), addr);
+        snprintf(port, sizeof port, "%s", colon + 1);
+    } else snprintf(host, sizeof host, "%s", addr);
+    if (host[0] == '[') { memmove(host, host + 1, strlen(host)); host[strcspn(host, "]")] = 0; }
+    if (c->up) up_close(c, NULL);
+    struct addrinfo hints = { .ai_socktype = SOCK_STREAM }, *ai = NULL;
+    if (getaddrinfo(host, port, &hints, &ai) || !ai) { ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "address not found"); return; }
+    int fd = socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int r = fd < 0 ? -1 : connect(fd, ai->ai_addr, ai->ai_addrlen);
+    freeaddrinfo(ai);
+    if (fd < 0 || (r && errno != EINPROGRESS)) {
+        if (fd >= 0) close(fd);
+        ws_text(c, "{\"t\":\"h264off\",\"reason\":\"%s\"}", "connect failed");
+        return;
+    }
+    int one = 1, rb = 1 << 20;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+    struct upstream *u = calloc(1, sizeof *u);
+    u->kind = K_UP, u->fd = fd, u->c = c, u->need_key = 1;
+    c->up = u;
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.ptr = u };
+    epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+    LOG("host stream: connecting to %s:%s", host, port);
+    // the JPEG capture may not be needed any more
+    if (!jpeg_clients() && streaming) video_stop();
+}
+
+static void up_io(struct upstream *u, uint32_t events)
+{
+    struct client *c = u->c;
+    if (!u->connected) {
+        int err = 0;
+        socklen_t l = sizeof err;
+        getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &err, &l);
+        if (err) { up_close(c, strerror(err)); return; }
+        u->connected = 1;
+        struct epoll_event ev = { .events = EPOLLIN, .data.ptr = u };
+        epoll_ctl(ep, EPOLL_CTL_MOD, u->fd, &ev);
+        if (!(events & EPOLLIN)) return;
+    }
+    for (;;) {
+        if (u->cap - u->len < 65536) {
+            size_t cap = u->cap ? u->cap * 2 : 262144;
+            if (cap > (8u << 20)) { up_close(c, "frame too big"); return; }
+            unsigned char *b = realloc(u->buf, cap);
+            if (!b) { up_close(c, "out of memory"); return; }
+            u->buf = b, u->cap = cap;
+        }
+        ssize_t n = read(u->fd, u->buf + u->len, u->cap - u->len);
+        if (n == 0) { up_close(c, "the host closed the stream"); return; }
+        if (n < 0) {
+            if (errno == EAGAIN) break;
+            up_close(c, strerror(errno));
+            return;
+        }
+        u->len += n;
+        size_t off = 0;
+        if (!u->have_hdr) {
+            unsigned char *nl = memchr(u->buf, '\n', u->len);
+            if (!nl) { if (u->len > 1024) { up_close(c, "bad header"); return; } continue; }
+            *nl = 0;
+            // forward the host's JSON header with a type tag
+            char msg[600];
+            snprintf(msg, sizeof msg, "{\"t\":\"h264\",%s", (char *)u->buf + 1);
+            if (ws_text(c, "%s", msg) < 0) return;
+            u->have_hdr = 1;
+            off = nl + 1 - u->buf;
+        }
+        while (u->len - off >= 5) {
+            uint32_t len = (uint32_t)u->buf[off] << 24 | u->buf[off + 1] << 16 | u->buf[off + 2] << 8 | u->buf[off + 3];
+            int key = u->buf[off + 4];
+            if (len > (4u << 20)) { up_close(c, "bad frame"); return; }
+            if (u->len - off < 5 + len) break;
+            const unsigned char *au = u->buf + off + 5;
+            // H.264 frames depend on each other: when the viewer falls behind,
+            // drop until the next key frame (one a second)
+            size_t backlog = c->outlen - c->outoff;
+            if (backlog > (1u << 20)) u->need_key = 1;
+            if (u->need_key && !key) u->dropped++;
+            else {
+                u->need_key = 0;
+                unsigned char h[2] = { 6, (unsigned char)key };
+                ws_header(c, 2, sizeof h + len);
+                out_put(c, h, sizeof h);
+                out_put(c, au, len);
+                u->frames++;
+                c->frames++;
+                if (flush(c) < 0) { client_close(c); return; }
+            }
+            off += 5 + len;
+        }
+        memmove(u->buf, u->buf + off, u->len - off);
+        u->len -= off;
+    }
+}
+
+static void handle_ws(struct client *c)
+{
+    for (;;) {
+        if (c->inlen < 2) return;
+        unsigned char *p = c->in;
+        int op = p[0] & 15, masked = p[1] & 0x80;
+        size_t len = p[1] & 127, h = 2;
+        if (len == 126) { if (c->inlen < 4) return; len = p[2] << 8 | p[3]; h = 4; }
+        else if (len == 127) { client_close(c); return; }
+        if (!masked || len > sizeof c->in - 14) { client_close(c); return; }
+        if (c->inlen < h + 4 + len) return;
+        unsigned char *m = p + h, *d = p + h + 4;
+        for (size_t i = 0; i < len; i++) d[i] ^= m[i & 3];
+        if (op == 8) { client_close(c); return; }
+        if (op == 9) { ws_header(c, 10, len); out_put(c, d, len); if (flush(c) < 0) { client_close(c); return; } }
+        if (op == 2 && len >= 1) {
+            switch (d[0]) {
+            case 2: if (len >= 3) key_event(d[1], d[2]); activity(); break;
+            case 3: if (len >= 6) ptr_event(d[1], d[2] | d[3] << 8, d[4] | d[5] << 8); activity(); break;
+            case 4: release_all(); break;
+            case 9: if (len >= 3) wheel_event(d[1], d[2]); activity(); break;
+            case 5: if (len >= 4) apply_settings(d[1], d[2], d[3]); break;
+            case 7: {
+                char addr[160];
+                size_t n = len - 1 < sizeof addr - 1 ? len - 1 : sizeof addr - 1;
+                memcpy(addr, d + 1, n);
+                addr[n] = 0;
+                up_open(c, addr);
+                break;
+            }
+            case 8: up_close(c, NULL); break;
+            }
+        }
+        size_t used = h + 4 + len;
+        memmove(c->in, c->in + used, c->inlen - used);
+        c->inlen -= used;
+    }
+}
+
+static void client_io(struct client *c, uint32_t events)
+{
+    if (c->state == C_TLS) {
+        int r = SSL_accept(c->ssl);
+        if (r <= 0) {
+            int e = SSL_get_error(c->ssl, r);
+            if (e == SSL_ERROR_WANT_READ) { client_poll(c, 0); return; }
+            if (e == SSL_ERROR_WANT_WRITE) { client_poll(c, 1); return; }
+            client_close(c);
+            return;
+        }
+        c->state = C_HTTP;
+    }
+    if ((events & EPOLLOUT) && c->outlen) {
+        if (flush(c) < 0) { client_close(c); return; }
+        if (c->state == -1 && !c->outlen) { client_close(c); return; }
+    }
+    for (;;) {
+        if (c->inlen >= sizeof c->in - 1) { client_close(c); return; }
+        int n = SSL_read(c->ssl, c->in + c->inlen, (int)(sizeof c->in - 1 - c->inlen));
+        if (n <= 0) {
+            int e = SSL_get_error(c->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) break;
+            client_close(c);
+            return;
+        }
+        c->inlen += n;
+        c->in[c->inlen] = 0;
+        if (c->state == C_HTTP) {
+            handle_http(c);
+            if (c->state == -1) {
+                if (!c->outlen) client_close(c);
+                return;
+            }
+        } else if (c->state == C_WS) {
+            handle_ws(c);
+        }
+        // the client may be gone now
+        int alive = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) alive |= clients[i] == c;
+        if (!alive) return;
+    }
+}
+
+static void accept_client(int lfd)
+{
+    for (;;) {
+        int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) return;
+        int slot = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (!clients[i]) { slot = i; break; }
+        if (slot < 0) { close(fd); continue; }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        int sb = 1 << 20;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+        struct client *c = calloc(1, sizeof *c);
+        c->kind = K_CLIENT;
+        c->fd = fd;
+        c->ssl = SSL_new(ctx);
+        SSL_set_fd(c->ssl, fd);
+        SSL_set_mode(c->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        c->state = C_TLS;
+        clients[slot] = c;
+        struct epoll_event ev = { .events = EPOLLIN, .data.ptr = c };
+        epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+        client_io(c, EPOLLIN);
+    }
+}
+
+// ------------------------------------------------------------------ frames
+static void video_ready(uint32_t events)
+{
+    if (events & EPOLLPRI) {
+        struct v4l2_event e;
+        while (!ioctl(vfd, VIDIOC_DQEVENT, &e))
+            if (e.type == V4L2_EVENT_SOURCE_CHANGE) {
+                LOG("source changed");
+                const char *err;
+                if (video_start(&err)) broadcast_text("{\"t\":\"%s\"}", "nosignal");
+                return;
+            }
+    }
+    for (;;) {
+        struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
+        if (ioctl(vfd, VIDIOC_DQBUF, &b)) return;
+        size_t len = b.bytesused;
+        int ok = b.index < NBUF && vbuf[b.index].p && len && !(b.flags & V4L2_BUF_FLAG_ERROR);
+        if (ok && len > buf_cap) {
+            free(prev), free(cur);
+            buf_cap = len + 65536;
+            prev = malloc(buf_cap), cur = malloc(buf_cap);
+            prev_len = 0;
+            if (!prev || !cur) { free(prev), free(cur); prev = cur = NULL; buf_cap = 0; ok = 0; }
+        }
+        if (ok) memcpy(cur, vbuf[b.index].p, len);
+        ioctl(vfd, VIDIOC_QBUF, &b);
+        if (!ok) continue;
+        n_frames++;
+        last_frame = now();
+        size_t skip = jpeg_skip(cur, len);
+        int same = len == prev_len && same_bytes(cur + skip, prev + skip, len - skip);
+        if (same) {
+            if (last_frame - last_change > IDLE_AFTER) set_rate(IDLE_FPS);
+            if (last_frame - last_sent < 1.0 && !fresh_viewer) {
+                n_same++;
+                continue;
+            }
+        } else {
+            last_change = last_frame;
+            set_rate(want_fps);
+        }
+        unsigned char *t = prev;
+        prev = cur, cur = t, prev_len = len;
+        last_sent = last_frame;
+        fresh_viewer = 0;
+        seq++;
+        n_bytes += len;
+        unsigned char h[9] = { 1, vw & 0xff, vw >> 8, vh & 0xff, vh >> 8, seq & 0xff, seq >> 8 & 0xff, seq >> 16 & 0xff, seq >> 24 };
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            struct client *c = clients[i];
+            if (!c || c->state != C_WS || c->up) continue;
+            if (c->outlen - c->outoff > 0) { c->skipped++; continue; }
+            ws_header(c, 2, sizeof h + len);
+            out_put(c, h, sizeof h);
+            out_put(c, prev, len);
+            c->frames++;
+            if (flush(c) < 0) client_close(c);
+        }
+        if (vfd < 0) return;
+    }
+}
+
+// ------------------------------------------------------------------ D-Bus
+static int method_ticket(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    (void)ud, (void)err;
+    char json[200];
+    snprintf(json, sizeof json, "{\"ticket\":\"%s\",\"port\":%d}", ticket_new(), port);
+    return sd_bus_reply_method_return(m, "s", json);
+}
+
+static int method_status(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    (void)ud, (void)err;
+    char json[300];
+    snprintf(json, sizeof json, "{\"port\":%d,\"viewers\":%d,\"streaming\":%d,\"signal\":%d,\"width\":%u,\"height\":%u,\"fps\":%d,\"quality\":%d,\"sub420\":%d}",
+             port, ws_clients(), streaming, signal_ok, vw, vh, want_fps, quality, sub420);
+    return sd_bus_reply_method_return(m, "s", json);
+}
+
+static const sd_bus_vtable kvm_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("Ticket", "", "s", method_ticket, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("Status", "", "s", method_status, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_VTABLE_END,
+};
+
+// ------------------------------------------------------------------ main
+static void usage(void)
+{
+    fprintf(stderr, "usage: reimu-kvm [-p port] [-c cert.pem] [-f fps] [-q 0..11] [-s 420|444] [-v video] [-k hidg] [-m hidg] [-d]\n");
+    exit(2);
+}
+
+int main(int argc, char **argv)
+{
+    int o;
+    while ((o = getopt(argc, argv, "p:c:f:q:s:v:k:m:d")) != -1)
+        switch (o) {
+        case 'p': port = atoi(optarg); break;
+        case 'c': cert_path = optarg; break;
+        case 'f': want_fps = atoi(optarg); break;
+        case 'q': quality = atoi(optarg); break;
+        case 's': sub420 = !strcmp(optarg, "420"); break;
+        case 'v': video_path = optarg; break;
+        case 'k': kbd_path = optarg; break;
+        case 'm': ptr_path = optarg; break;
+        case 'd': verbose = 1; break;
+        default: usage();
+        }
+    if (want_fps < 1 || want_fps > 60 || quality < 0 || quality > 11) usage();
+    signal(SIGPIPE, SIG_IGN);
+
+    ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_ciphersuites(ctx, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384");
+    SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1 || SSL_CTX_use_PrivateKey_file(ctx, cert_path, SSL_FILETYPE_PEM) != 1) {
+        LOG("cannot load %s", cert_path);
+        return 1;
+    }
+
+    int lfd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int one = 1, zero = 0;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+    struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_port = htons(port), .sin6_addr = in6addr_any };
+    if (bind(lfd, (struct sockaddr *)&a, sizeof a) || listen(lfd, 8)) {
+        LOG("port %d: %s", port, strerror(errno));
+        return 1;
+    }
+
+    sd_bus *bus = NULL;
+    if (sd_bus_open_system(&bus) < 0 ||
+        sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/kvm", "xyz.openbmc_project.Reimu.Kvm", kvm_vtable, NULL) < 0 ||
+        sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Kvm", 0) < 0) {
+        LOG("D-Bus registration failed");
+        return 1;
+    }
+
+    ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 0xfffffff1 };
+    epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+    // the listening socket and the bus are told apart from clients by data.u32
+    // tags; clients carry a pointer (heap pointers on the BMC are never these)
+    struct epoll_event bev = { .events = EPOLLIN, .data.u32 = 0xfffffff2 };
+    epoll_ctl(ep, EPOLL_CTL_ADD, sd_bus_get_fd(bus), &bev);
+    LOG("reimu-kvm on :%d", port);
+
+    double stat_t = now();
+    for (;;) {
+        struct epoll_event evs[16];
+        int n = epoll_wait(ep, evs, 16, 250);
+        for (int i = 0; i < n; i++) {
+            uint32_t tag = evs[i].data.u32;
+            if (tag == 0xfffffff1) accept_client(lfd);
+            else if (tag == 0xfffffff2) while (sd_bus_process(bus, NULL) > 0) ;
+            else if (tag == 0xfffffff0) { if (vfd >= 0) video_ready(evs[i].events); }
+            else if (*(int *)evs[i].data.ptr == K_UP) up_io(evs[i].data.ptr, evs[i].events);
+            else if (*(int *)evs[i].data.ptr == K_CLIENT) client_io(evs[i].data.ptr, evs[i].events);
+        }
+        for (int i = 0; i < ngrave; i++) free(grave[i]);
+        ngrave = 0;
+        while (sd_bus_process(bus, NULL) > 0) ;
+        double t = now();
+        if (jpeg_clients()) {
+            if (!streaming && t - last_try > 2) {
+                const char *err = NULL;
+                video_start(&err);
+            } else if (streaming && t - last_frame > 1.5) {
+                // no frames: signal lost or mode change without an event
+                const char *err = NULL;
+                if (video_start(&err)) broadcast_text("{\"t\":\"%s\"}", "nosignal");
+            }
+        }
+        if (t - stat_t >= 1) {
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                struct client *c = clients[i];
+                if (!c || c->state != C_WS) continue;
+                char s[300];
+                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d}",
+                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming);
+                c->frames = c->skipped = 0;
+                // stats go out only between frames, never into the middle of one
+                if (c->outlen == c->outoff) ws_text(c, "%s", s);
+            }
+            n_frames = n_bytes = n_same = 0;
+            stat_t = t;
+        }
+    }
+}
