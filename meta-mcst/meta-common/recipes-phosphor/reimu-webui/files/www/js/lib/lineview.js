@@ -3,7 +3,7 @@
 
 import { fmtTime } from "../api.js";
 
-const ROW = 18;
+const ROW = 18; // px per line at the default 13px font
 
 export class LogView {
   constructor(container, opts = {}) {
@@ -22,10 +22,13 @@ export class LogView {
     this.showDate = opts.showDate !== false;
     this.follow = true;
     this.pool = [];
+    this.row = ROW;
+    this.showTime = opts.showTime !== false;
+    this.mapText = null; // display filter for line text (e.g. glyphs the font lacks)
     this.onFollowChange = opts.onFollowChange || (() => {});
     this._raf = 0;
     this.el.addEventListener("scroll", () => {
-      const atBottom = this.el.scrollTop + this.el.clientHeight >= this.el.scrollHeight - ROW;
+      const atBottom = this.el.scrollTop + this.el.clientHeight >= this.el.scrollHeight - this.row;
       if (atBottom !== this.follow) {
         this.follow = atBottom;
         this.onFollowChange(this.follow);
@@ -80,10 +83,20 @@ export class LogView {
     this._schedule();
   }
 
+  // font size in px (line height follows) and the narrowest text column in
+  // characters, which the view then keeps by panning sideways
+  setFont(px, family, minCols) {
+    this.row = Math.round(px * 1.4);
+    this.el.style.font = `${px}px/${this.row}px ${family}`;
+    this.inner.style.minWidth = minCols ? `calc(${minCols}ch + 16px)` : "";
+    this.pool.forEach((p) => (p.row.style.height = `${this.row}px`));
+    this._rebuild();
+  }
+
   scrollToRow(row) {
     this.follow = false;
     this.onFollowChange(false);
-    this.el.scrollTop = Math.max(0, row * ROW - this.el.clientHeight / 2);
+    this.el.scrollTop = Math.max(0, row * this.row - this.el.clientHeight / 2);
   }
 
   _hit(l) {
@@ -98,7 +111,7 @@ export class LogView {
       this.view = null; // identity
     }
     const rows = this._count();
-    this.inner.style.height = `${rows * ROW}px`;
+    this.inner.style.height = `${rows * this.row}px`;
     if (this.follow) this.el.scrollTop = this.el.scrollHeight;
     this._schedule(true);
   }
@@ -127,12 +140,13 @@ export class LogView {
   _render(force) {
     const top = this.el.scrollTop;
     const h = this.el.clientHeight;
-    const first = Math.max(0, Math.floor(top / ROW) - 5);
-    const last = Math.min(this._count(), Math.ceil((top + h) / ROW) + 5);
+    const first = Math.max(0, Math.floor(top / this.row) - 5);
+    const last = Math.min(this._count(), Math.ceil((top + h) / this.row) + 5);
     const need = last - first;
     while (this.pool.length < need) {
       const row = document.createElement("div");
       row.className = "logline";
+      row.style.height = `${this.row}px`;
       const ts = document.createElement("span");
       ts.className = "ts";
       const tx = document.createElement("span");
@@ -154,9 +168,9 @@ export class LogView {
       if (!force && p.key === key) continue;
       p.key = key;
       p.row.style.display = "";
-      p.row.style.top = `${r * ROW}px`;
-      p.ts.textContent = l && l.t ? fmtTime(l.t, this.tz, this.showDate) : "";
-      p.tx.textContent = l ? l.text : "";
+      p.row.style.top = `${r * this.row}px`;
+      p.ts.textContent = l && l.t && this.showTime ? fmtTime(l.t, this.tz, this.showDate) : "";
+      p.tx.textContent = l ? (this.mapText ? this.mapText(l.text) : l.text) : "";
       p.row.classList.toggle("hit", !!this._hit(l));
       p.row.classList.toggle("partial", !!(l && l.partial));
     }

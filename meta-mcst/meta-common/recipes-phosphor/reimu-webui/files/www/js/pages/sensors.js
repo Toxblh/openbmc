@@ -82,8 +82,10 @@ function table(title, rows, unit, digits, opts = {}) {
   const idle = opts.hideIdle ? rs.filter((r) => r.value === null || r.value === undefined) : [];
   if (opts.hideIdle && !showIdle) rs = rs.filter((r) => !idle.includes(r));
   const cmp = (a, b) => a.localeCompare(b, "ru", { numeric: true });
-  rs.sort((a, b) => cmp(a.group || "", b.group || "") || cmp(a.name || "", b.name || ""));
-  const value = (r) => (r.value === undefined || r.value === null ? "—" : `${num(r.value, digits)} ${r.pct ? "%" : unit}`);
+  rs.sort((a, b) => cmp(a.group || "", b.group || "") || cmp(a.src || "", b.src || "") || cmp(a.name || "", b.name || ""));
+  const reading = (r) => (r.value === undefined || r.value === null ? "—" : `${num(r.value, digits)}\u00a0${r.pct ? "%" : unit}`);
+  // fans: the speed and, after it, the drive the controller gives the fan
+  const value = (r) => (opts.duty && r.duty !== undefined && r.duty !== null ? `${reading(r)} · ${num(r.duty, 0)}\u00a0%` : reading(r));
   let more = null;
   if (idle.length) {
     const a = h("a", { href: "#" }, showIdle ? "скрыть каналы без сигнала" : `показать каналы без сигнала (${idle.length})`);
@@ -101,20 +103,19 @@ function table(title, rows, unit, digits, opts = {}) {
     rs.length
       ? h(
           "table",
-          { class: "tbl" },
+          { class: "tbl sens-tbl" },
           h(
             "thead",
             {},
             h(
               "tr",
               {},
-              h("th", { class: "m-hide" }, "Устройство"),
-              h("th", {}, "Датчик"),
-              h("th", {}, "Значение"),
-              opts.duty ? h("th", {}, "Упр.") : null,
-              h("th", {}, "Сост."),
-              h("th", { class: "m-hide" }, "Предупр."),
-              h("th", { class: "m-hide" }, "Авария"),
+              h("th", { class: "m-hide c-dev" }, "Устройство"),
+              h("th", { class: "c-name" }, "Датчик"),
+              h("th", { class: "c-val" }, "Значение"),
+                            h("th", { class: "c-st" }, "Сост."),
+              h("th", { class: "m-hide c-lim" }, "Предупр."),
+              h("th", { class: "m-hide c-lim" }, "Авария"),
               h("th", { class: "m-hide" }, "Адрес"),
             ),
           ),
@@ -129,7 +130,6 @@ function table(title, rows, unit, digits, opts = {}) {
                 // on a phone the device column is hidden: its name goes above the sensor's
                 h("td", {}, h("div", { class: "m-only muted small" }, r.group), r.name),
                 h("td", { class: "mono" }, value(r)),
-                opts.duty ? h("td", { class: "mono" }, r.duty === undefined || r.duty === null ? "—" : `${num(r.duty, 0)} %`) : null,
                 h("td", {}, healthBadge(r.status)),
                 h("td", { class: "mono muted m-hide" }, num(r.warn, digits)),
                 h("td", { class: "mono muted m-hide" }, num(r.crit, digits)),

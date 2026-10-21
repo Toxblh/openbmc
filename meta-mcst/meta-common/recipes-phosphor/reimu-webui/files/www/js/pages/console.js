@@ -1,9 +1,10 @@
 // Serial consoles (host COM ports via reimu-serial): timestamped log with
 // full history, search, interactive terminal (xterm.js), baud/break control.
 
-import { h, toast, fmtTime } from "../api.js";
+import { h, icon, toast, fmtTime } from "../api.js";
 import { SerialClient, keyToBytes } from "../lib/serial-client.js";
 import { LogView } from "../lib/lineview.js";
+import { keyBar, ARROWS, FKEYS } from "../lib/keybar.js";
 
 export const fill = true;
 
@@ -14,11 +15,103 @@ let root;
 let ports = []; // {index, name, title, client, view, term, ...}
 let active = null;
 let prefs;
+let keys; // key bar for touch screens
+const held = { ctrl: false, alt: false };
+
+const narrow = () => window.matchMedia && matchMedia("(max-width: 700px)").matches;
+const touch = () => (window.matchMedia && matchMedia("(pointer: coarse)").matches) || navigator.maxTouchPoints > 0;
+// The host formats its output for 80 columns and never learns the size of
+// a serial terminal. On a narrow screen the font shrinks until 80 columns
+// fit (not below MIN_PX); wider lines pan sideways.
+const MIN_COLS = 80;
+const MIN_PX = 6;
+// input sent and not a byte back for this long: the host is stuck
+const NO_REPLY_MS = 5000;
+
+// width of a character of the terminal font, per px of font size
+function charRatio() {
+  const c = document.createElement("canvas").getContext("2d");
+  c.font = `100px ${termFont()}`;
+  return c.measureText("M".repeat(10)).width / 1000 || 0.6;
+}
+
+// font size (px) for `cols` characters in `width` px, at most the chosen size
+function fitPx(width, cols) {
+  if (!narrow()) return prefs.fontSize;
+  const px = Math.floor((width / (cols * charRatio())) * 2) / 2;
+  return Math.max(MIN_PX, Math.min(prefs.fontSize, px));
+}
+
+function fitLog(p) {
+  // the time column counts too: "10:20:24.528 " or with the date
+  const tsCols = !prefs.time ? 0 : prefs.date ? 25 : 14;
+  const width = (p.logWrap.clientWidth || p.body.clientWidth || innerWidth) - 16;
+  p.view.setFont(fitPx(width, MIN_COLS + tsCols), termFont(), narrow() ? MIN_COLS + tsCols : 0);
+}
+
+function fitTerm(p) {
+  const px = fitPx(p.termWrap.clientWidth - 8, MIN_COLS);
+  if (p.term.options.fontSize !== px) p.term.options.fontSize = px;
+  p.fit.fit();
+  if (narrow() && p.term.cols < MIN_COLS) p.term.resize(MIN_COLS, p.term.rows);
+}
+
+// Shell prompts draw icons from Nerd Fonts (Unicode private use area). With
+// no such font in the system they would be empty boxes: show spaces then.
+const PUA = /[\uE000-\uF8FF]|[\u{F0000}-\u{10FFFD}]/gu;
+let noIcons = false;
+function checkIcons() {
+  const c = document.createElement("canvas");
+  c.width = 40;
+  c.height = 40;
+  const g = c.getContext("2d");
+  const draw = (ch) => {
+    g.clearRect(0, 0, 40, 40);
+    g.font = `30px ${termFont()}`;
+    g.fillText(ch, 4, 32);
+    return g.getImageData(0, 0, 40, 40).data.join();
+  };
+  // U+E0B0 (powerline arrow) is in every Nerd Font, U+E9F0 in none
+  noIcons = draw("\ue0b0") === draw("\ue9f0");
+  const map = noIcons ? (t) => t.replace(PUA, " ") : null;
+  ports.forEach((p) => {
+    p.view.mapText = map;
+    p.view.setTz(tzValue(p));
+  });
+}
+const termText = (t) => (noIcons ? t.replace(PUA, " ") : t);
+
+const KEYS = [
+  ARROWS,
+  // ^C/^D/^Z at the far end: a stray ^D logs the session out
+  [["Del", "Delete"], ["Home", "Home"], ["End", "End"], ["PgUp", "PageUp"], ["PgDn", "PageDown"], ["Ins", "Insert"], ...FKEYS, ["^C", "^C"], ["^D", "^D"], ["^Z", "^Z"]],
+];
+
+function pressKey(k) {
+  if (k in held) {
+    held[k] = !held[k];
+    return;
+  }
+  if (!active) return;
+  const seq = k[0] === "^" ? String.fromCharCode(k.charCodeAt(1) - 64) : keyToBytes({ key: k });
+  if (seq) active.client.write((held.alt ? "\x1b" : "") + seq);
+  held.ctrl = held.alt = false;
+}
+
+// text typed on the phone keyboard after a sticky Ctrl/Alt of the key bar
+function withMods(d) {
+  if (!(held.ctrl || held.alt) || d.length !== 1) return d;
+  let out = d;
+  if (held.ctrl) out = keyToBytes({ key: d, ctrlKey: true }) || d;
+  if (held.alt) out = "\x1b" + out;
+  held.ctrl = held.alt = false;
+  if (keys) keys.refresh();
+  return out;
+}
 
 function loadPrefs() {
   // a phone has no room for the date in front of every line
-  const narrow = window.matchMedia && matchMedia("(max-width: 700px)").matches;
-  const def = { mode: "log", tz: "local", eol: "CR", date: !narrow, active: 0, fontSize: narrow ? 12 : 14, bs: "bs" };
+  const def = { mode: "log", tz: "local", eol: "CR", date: !narrow(), active: 0, fontSize: narrow() ? 12 : 14, bs: "bs", keys: true, time: true };
   try {
     return Object.assign(def, JSON.parse(localStorage.getItem("reimu-console") || "{}"));
   } catch (e) {
@@ -97,8 +190,10 @@ function applyFontToTerminals() {
     if (!p.term) return;
     p.term.options.fontFamily = termFont();
     p.term.options.fontSize = prefs.fontSize;
-    if (!p.termWrap.classList.contains("hidden")) p.fit.fit();
+    if (!p.termWrap.classList.contains("hidden")) fitTerm(p);
   });
+  ports.forEach(fitLog);
+  checkIcons();
   if (root) root.querySelector("#con-font").title = `Шрифт терминала: ${userFontName || "системный (JetBrains Mono Nerd Font, если установлен)"}`;
 }
 
@@ -143,6 +238,7 @@ export async function mount(el) {
     h(
       "div",
       { class: "console-toolbar" },
+      h("button", { class: "btn small touch-only", id: "con-keys", title: "Панель клавиш: Esc, Tab, Ctrl, стрелки, F1–F12", "aria-label": "Панель клавиш" }, icon("keyboard")),
       h("div", { class: "tabs", id: "con-tabs" }),
       h("span", { class: "spacer" }),
       h(
@@ -152,8 +248,8 @@ export async function mount(el) {
         h("button", { "data-mode": "term", title: "Интерактивный терминал (xterm)" }, "Терминал"),
       ),
       h("input", { id: "con-search", type: "search", placeholder: "Поиск…", size: 18 }),
-      h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-only" }), "только найденное"),
-      h("button", { class: "btn small m-only-inline", id: "con-more", title: "Остальные настройки" }, "⋯"),
+      h("label", { class: "inline small con-only-l" }, h("input", { type: "checkbox", id: "con-only" }), "только найденное"),
+      h("button", { class: "btn small m-only-inline", id: "con-more", title: "Остальные настройки", "aria-label": "Остальные настройки" }, icon("more")),
       h(
         "div",
         { class: "con-extra" },
@@ -164,6 +260,7 @@ export async function mount(el) {
           h("option", { value: "bmc" }, "Время: BMC"),
           h("option", { value: "utc" }, "Время: UTC"),
         ),
+        h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-time" }), "время"),
         h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-date" }), "дата"),
         h("select", { id: "con-baud", title: "Скорость порта" }, BAUDS.map((b) => h("option", { value: b }, `${b}`))),
         h("button", { class: "btn small", id: "con-break", title: "Послать BREAK (SysRq на Linux)" }, "Break"),
@@ -173,7 +270,7 @@ export async function mount(el) {
       h(
         "div",
         { class: "dropdown", id: "con-fontmenu" },
-        h("button", { class: "btn small", id: "con-font", title: "Шрифт терминала" }, "Терминал ▾"),
+        h("button", { class: "btn small", id: "con-font", title: "Шрифт терминала" }, "Терминал ", icon("caret")),
         h(
           "div",
           { class: "dropdown-menu right" },
@@ -187,6 +284,7 @@ export async function mount(el) {
       ),
     ),
     h("div", { class: "console-body", id: "con-body" }),
+    (keys = keyBar(KEYS, pressKey, held)),
     h(
       "div",
       { class: "statusbar", id: "con-status" },
@@ -201,8 +299,32 @@ export async function mount(el) {
 
   const $ = (id) => el.querySelector("#" + id);
   $("con-more").addEventListener("click", () => el.classList.toggle("con-extra-open"));
+  const showKeys = () => {
+    const on = touch() && prefs.keys;
+    keys.classList.toggle("hidden", !on);
+    $("con-keys").classList.toggle("active", on);
+    if (active && active.term && !active.termWrap.classList.contains("hidden")) requestAnimationFrame(() => fitTerm(active));
+  };
+  $("con-keys").addEventListener("click", () => {
+    prefs.keys = !prefs.keys;
+    savePrefs();
+    showKeys();
+  });
+  showKeys();
   $("con-tz").value = prefs.tz;
   $("con-date").checked = prefs.date;
+  $("con-time").checked = prefs.time;
+  $("con-time").addEventListener("change", (e) => {
+    prefs.time = e.target.checked;
+    savePrefs();
+    ports.forEach((p) => {
+      p.view.showTime = prefs.time;
+      fitLog(p);
+    });
+  });
+  const onResize = () => ports.forEach((p) => p.body.classList.contains("hidden") || fitLog(p));
+  window.addEventListener("resize", onResize);
+  root._offResize = () => window.removeEventListener("resize", onResize);
   $("con-mode").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-mode]");
     if (b) setMode(b.dataset.mode);
@@ -219,6 +341,7 @@ export async function mount(el) {
       if (p.view) {
         p.view.showDate = prefs.date;
         p.view.setTz(tzValue(p));
+        fitLog(p);
       }
     });
   });
@@ -280,15 +403,49 @@ export async function mount(el) {
   renderTabs();
 }
 
+// an "exec:" port of reimu-serial (SSH to the platform), not a COM port
+const isExec = (p) => !!(p.client.info && /^exec:/.test(p.client.info.device || ""));
+
+// «хост не отвечает»: input went out and nothing came back within NO_REPLY_MS;
+// «сессия завершилась»: a login prompt came after the user typed something
+function watchReplies(p) {
+  const write = p.client.write.bind(p.client);
+  p.client.write = (d) => {
+    p.lastInput = Date.now();
+    p.ended = 0;
+    if (!p.waitSince && !isExec(p)) {
+      p.waitSince = Date.now();
+      p.waitTimer = setTimeout(() => {
+        p.silentSince = p.waitSince;
+        clearInterval(p.silentTick);
+        p.silentTick = setInterval(() => p === active && updateStatus(), 30000);
+        if (p === active) updateStatus();
+      }, NO_REPLY_MS);
+    }
+    return write(d);
+  };
+  p.client.addEventListener("data", (ev) => {
+    clearTimeout(p.waitTimer);
+    clearInterval(p.silentTick);
+    const was = p.silentSince;
+    p.waitSince = p.silentSince = 0;
+    if (p.lastInput && !isExec(p)) {
+      p.tail = ((p.tail || "") + (p.loginDec ||= new TextDecoder()).decode(ev.detail.bytes, { stream: true })).slice(-200);
+      if (/login:\s*$/i.test(p.tail)) p.ended = Date.now();
+    }
+    if (was && p === active) updateStatus();
+  });
+}
+
 function addPort(pi) {
   const p = { ...pi, client: new SerialClient(pi.index) };
+  watchReplies(p);
   p.body = h("div", { class: "console-body hidden" });
   p.logWrap = h("div", { class: "logview" });
   p.followBtn = h("button", { class: "btn small primary follow-btn hidden" }, "↓ к последним строкам");
-  const narrow = window.matchMedia && matchMedia("(max-width: 700px)").matches;
   // phone keyboards must not capitalize or "correct" commands
   p.input = h("input", {
-    placeholder: narrow ? "Строка для отправки" : "Строка для отправки (Enter). Или кликните в лог и печатайте прямо в порт.",
+    placeholder: narrow() ? "Строка для отправки" : "Строка для отправки (Enter). Или кликните в лог и печатайте прямо в порт.",
     spellcheck: "false",
     autocapitalize: "off",
     autocorrect: "off",
@@ -304,14 +461,24 @@ function addPort(pi) {
 
   p.view = new LogView(p.logWrap, {
     showDate: prefs.date,
+    showTime: prefs.time,
     onFollowChange: (f) => p.followBtn.classList.toggle("hidden", f),
   });
   p.followBtn.addEventListener("click", () => p.view.scrollToBottom());
+  p.view.mapText = noIcons ? (t) => t.replace(PUA, " ") : null;
+  requestAnimationFrame(() => fitLog(p));
 
   const send = () => {
     p.client.write(p.input.value + EOL[p.eol.value]);
     p.input.value = "";
   };
+  p.input.addEventListener("beforeinput", (e) => {
+    // Ctrl/Alt of the key bar + a letter goes straight to the port
+    if (e.data && e.data.length === 1 && (held.ctrl || held.alt)) {
+      e.preventDefault();
+      p.client.write(withMods(e.data));
+    }
+  });
   p.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -365,7 +532,7 @@ function addPort(pi) {
   });
   p.client.addEventListener("data", (ev) => {
     refresh();
-    if (p.term) p.term.write(ev.detail.bytes);
+    if (p.term) p.term.write(noIcons ? termText((p.dec ||= new TextDecoder()).decode(ev.detail.bytes, { stream: true })) : ev.detail.bytes);
   });
   p.client.addEventListener("cleared", () => {
     p.view.setLines(p.client.lines, null);
@@ -413,14 +580,15 @@ function setMode(mode) {
   const term = mode === "term";
   active.logPane.classList.toggle("hidden", term);
   active.termWrap.classList.toggle("hidden", !term);
-  ["con-search", "con-only", "con-tz", "con-date"].forEach((id) => (root.querySelector("#" + id).disabled = term));
+  ["con-search", "con-only", "con-tz", "con-date", "con-time"].forEach((id) => (root.querySelector("#" + id).disabled = term));
   if (term) {
     if (!active.term) createTerminal(active);
     requestAnimationFrame(() => {
-      active.fit.fit();
+      fitTerm(active);
       active.term.focus();
     });
   } else {
+    fitLog(active);
     active.view.scrollToBottom();
     active.logWrap.focus();
   }
@@ -450,10 +618,25 @@ function createTerminal(p) {
     }
     return true;
   });
-  p.term.onData((d) => p.client.write(d));
+  p.term.onData((d) => p.client.write(withMods(d)));
   p.term.onBinary((d) => p.client.write(Uint8Array.from(d, (c) => c.charCodeAt(0))));
-  p.resizeObs = new ResizeObserver(() => !p.termWrap.classList.contains("hidden") && p.fit.fit());
+  p.resizeObs = new ResizeObserver(() => !p.termWrap.classList.contains("hidden") && fitTerm(p));
   p.resizeObs.observe(p.termWrap);
+  // xterm takes every touch move for its scrollback: pan sideways here
+  let t = null;
+  p.termWrap.addEventListener("touchstart", (e) => (t = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, h: null } : null), { capture: true, passive: true });
+  p.termWrap.addEventListener(
+    "touchmove",
+    (e) => {
+      if (!t || e.touches.length !== 1) return;
+      const x = e.touches[0].clientX, y = e.touches[0].clientY;
+      if (t.h === null && Math.hypot(x - t.x, y - t.y) > 6) t.h = Math.abs(x - t.x) > Math.abs(y - t.y);
+      if (t.h) p.termWrap.scrollLeft -= x - t.x;
+      t.x = x;
+      t.y = y;
+    },
+    { capture: true, passive: true },
+  );
   resetTerminal(p);
 }
 
@@ -462,28 +645,44 @@ function resetTerminal(p) {
   // History is replayed as plain lines: escape sequences from long ago would
   // only garble the screen.
   const hist = p.client.lines.map((l) => l.text).join("\r\n");
-  if (hist) p.term.write(hist + "\r\n");
+  if (hist) p.term.write(termText(hist) + "\r\n");
   const part = p.client.partialLine();
-  if (part) p.term.write(part.raw);
+  if (part) p.term.write(noIcons ? termText(part.raw) : part.raw);
 }
 
 function updateStatus() {
   if (!active || !root) return;
   const $ = (id) => root.querySelector("#" + id);
   const info = active.client.info;
-  $("st-port").textContent = info ? `${active.title} (${info.device})` : active.title;
+  const exec = isExec(active);
+  $("st-port").textContent = info && !exec ? `${active.title} (${info.device})` : active.title;
   const online = active.client.connected && info && info.online;
-  $("st-online").textContent = !active.client.connected ? "нет связи с BMC" : info && !info.online ? "устройство недоступно" : online ? (info.legacy ? "штатная прошивка: история только в браузере" : `${info.baud} бод`) : "…";
-  $("st-online").style.color = online ? "" : "var(--warn)";
+  const st = $("st-online");
+  st.textContent = !active.client.connected ? "нет связи с BMC" : info && !info.online ? "устройство недоступно" : online ? (info.legacy ? "штатная прошивка: история только в браузере" : exec ? "сеанс SSH" : `${info.baud} бод`) : "…";
+  st.title = "";
+  st.style.color = online ? "" : "var(--warn)";
+  if (online && active.silentSince) {
+    const min = Math.floor((Date.now() - active.silentSince) / 60000);
+    st.textContent = `хост не отвечает на ввод${min ? ` (${min} мин)` : ""}`;
+    st.title = "Ctrl+Q — если вывод остановлен (XOFF); вкладка SSH — войти по сети; Break (SysRq) действует, только если консоль ядра на этом порту (console=ttyS1)";
+    st.style.color = "var(--warn)";
+  } else if (online && active.ended) {
+    st.textContent = "сессия завершилась: приглашение входа";
+    st.style.color = "var(--warn)";
+  }
   $("st-lines").textContent = `${active.client.lines.length} / ${active.client.maxLines}`;
   $("st-rx").textContent = `${active.client.stats.rxBytes} Б`;
-  if (info && !info.legacy) $("con-baud").value = info.baud;
-  $("con-baud").disabled = !!(info && info.legacy);
-  $("st-hint").textContent = prefs.mode === "log" ? "Клик в ленту — ввод прямо в порт; выделение мышью — копирование" : "";
+  if (info && !info.legacy && !exec) $("con-baud").value = info.baud;
+  $("con-baud").disabled = !!(info && info.legacy) || exec;
+  $("con-break").disabled = exec;
+  $("st-hint").textContent = online && active.silentSince ? st.title : prefs.mode === "log" ? "Клик в ленту — ввод прямо в порт; выделение мышью — копирование" : "";
 }
 
 export function unmount() {
+  if (root && root._offResize) root._offResize();
   ports.forEach((p) => {
+    clearTimeout(p.waitTimer);
+    clearInterval(p.silentTick);
     p.client.close();
     p.view.destroy();
     if (p.term) p.term.dispose();
@@ -492,4 +691,5 @@ export function unmount() {
   ports = [];
   active = null;
   root = null;
+  keys = null;
 }

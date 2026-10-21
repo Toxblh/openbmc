@@ -33,7 +33,7 @@ function showLogin(msg = "") {
 async function showApp(user) {
   state.loggedIn = true;
   appState.user = user || appState.user || "root";
-  $("user-btn").textContent = `${appState.user} ▾`;
+  $("user-name").textContent = appState.user;
   $("nav-logout").textContent = `Выйти (${appState.user})`;
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
@@ -143,11 +143,11 @@ async function doRoute() {
   entry.el.style.flexDirection = entry.mod.fill ? "column" : "";
 }
 
-// Narrow screens: the page links live in a drawer opened by the ☰ button
+// Narrow screens: the page links live in a drawer opened by the menu button
 function setNavOpen(open) {
   document.body.classList.toggle("nav-open", open);
   $("nav-btn").setAttribute("aria-expanded", String(open));
-  $("nav-btn").textContent = open ? "✕" : "☰";
+  $("nav-btn").querySelector(".ic").className = `ic ic-${open ? "close" : "menu"}`;
 }
 
 function setupDropdowns() {

@@ -4,6 +4,8 @@ import { platformSensors, rowOf } from "./sensors.js";
 
 let root, timer;
 
+const LED = { OK: "on", Warning: "warn", Critical: "err" };
+
 const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
 
 export async function mount(el) {
@@ -34,7 +36,9 @@ async function refresh() {
       .filter((s) => s.kind === "temp" && s.value !== null)
       .forEach((s) => {
         const r = rowOf(s);
-        temps.push({ Name: `${r.group}: ${r.name}`, ReadingCelsius: r.value, Status: r.status });
+        // "температура" of a regulator says nothing: its device does
+        if (r.name === "температура") temps.push({ Name: r.group, ReadingCelsius: r.value, Status: r.status });
+        else temps.push({ Name: r.name, Group: r.group, ReadingCelsius: r.value, Status: r.status });
       });
   temps.sort((a, b) => (b.ReadingCelsius || 0) - (a.ReadingCelsius || 0));
 
@@ -65,7 +69,7 @@ async function refresh() {
             ["Серийный номер", sys.SerialNumber],
             ["Версия ПНС", sys.BiosVersion],
             ["Процессоры", sys.ProcessorSummary && sys.ProcessorSummary.Count ? `${sys.ProcessorSummary.Count} × ${sys.ProcessorSummary.Model || ""}` : undefined],
-            ["UID", sys.IndicatorLED],
+            ["Индикатор UID", { Off: "выключен", Lit: "горит", Blinking: "мигает" }[sys.IndicatorLED] || sys.IndicatorLED],
           ])
         : h("div", { class: "muted" }, "нет данных"),
       h("br"),
@@ -79,7 +83,7 @@ async function refresh() {
         ? kv([
             ["Прошивка", mgr.FirmwareVersion],
             ["Модель", mgr.Model],
-            ["Время BMC", mgr.DateTime ? `${mgr.DateTime.replace("T", " ")}` : undefined],
+            ["Время BMC", mgr.DateTime ? mgr.DateTime.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, (z) => (z === "+00:00" || z === "Z" ? " UTC" : ` ${z}`)) : undefined],
             ["Время браузера", new Date().toLocaleString()],
             ["UUID", mgr.UUID],
           ])
@@ -91,12 +95,16 @@ async function refresh() {
       h("h3", {}, "Температуры"),
       temps.length
         ? h(
-            "table",
-            { class: "tbl" },
-            h(
-              "tbody",
-              {},
-              temps.slice(0, 8).map((t) => h("tr", {}, h("td", {}, t.Name), h("td", { class: "mono" }, t.ReadingCelsius !== undefined && t.ReadingCelsius !== null ? `${Number(t.ReadingCelsius).toFixed(1)} °C` : "—"), h("td", {}, healthBadge(t.Status)))),
+            "div",
+            { class: "temps" },
+            temps.slice(0, 8).map((t) =>
+              h(
+                "div",
+                { class: "temp-row", title: t.Status && t.Status.Health ? `Состояние: ${t.Status.Health}` : "" },
+                h("span", { class: `led ${LED[t.Status && t.Status.Health] || ""}` }),
+                h("span", { class: "temp-name" }, t.Name, t.Group ? h("span", { class: "muted small" }, t.Group) : null),
+                h("span", { class: "temp-val mono" }, t.ReadingCelsius !== undefined && t.ReadingCelsius !== null ? `${Number(t.ReadingCelsius).toFixed(1)}\u00a0°C` : "—"),
+              ),
             ),
           )
         : h("div", { class: "muted" }, plat && plat.platform === "starting" ? "платформа включается: датчики появятся через ~30 с" : on ? "датчики не найдены" : "платформа выключена: датчики платформы появятся после включения"),

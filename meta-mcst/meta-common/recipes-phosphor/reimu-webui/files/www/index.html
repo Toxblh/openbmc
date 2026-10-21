@@ -50,7 +50,7 @@
           <span class="led" id="power-led"></span><span id="power-text">…</span>
         </div>
         <div class="dropdown">
-          <button class="btn" id="power-menu-btn" aria-haspopup="true"><span class="m-hide-inline">Питание </span><span class="m-only-inline" aria-label="Питание">⏻ </span>▾</button>
+          <button class="btn" id="power-menu-btn" aria-haspopup="true"><span class="m-hide-inline">Питание </span><span class="m-only-inline" aria-label="Питание"><i class="ic ic-power" aria-hidden="true"></i></span><i class="ic ic-caret" aria-hidden="true"></i></button>
           <div class="dropdown-menu" id="power-menu">
             <button data-reset="On">Включить</button>
             <button data-reset="GracefulShutdown">Выключить (ACPI)</button>
@@ -60,13 +60,13 @@
           </div>
         </div>
         <div class="dropdown user-dd">
-          <button class="btn ghost" id="user-btn">root ▾</button>
+          <button class="btn ghost" id="user-btn"><span id="user-name">root</span> <i class="ic ic-caret" aria-hidden="true"></i></button>
           <div class="dropdown-menu right">
             <a href="legacy/">Старый интерфейс</a>
             <button id="logout-btn">Выйти</button>
           </div>
         </div>
-        <button class="btn ghost nav-btn" id="nav-btn" aria-label="Меню" aria-expanded="false">☰</button>
+        <button class="btn ghost nav-btn" id="nav-btn" aria-label="Меню" aria-expanded="false"><i class="ic ic-menu" aria-hidden="true"></i></button>
       </div>
     </header>
     <main id="page" class="page"></main>

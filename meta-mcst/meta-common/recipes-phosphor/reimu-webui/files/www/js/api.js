@@ -104,8 +104,10 @@ export const api = {
       /* session may be gone already */
     }
   },
-  // Cheap authenticated probe used at startup.
+  // Cheap authenticated probe used at startup. Without the XSRF cookie (set at
+  // login) there is no session to probe: no request, no 401 in the console.
   async whoami() {
+    if (!cookie("XSRF-TOKEN")) throw new ApiError(401, "no session", null);
     return request("GET", "/redfish/v1/SessionService/Sessions", undefined, { noAuthEvent: true });
   },
 
@@ -146,6 +148,10 @@ export function h(tag, attrs = {}, ...children) {
   }
   return el;
 }
+
+// Icons are SVG masks in reimu.css: symbol characters such as ⏻ or ⌨ are
+// missing from many system fonts.
+export const icon = (name) => h("i", { class: `ic ic-${name}`, "aria-hidden": "true" });
 
 export function toast(text, kind = "") {
   const box = document.getElementById("toasts");
