@@ -1,4 +1,4 @@
-/* shared by reimu-pnsd.c and reimu-sensors.c */
+/* shared by reimu-pnsd.c, reimu-sensors.c and reimu-journal.c */
 #ifndef REIMU_SENSORS_H
 #define REIMU_SENSORS_H
 
@@ -18,5 +18,8 @@ void buf_json(struct buf *b, const char *s, size_t n);
 
 /* appends "sensors":[...] (and "error" when there is no device tree) */
 void sensors_json(struct buf *b);
+
+/* BMC journal window as JSON, see reimu-journal.c */
+void journal_json(struct buf *b, const char *cursor, int count);
 
 #endif

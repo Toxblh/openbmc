@@ -18,6 +18,7 @@ SRC_URI = " \
             file://Makefile \
             file://reimu-pnsd.c \
             file://reimu-sensors.c \
+            file://reimu-journal.c \
             file://reimu-sensors.h \
             file://reimu-pns-scan \
             file://reimu-pnsd.service \

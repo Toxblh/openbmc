@@ -740,6 +740,26 @@ static int method_rescan(sd_bus_message *m, void *ud, sd_bus_error *err)
     return r;
 }
 
+static int method_journal(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    (void)ud; (void)err;
+    const char *cur;
+    int32_t count;
+    int r = sd_bus_message_read(m, "si", &cur, &count);
+    if (r < 0) return r;
+    struct buf b = { 0 };
+    journal_json(&b, cur, count);
+    r = sd_bus_reply_method_return(m, "s", b.s ? b.s : "{}");
+    free(b.s);
+    return r;
+}
+
+static const sd_bus_vtable journal_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("Read", "si", "s", method_journal, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_VTABLE_END
+};
+
 static const sd_bus_vtable pns_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_PROPERTY("Json", "s", prop_json, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -763,6 +783,9 @@ static int run_daemon(void)
     if (r >= 0)
         r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/sensors", "xyz.openbmc_project.Reimu.Sensors",
                                      sensors_vtable, NULL);
+    if (r >= 0)
+        r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/journal", "xyz.openbmc_project.Reimu.Journal",
+                                     journal_vtable, NULL);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
     if (r < 0)
@@ -819,13 +842,22 @@ int main(int argc, char **argv)
         free(j);
         return 0;
     }
+    if (argc >= 2 && argc <= 4 && !strcmp(argv[1], "--journal"))
+    {
+        struct buf b = { 0 };
+        journal_json(&b, argc > 3 ? argv[3] : "", argc > 2 ? atoi(argv[2]) : -20);
+        if (b.s) puts(b.s);
+        free(b.s);
+        return 0;
+    }
     if (argc == 1) return run_daemon();
 #endif
     fprintf(stderr, "Usage: %s                    run D-Bus service\n"
                     "       %s --parse <flash>    print ПНС flash partition table as JSON\n"
                     "       %s --fru <eeprom>     print FRU ID EEPROM image as XML\n"
                     "       %s --json             print the D-Bus JSON document\n"
-                    "       %s --sensors          read the platform sensors now (no power check)\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+                    "       %s --sensors          read the platform sensors now (no power check)\n"
+                    "       %s --journal [n [cursor]]  print BMC journal entries (n < 0: before cursor)\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }

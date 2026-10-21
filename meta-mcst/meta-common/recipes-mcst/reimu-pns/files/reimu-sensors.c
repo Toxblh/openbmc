@@ -450,7 +450,13 @@ static void emc2305(struct out *o, int bus, int addr, const char *label, const c
     close(fd);
 }
 
-/* E8C2 PCS: 2-byte big-endian reading in 1/8 °C, 0 = no sensor */
+/* E8C2 PCS: 2-byte big-endian reading in 1/8 °C, 0 = no sensor. Sensor
+ * places as the host's l_pcs driver names T0..T6. */
+static const char *const pcs_names[] = {
+    "ядра 0, 1", "ядра 2, 3", "ядра 4, 5", "ядра 6, 7",
+    "контроллеры памяти 0, 1", "контроллеры памяти 2, 3", "системный коммутатор",
+};
+
 static void pcs(struct out *o, int bus, int node)
 {
     char group[32];
@@ -470,8 +476,9 @@ static void pcs(struct out *o, int bus, int node)
         }
         unsigned v = (b[0] << 8) | b[1];
         if (!v) continue;
-        char name[32], src[24];
-        snprintf(name, sizeof(name), "датчик %d", k);
+        char name[64], src[24];
+        if (k < (int)(sizeof(pcs_names) / sizeof(pcs_names[0]))) snprintf(name, sizeof(name), "%s", pcs_names[k]);
+        else snprintf(name, sizeof(name), "датчик %d", k);
         snprintf(src, sizeof(src), "%d-%04x", bus, addr);
         emit(o, "temp", group, name, src, v / 8.0, NAN, NAN, -1);
     }
