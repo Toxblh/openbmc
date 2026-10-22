@@ -23,7 +23,7 @@ static int instantiate(int node, const char *compatible, int bus, int reg)
 
     char sysfspath[512];
     char sysfsdata[256];
-    snprintf(sysfspath, 511, "/sys/class/i2c-adapter/i2c-%d/new_device", bus);
+    snprintf(sysfspath, 511, "/sys/bus/i2c/devices/i2c-%d/new_device", bus);
     snprintf(sysfsdata, 255, "%s 0x%02x\n", compatible, reg);
     if(reimu_writefile(sysfspath, sysfsdata, strlen(sysfsdata)))
     {
@@ -31,7 +31,7 @@ static int instantiate(int node, const char *compatible, int bus, int reg)
         return 2;
     }
 
-    snprintf(sysfspath, 511, "/sys/class/i2c-adapter/i2c-%d/%d-%04x/hwmon", bus, bus, reg);
+    snprintf(sysfspath, 511, "/sys/bus/i2c/devices/i2c-%d/%d-%04x/hwmon", bus, bus, reg);
 
     int attempt = 0;
     while(reimu_chkdir(sysfspath))
@@ -65,7 +65,7 @@ static int deinstantiate(int node, const char *compatible, int bus, int reg)
 
     char sysfspath[512];
     char sysfsdata[256];
-    snprintf(sysfspath, 511, "/sys/class/i2c-adapter/i2c-%d/delete_device", bus);
+    snprintf(sysfspath, 511, "/sys/bus/i2c/devices/i2c-%d/delete_device", bus);
     snprintf(sysfsdata, 255, "0x%02x\n", reg);
     if(reimu_writefile(sysfspath, sysfsdata, strlen(sysfsdata)))
     {
@@ -80,7 +80,7 @@ static int deinstantiate(int node, const char *compatible, int bus, int reg)
 static void detect_addresses(int i2c, int *apb, int *bus)
 {
     char bus_path[1024], *real_path;
-    snprintf(bus_path, 1023, "/sys/class/i2c-adapter/i2c-%d/device", i2c);
+    snprintf(bus_path, 1023, "/sys/bus/i2c/devices/i2c-%d/device", i2c);
     if((real_path = realpath(bus_path, NULL)) == NULL) reimu_cancel(40, "Can't get real path of device node %s: %s\n", bus_path, strerror(errno));
 
     char *apb_path = strchr(real_path, '@');

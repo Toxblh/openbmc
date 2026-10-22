@@ -18,3 +18,9 @@ SRC_URI = "git://github.com/makise-homura/mcst-fruid.git;protocol=https"
 SRCREV = "${AUTOREV}"
 
 S = "${WORKDIR}/git"
+
+# /sys/class/i2c-adapter is gone in kernel 6.x (CONFIG_I2C_COMPAT removed);
+# the adapters are under /sys/bus/i2c/devices in every kernel
+do_configure_prepend() {
+    sed -i "s#/sys/class/i2c-adapter/#/sys/bus/i2c/devices/#g" ${S}/i2c-ops.c
+}

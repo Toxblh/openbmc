@@ -43,7 +43,7 @@ static void detect_hwmon(int bus, int reg)
     if(s_hwmons[cpu][sensor] >= 0) return;
 
     char path[1024];
-    snprintf(path, 1023, "/sys/class/i2c-adapter/i2c-%d/%d-00%02x/hwmon", bus, bus, reg);
+    snprintf(path, 1023, "/sys/bus/i2c/devices/i2c-%d/%d-00%02x/hwmon", bus, bus, reg);
     dbg_printf(stdout, "Trying to check %s\n", path);
 
     char *file = NULL;
@@ -73,7 +73,7 @@ static int detect_cpus(int unused __attribute__((unused)), const char *pcompatib
         if ((s_cpus[cpu] == 0) && (s_hwmons[cpu][sensor] >= 0))
         {
             char path[1024];
-            snprintf(path, 1023, "/sys/class/i2c-adapter/i2c-%d/%d-00%02x/hwmon/hwmon%ld/temp1_input", bus, bus, reg, s_hwmons[cpu][sensor]);
+            snprintf(path, 1023, "/sys/bus/i2c/devices/i2c-%d/%d-00%02x/hwmon/hwmon%ld/temp1_input", bus, bus, reg, s_hwmons[cpu][sensor]);
             dbg_printf(stdout, "Trying to read %s\n", path);
             if(!reimu_chkfile(path))
             {
@@ -89,7 +89,7 @@ static long get_temperature(int cpu, int sensor, double *result)
 {
     char path[1024];
     int reg = 0x20 + (0x10 * cpu) | sensor;
-    snprintf(path, 1023, "/sys/class/i2c-adapter/i2c-%d/%d-00%02x/hwmon/hwmon%ld/temp1_input", s_buses[cpu], s_buses[cpu], reg, s_hwmons[cpu][sensor]);
+    snprintf(path, 1023, "/sys/bus/i2c/devices/i2c-%d/%d-00%02x/hwmon/hwmon%ld/temp1_input", s_buses[cpu], s_buses[cpu], reg, s_hwmons[cpu][sensor]);
 
     char *ctemp, *ctempend;
     if (reimu_readfile(path, &ctemp, NULL)) return -258;

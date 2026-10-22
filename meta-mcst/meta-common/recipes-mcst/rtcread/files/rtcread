@@ -43,10 +43,10 @@ instantiate_rtc()
         return
     fi
 
-    sysfsdir=/sys/class/i2c-adapter/i2c-${bus}/${bus}-00${slave}/rtc/
+    sysfsdir=/sys/bus/i2c/devices/i2c-${bus}/${bus}-00${slave}/rtc/
     if [ ! -d $sysfsdir ]
     then
-        echo "$model 0x$slave" > /sys/class/i2c-adapter/i2c-$bus/new_device
+        echo "$model 0x$slave" > /sys/bus/i2c/devices/i2c-$bus/new_device
         usleep 100000
     fi
 
