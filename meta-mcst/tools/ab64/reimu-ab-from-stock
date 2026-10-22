@@ -1,0 +1,126 @@
+#!/bin/sh
+# reimu-ab-from-stock: start the A/B firmware on a BMC that runs the stock
+# REIMU firmware, from RAM (kexec: the BMC isn't reset, so neither is the
+# platform), and optionally install it.
+#
+#   reimu-ab-from-stock test    BMC KEXEC.tar
+#   reimu-ab-from-stock install BMC KEXEC.tar UPDATE.tar [--reboot]
+#
+# BMC: [user@]host[:port] (ssh; SSHPASS set: password login through SSH_ASKPASS).
+# Needs fdtput/fdtget (dtc) here.
+# KEXEC.tar, UPDATE.tar: reimu-ab-kexec.tar and reimu-ab.tar of the build.
+#
+# test: the new firmware runs with every flash partition read-only (fdt-ro)
+#   and its rwfs in RAM; nothing is written anywhere. A dead-man switch
+#   (WDT1, 15 min) resets the BMC back into the stock firmware if the new
+#   one doesn't come up; once up, it keeps running until a reboot (which
+#   starts the stock firmware again: the flash is untouched).
+# install: the same start, writable, then on the new firmware:
+#   1. the settings of the stock rwfs are saved (ssh host keys, the web
+#      certificate, IPMI users, ...) - first, to this computer too
+#   2. reimu-ab setup-env: the A/B bootcmd (the stock kernel stays bootable
+#      as slot A until it's overwritten; the MAC addresses are kept)
+#   3. reimu-ab install both: slot B, then B is the one that boots, then
+#      slot A; every write is read back and compared, rewritten on a mismatch
+#   4. reimu-ab rwfs-init: the rwfs erased (checked), the settings put in
+#   5. reimu-ab verify: both slots re-read against their digests
+#   Reboot only with --reboot (it resets the platform: a SoC reset).
+# EXTRA_CMDLINE: more for the new kernel's command line (netconsole=...).
+set -eu
+mode=${1:?test or install}; bmc=${2:?BMC}; kx=${3:?KEXEC.tar}; upd=${4:-}; reboot=${5:-}
+[ "$mode" = install ] && [ -z "$upd" ] && { echo "install needs UPDATE.tar" >&2; exit 2; }
+host=${bmc%:*}; port=22; [ "$host" != "$bmc" ] && port=${bmc##*:}
+case $host in *@*) ;; *) host=root@$host ;; esac
+SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 -o ServerAliveInterval=10"
+if [ -n "${SSHPASS:-}" ]; then
+    ap=$(mktemp); printf '#!/bin/sh\necho "%s"\n' "$SSHPASS" > "$ap"; chmod +x "$ap"
+    export SSH_ASKPASS=$ap SSH_ASKPASS_REQUIRE=force DISPLAY=x
+fi
+r() { ssh -p $port $SSHO $host "$@"; }
+put() { r "cat > '$2'" < "$1"; }   # no sftp-server on the BMC
+say() { printf '\n== %s\n' "$*"; }
+wait_up() { # until ssh answers (the new firmware after kexec)
+    i=0; while ! r true 2>/dev/null; do i=$((i + 1)); [ $i -lt 90 ] || { echo "BMC not back after kexec" >&2; exit 1; }; sleep 5; done
+    r 'systemctl is-system-running --wait >/dev/null 2>&1; true'
+}
+
+say "on the stock firmware: $(r 'cat /etc/os-release | sed -n s/^VERSION_ID=//p; uname -r' | tr '\n' ' ')"
+r 'grep -q "^VERSION_ID=reimu-1.0.2$" /etc/os-release' || { echo "not the stock REIMU 1.0.2 firmware" >&2; exit 1; }
+w=$(mktemp -d); trap 'rm -rf "$w" ${ap:-}' EXIT
+tar -xf "$kx" -C "$w"
+# U-Boot puts the MAC addresses into the device tree at bootm; kexec doesn't:
+# the board's ones (U-Boot environment) into both device trees
+for n in "ethaddr 1e660000" "eth1addr 1e680000"; do
+    mac=$(r "fw_printenv -n ${n% *}" | tr 'A-F:' 'a-f ')
+    [ $(echo $mac | wc -w) = 6 ] || { echo "no ${n% *} in the U-Boot environment" >&2; exit 1; }
+    for f in fdt fdt-ro; do fdtput -t bx "$w/$f" /ahb/ethernet@${n#* } local-mac-address $mac; done
+    echo "${n% *}: $(fdtget -t bx "$w/fdt" /ahb/ethernet@${n#* } local-mac-address)"
+done
+r 'rm -rf /tmp/ab && mkdir -p /tmp/ab'
+for f in zImage fdt fdt-ro initrd kexec; do put "$w/$f" /tmp/ab/$f; done
+r 'chmod +x /tmp/ab/kexec'
+
+if [ "$mode" = install ]; then
+    say "saving the stock settings (rwfs)"
+    r 'cd /run/initramfs/rw/cow && tar -cf /tmp/ab/settings.tar $(ls -d etc/ssh etc/ssl/certs/https etc/machine-id etc/overheatd.conf \
+        var/lib/ipmi var/lib/phosphor-inventory-manager var/lib/phosphor-led-manager var/lib/reimu var/lib/dbus \
+        var/lib/phosphor-state-manager home/root/.ssh home/root/bmcweb_persistent_data.json usr/log 2>/dev/null)'
+    r 'cat /tmp/ab/settings.tar' > "$w/settings.tar"
+    keep=${SETTINGS_KEEP:-./stock-settings-$(date +%Y%m%d-%H%M%S).tar}
+    cp "$w/settings.tar" "$keep"
+    echo "settings: $(tar -tf "$w/settings.tar" | wc -l | tr -d ' ') files, a copy in $keep"
+fi
+
+# the platform's device tree and FRU data, read by mcst-fruid from the PNS
+# flash at a cold boot of the BMC only (after a kexec the flash is the
+# host's): the sensors (hwmon-instantiator) need them
+r 'cd /var/volatile && tar -cf /tmp/ab/volatile.tar motherboard_devtree.dtb motherboard_info.xml 2>/dev/null' &&
+    r 'cat /tmp/ab/volatile.tar' > "$w/volatile.tar" || rm -f "$w/volatile.tar"
+
+fdt=fdt-ro; extra=reimu.test
+[ "$mode" = install ] && { fdt=fdt; extra=reimu.ram; }
+# from RAM nothing may write the U-Boot environment or reboot the BMC on its
+# own: set_mac (MAC from the FRU EEPROM -> environment, reboot),
+# revert-to-mfg (UID button: wipe the rwfs, reboot). (Not units another one
+# Requires: phosphor-discover-system-state@0 is, masking it stops the boot.)
+mask="systemd.mask=set_mac.service systemd.mask=revert-to-mfg.service"
+cmd="console=ttyS4,115200n8 root=/dev/ram rw watchdog.open_timeout=900 reimu.slot=a $extra $mask ${EXTRA_CMDLINE:-}"
+say "kexec into the new firmware ($extra, $fdt), dead-man switch 15 min"
+r "/tmp/ab/kexec -l /tmp/ab/zImage --dtb=/tmp/ab/$fdt --initrd=/tmp/ab/initrd --command-line='$cmd'"
+r '[ "$(cat /sys/kernel/kexec_loaded)" = 1 ]'
+# WDT1 (watchdog0; never watchdog1: second-flash boot) for 15 min: the new
+# kernel feeds it until its systemd takes it over
+r 'busybox watchdog -T 900 -t 100000 /dev/watchdog0'
+# the drivers without .shutdown (video, USB gadget, NICs) keep their DMA
+# going over a kexec: stop them; file systems read-only instead of a shutdown
+r 'for u in start-ipkvm reimu-kvm bmcweb $(systemctl list-units --plain --no-legend "reimu-webdev*" | cut -d" " -f1); do systemctl stop $u 2>/dev/null; done
+   for g in /sys/kernel/config/usb_gadget/*/UDC; do echo > $g 2>/dev/null; done
+   sync; echo u > /proc/sysrq-trigger; sync
+   (sleep 2; ip link set eth1 down; ip link set eth0 down; /tmp/ab/kexec -e) >/dev/null 2>&1 &' || true
+sleep 15
+wait_up
+say "new firmware: $(r 'uname -r; cat /run/initramfs/reimu-ab; sed -n s/^VERSION_ID=//p /etc/os-release' | tr '\n' ' ')"
+r 'grep -qw '"$extra"' /proc/cmdline' || { echo "not the new firmware?" >&2; exit 1; }
+if [ -s "$w/volatile.tar" ]; then
+    put "$w/volatile.tar" /tmp/volatile.tar
+    r 'tar -xf /tmp/volatile.tar -C /var/volatile && systemctl restart hwmon-instantiator' &&
+        echo "platform device tree from the stock firmware: $(r 'ls /var/volatile/motherboard_* | tr "\n" " "')"
+else
+    echo "no platform device tree on the stock firmware (not cold-booted since): no sensors from it"
+fi
+[ "$mode" = test ] && { echo "test mode: nothing was written; a reboot starts the stock firmware"; exit 0; }
+
+say "copying the update and the settings"
+put "$upd" /tmp/reimu-ab.tar
+put "$w/settings.tar" /tmp/settings.tar
+r 'sha256sum /tmp/reimu-ab.tar /tmp/settings.tar' | sed 's/^/  BMC: /'
+shasum -a 256 "$upd" "$w/settings.tar" | sed 's/^/  here: /'
+say "1/4 A/B environment"; r 'reimu-ab setup-env'
+say "2/4 both slots (B, then A)"; r 'reimu-ab install /tmp/reimu-ab.tar both'
+say "3/4 rwfs with the settings"; r 'reimu-ab rwfs-init /tmp/settings.tar'
+say "4/4 verify"; r 'reimu-ab verify && reimu-ab status && fw_printenv bootcmd reimu_slot reimu_tries reimu_pending ethaddr eth1addr'
+if [ "$reboot" = --reboot ]; then
+    say "reboot (U-Boot -> slot A)"; r 'reboot' || true
+else
+    echo; echo "installed and verified; reboot to start it (resets the platform)"
+fi

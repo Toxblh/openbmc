@@ -1,0 +1,60 @@
+# reimu-ab-rofs: sourced by the initramfs /init (obmc-init.sh) before it mounts
+# the rofs. REIMU A/B on one flash: U-Boot boots kernel-a or kernel-b and says
+# which on the command line (reimu.slot=a|b; none: the stock environment,
+# slot A). This copies that slot's rofs to RAM (/run/image-rofs, which /init
+# then mounts) after checking it against the digest in the partition's last
+# 4 KiB:  "reimu-rofs <bytes> <sha256>\n" (bytes: a multiple of 4 KiB). The
+# running system doesn't read the flash afterwards, so either slot can be
+# rewritten while it runs. (This busybox has no head -c or head -N.)
+#
+# A bad rofs falls back to the other slot's; the outcome is in
+# /run/initramfs/reimu-ab (read by reimu-ab status):
+#   kernel=a rofs=a|b state=ok|fallback|ram
+# reimu.ram (reimu-ab ram, a kexec): nothing of the flash is mounted, the
+# rwfs is in RAM. reimu.test (a kexec test from another firmware): the same,
+# with the rofs in the initrd (/image-rofs); the flash isn't even read.
+
+reimu_ab_trailer() { # mtdN -> "bytes sha256" of the rofs in it, or nothing
+	local sz
+	sz=$(cat /sys/class/mtd/$1/size 2>/dev/null) || return
+	dd if=/dev/$1 bs=4096 skip=$((sz / 4096 - 1)) count=1 2>/dev/null |
+		sed -n 's/^reimu-rofs \([0-9]*\) \([0-9a-f]\{64\}\)$/\1 \2/p;T;q' 
+}
+
+reimu_ab_load() { # mtdN -> 0 with a checked copy in /run/image-rofs
+	local t bytes sum
+	t=$(reimu_ab_trailer $1)
+	[ -n "$t" ] || { echo "reimu-ab: $1: no rofs digest"; return 1; }
+	bytes=${t% *} sum=${t#* }
+	echo "reimu-ab: $1: checking $bytes bytes"
+	dd if=/dev/$1 of=/run/image-rofs bs=4096 count=$((bytes / 4096)) 2>/dev/null
+	if [ "$(sha256sum < /run/image-rofs | cut -d' ' -f1)" = "$sum" ]; then
+		return 0
+	fi
+	echo "reimu-ab: $1: rofs digest mismatch"
+	rm -f /run/image-rofs
+	return 1
+}
+
+reimu_slot=$(sed -n 's/.*reimu\.slot=\([ab]\).*/\1/p' /proc/cmdline)
+[ -n "$reimu_slot" ] || reimu_slot=a
+[ $reimu_slot = a ] && reimu_other=b || reimu_other=a
+
+if [ -s /image-rofs ]; then
+	mv /image-rofs /run/image-rofs
+	echo "kernel=$reimu_slot rofs=ram state=ram" > /run/initramfs/reimu-ab
+elif grep -qw reimu.test /proc/cmdline; then
+	debug_takeover "reimu.test without /image-rofs in the initrd: not reading the flash"
+elif reimu_ab_load $(findmtd rofs-$reimu_slot); then
+	echo "kernel=$reimu_slot rofs=$reimu_slot state=ok" > /run/initramfs/reimu-ab
+elif reimu_ab_load $(findmtd rofs-$reimu_other); then
+	echo "kernel=$reimu_slot rofs=$reimu_other state=fallback" > /run/initramfs/reimu-ab
+else
+	debug_takeover "reimu-ab: neither rofs-a nor rofs-b is intact"
+fi
+# reimu.ram/reimu.test: the rwfs is in RAM, and /init must not convert
+# (erase) or mount the flash's rwfs partition
+if grep -qwE 'reimu\.(ram|test)' /proc/cmdline; then
+	force_rwfst_jffs2=n rwfst=none rwfs= rwdev=/dev/null
+	echo overlay-filesystem-in-ram >> $optfile
+fi

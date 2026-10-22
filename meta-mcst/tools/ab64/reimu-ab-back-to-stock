@@ -1,0 +1,42 @@
+#!/bin/sh
+# reimu-ab-back-to-stock: after "reimu-ab-from-stock test", start the stock
+# firmware again without resetting the BMC (and with it the platform): kexec
+# into the stock kernel, whose initramfs mounts the stock rofs and rwfs from
+# the flash (untouched by the test).
+#
+#   reimu-ab-back-to-stock BMC DIR
+#
+# DIR: zImage, initrd (the stock kernel and initramfs, e.g. out of the
+# flash dump's kernel.bin by reimu-fit) and fdt (the stock device tree as
+# U-Boot left it: /sys/firmware/fdt of the stock firmware, with /memory).
+set -eu
+bmc=${1:?BMC}; d=${2:?DIR}
+host=${bmc%:*}; port=22; [ "$host" != "$bmc" ] && port=${bmc##*:}
+case $host in *@*) ;; *) host=root@$host ;; esac
+SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20"
+if [ -n "${SSHPASS:-}" ]; then
+    ap=$(mktemp); printf '#!/bin/sh\necho "%s"\n' "$SSHPASS" > "$ap"; chmod +x "$ap"
+    export SSH_ASKPASS=$ap SSH_ASKPASS_REQUIRE=force DISPLAY=x
+fi
+r() { ssh -p $port $SSHO $host "$@"; }
+put() { r "cat > '$2'" < "$1"; }
+
+r 'grep -qwE "reimu\.(test|ram)" /proc/cmdline' || { echo "not the A/B firmware started from RAM" >&2; exit 1; }
+w=$(mktemp -d); trap 'rm -rf "$w" ${ap:-}' EXIT
+cp "$d/zImage" "$d/initrd" "$d/fdt" "$w/"
+for n in "ethaddr 1e660000" "eth1addr 1e680000"; do
+    mac=$(r "fw_printenv -n ${n% *}" | tr 'A-F:' 'a-f ')
+    fdtput -t bx "$w/fdt" /ahb/ethernet@${n#* } local-mac-address $mac
+done
+r 'rm -rf /tmp/stock-kx && mkdir -p /tmp/stock-kx'
+for f in zImage initrd fdt; do put "$w/$f" /tmp/stock-kx/$f; done
+# no watchdog.open_timeout: the stock kernel keeps feeding WDT1 (systemd of
+# the A/B firmware armed it) as long as it runs, like on a normal boot
+r "kexec -l /tmp/stock-kx/zImage --dtb=/tmp/stock-kx/fdt --initrd=/tmp/stock-kx/initrd --command-line='console=ttyS4,115200n8 root=/dev/ram rw'"
+r 'for u in start-ipkvm reimu-kvm bmcweb; do systemctl stop $u 2>/dev/null; done
+   for g in /sys/kernel/config/usb_gadget/*/UDC; do echo > $g 2>/dev/null; done
+   sync; echo u > /proc/sysrq-trigger; sync
+   (sleep 2; ip link set eth1 down; ip link set eth0 down; kexec -e) >/dev/null 2>&1 &' || true
+sleep 20
+i=0; while ! r true 2>/dev/null; do i=$((i + 1)); [ $i -lt 60 ] || { echo "BMC not back" >&2; exit 1; }; sleep 5; done
+echo "back on: $(r 'sed -n s/^VERSION_ID=//p /etc/os-release; uname -r; cat /proc/cmdline' | tr '\n' ' ')"

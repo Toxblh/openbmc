@@ -1,0 +1,274 @@
+#!/bin/sh
+# reimu-ab: A/B firmware on the one 64 MiB BMC flash of REIMU-5564.
+#
+# Layout (reimu-ab64.dtsi): u-boot, u-boot-env (never rewritten by an
+# update), kernel-a + rofs-a, kernel-b + rofs-b, rwfs. U-Boot's bootcmd
+# (reimu-ab.env) counts boots in reimu_tries and boots reimu_slot; after 3
+# boots that didn't reach "mark-good" it switches to the other slot. A slot
+# that won't boot at all (bad FIT) falls through to the other one at once.
+# The running system has its rofs in RAM (the initramfs copies and checks it),
+# so any slot can be written while it runs.
+#
+# Every write is read back and compared (reimu-flash), and written again if
+# it differs; the environment is only switched once both parts are proven.
+#
+#   reimu-ab status              booted slot, environment, what each slot holds
+#   reimu-ab install IMAGE.tar [a|b|both]
+#                                write the update (image-kernel, image-rofs,
+#                                SHA256SUMS) into the other slot (or the one
+#                                given), then boot it next (pending until
+#                                healthy); no reboot
+#   reimu-ab verify [a|b]        re-read the slots, check them against their
+#                                digests
+#   reimu-ab set-slot a|b        boot this slot next
+#   reimu-ab boot                (reimu-ab.service) a boot that came up: mark
+#                                it good; a pending one only when healthy,
+#                                else back to the other slot
+#   reimu-ab setup-env           install the A/B bootcmd in the U-Boot
+#                                environment (the MAC addresses stay)
+#   reimu-ab ram                 restart (kexec, the platform keeps running)
+#                                with nothing of the flash mounted: rwfs in RAM
+#   reimu-ab rwfs-init [SETTINGS.tar]
+#                                (in "ram" mode) erase the rwfs, check it is
+#                                erased, put the settings (files under the
+#                                overlay's cow/: etc/ssh, var/lib...) in it
+#   reimu-ab restore-stock DIR   (in "ram" mode) write back the stock
+#                                firmware dumped into DIR (u-boot-env.bin,
+#                                kernel.bin, rofs.bin, rwfs.bin, SHA256SUMS)
+#                                at the stock offsets; U-Boot is not touched
+set -u
+me=reimu-ab
+FLASH=${REIMU_FLASH:-reimu-flash}
+STATE=/run/initramfs/reimu-ab
+HEALTH_DEADLINE=${HEALTH_DEADLINE:-300}
+HEALTH_UNITS=${HEALTH_UNITS:-"bmcweb.socket reimu-serial.service"}
+HEALTH_URL=${HEALTH_URL:-}
+
+say() { printf '%s\n' "$*"; }
+die() { printf '%s: %s\n' "$me" "$*" >&2; logger -t $me -- "$*" 2>/dev/null; exit 1; }
+log() { printf '%s: %s\n' "$me" "$*" >&2; logger -t $me -- "$*" 2>/dev/null; }
+
+mtd() { # label -> /dev/mtdN
+    m=$(grep -xl "$1" /sys/class/mtd/mtd*/name 2>/dev/null | sed -n 1p)
+    [ -n "$m" ] || die "no flash partition \"$1\" (not the A/B layout?)"
+    m=${m%/name}; echo /dev/${m##*/}
+}
+size_of() { cat /sys/class/mtd/${1#/dev/}/size; }
+env_get() { fw_printenv -n "$1" 2>/dev/null; }
+env_set() { # NAME VALUE: set (if it differs) and read back
+    [ "$(env_get "$1")" = "${2:-}" ] && return 0
+    fw_setenv "$@" || die "fw_setenv $1 failed"
+    [ "$(env_get "$1")" = "${2:-}" ] || die "U-Boot environment: $1 did not take"
+}
+booted() { sed -n "s/.*$1=\([a-z]*\).*/\1/p" $STATE 2>/dev/null; }
+other() { [ "$1" = a ] && echo b || echo a; }
+flash_mounted() { grep -qE '^/dev/mtdblock|jffs2' /proc/mounts; }
+
+# the last 4 KiB of rofs-X: "reimu-rofs BYTES SHA256", "reimu-kernel BYTES
+# SHA256", "reimu-version VERSION"; both images padded with 0xff to 4 KiB
+trailer() {
+    d=$(mtd rofs-$1); sz=$(size_of $d)
+    dd if=$d bs=4096 skip=$((sz / 4096 - 1)) count=1 2>/dev/null | tr -d '\377\000' | grep '^reimu-'
+}
+field() { sed -n "s/^reimu-$1 //p"; }
+
+do_status() {
+    say "booted: $(cat $STATE 2>/dev/null || echo 'unknown (not an A/B initramfs)')"
+    say "next: slot $(env_get reimu_slot) (boots since mark-good: $(env_get reimu_tries)$( [ "$(env_get reimu_pending)" = 1 ] && echo ', pending: not yet healthy'))"
+    [ "$(env_get bootcmd)" = "run reimu_ab" ] || say "U-Boot bootcmd is not the A/B one (reimu-ab setup-env): it boots slot A only"
+    for s in a b; do
+        t=$(trailer $s)
+        if [ -n "$t" ]; then
+            say "slot $s: $(echo "$t" | field version)"
+        else
+            say "slot $s: empty or not an A/B image"
+        fi
+    done
+}
+
+# check a slot against its digests: 0 if both parts are intact
+verify_slot() {
+    t=$(trailer $1)
+    [ -n "$t" ] || { log "slot $1: no digests"; return 1; }
+    set -- $1 $(echo "$t" | field rofs) $(echo "$t" | field kernel)
+    # (both sizes are multiples of 4 KiB)
+    rs=$(dd if=$(mtd rofs-$1) bs=4096 count=$(($2 / 4096)) 2>/dev/null | sha256sum | cut -d' ' -f1)
+    ks=$(dd if=$(mtd kernel-$1) bs=4096 count=$(($4 / 4096)) 2>/dev/null | sha256sum | cut -d' ' -f1)
+    [ "$rs" = "$3" ] || { log "slot $1: rofs differs from its digest"; return 1; }
+    [ "$ks" = "$5" ] || { log "slot $1: kernel differs from its digest"; return 1; }
+    say "slot $1: intact"
+}
+
+do_verify() {
+    rc=0
+    for s in ${1:-a b}; do verify_slot $s || rc=1; done
+    return $rc
+}
+
+do_install() {
+    tar=$1; slots=${2:-}
+    [ -f "$tar" ] || die "$tar: no such file"
+    cur=$(booted kernel)
+    [ -n "$slots" ] || { [ -n "$cur" ] || die "booted slot unknown: say which slot"; slots=$(other $cur); }
+    # both (the first install): B first, then make it the slot that boots, then
+    # A: whenever the power goes, one slot is complete and U-Boot finds it
+    [ "$slots" = both ] && slots="b a"
+    for s in $slots; do
+        case $s in a|b) ;; *) die "slot: a, b or both" ;; esac
+    done
+    w=$(mktemp -d /tmp/reimu-ab.XXXXXX) || die "no /tmp"
+    trap 'rm -rf "$w"' EXIT
+    tar -xf "$tar" -C "$w" image-kernel image-rofs SHA256SUMS || die "$tar: needs image-kernel, image-rofs, SHA256SUMS"
+    (cd "$w" && sha256sum -c SHA256SUMS >/dev/null) || die "$tar: damaged (SHA256SUMS)"
+    for s in $slots; do
+        k=$(mtd kernel-$s) r=$(mtd rofs-$s)
+        [ $(stat -c %s $w/image-kernel) -le $(size_of $k) ] || die "kernel bigger than kernel-$s"
+        [ $(stat -c %s $w/image-rofs) -eq $(size_of $r) ] || die "image-rofs is not the size of rofs-$s"
+        # the slot is not bootable while it's being written
+        [ "$(env_get reimu_slot)" = $s ] && env_set reimu_slot $(other $s)
+        log "slot $s: kernel"
+        $FLASH write $k 0 $w/image-kernel 5 | sed -n 's/^ok/kernel written and read back:/p' || die "slot $s: kernel write failed"
+        log "slot $s: rofs"
+        $FLASH write $r 0 $w/image-rofs 5 | sed -n 's/^ok/rofs written and read back:/p' || die "slot $s: rofs write failed"
+        verify_slot $s || die "slot $s: digests don't match after writing"
+        env_set reimu_slot $s
+    done
+    rm -rf "$w"; trap - EXIT
+    set -- $slots; s=${2:-$1}
+    env_set reimu_tries 0
+    env_set reimu_pending 1
+    env_set reimu_slot $s
+    say "slot $s boots next (pending until healthy; reimu-ab set-slot $(other $s) to go back)"
+}
+
+healthy() {
+    for u in $HEALTH_UNITS; do systemctl -q is-active $u || return 1; done
+    [ -z "$HEALTH_URL" ] || wget -q -O /dev/null --no-check-certificate "$HEALTH_URL" 2>/dev/null
+}
+
+do_boot() {
+    k=$(booted kernel) r=$(booted rofs) st=$(booted state)
+    [ -n "$k" ] || { log "not booted by the A/B initramfs"; return 0; }
+    [ "$st" = ram ] && { log "running from RAM (kexec test): nothing to confirm"; return 0; }
+    [ "$(env_get reimu_slot)" = "$k" ] || log "U-Boot booted slot $k, not slot $(env_get reimu_slot): slot $(env_get reimu_slot) didn't start"
+    if [ "$st" = fallback ]; then
+        # kernel of one slot, rofs of the other: next time boot the slot the rofs is from
+        log "rofs-$k is damaged, running rofs-$r: slot $r boots next"
+        env_set reimu_slot $r; env_set reimu_tries 0
+        return 0
+    fi
+    if [ "$(env_get reimu_pending)" = 1 ]; then
+        while ! healthy; do
+            up=$(cut -d. -f1 /proc/uptime)
+            if [ "$up" -ge "$HEALTH_DEADLINE" ]; then
+                log "slot $k: not healthy after ${up}s, going back to slot $(other $k)"
+                env_set reimu_slot $(other $k); env_set reimu_tries 0; env_set reimu_pending 0
+                systemctl reboot
+                return 1
+            fi
+            sleep 5
+        done
+        env_set reimu_pending 0
+        log "slot $k: healthy, update confirmed"
+    fi
+    env_set reimu_slot $k
+    env_set reimu_tries 0
+}
+
+do_set_slot() {
+    case ${1:-} in a|b) ;; *) die "set-slot a|b" ;; esac
+    verify_slot $1 || die "slot $1 is not intact: not switching"
+    env_set reimu_slot $1; env_set reimu_tries 0; env_set reimu_pending 1
+    say "slot $1 boots next"
+}
+
+do_setup_env() {
+    f=/usr/share/reimu-ab/reimu-ab.env
+    [ -f $f ] || die "$f missing"
+    m0=$(env_get ethaddr) m1=$(env_get eth1addr)
+    fw_setenv -s $f || die "fw_setenv failed"
+    while read -r n v; do
+        [ -n "$n" ] && [ "${n#\#}" = "$n" ] || continue
+        [ "$(env_get $n)" = "$v" ] || die "U-Boot environment: $n did not take"
+    done < $f
+    [ "$(env_get ethaddr)" = "$m0" ] && [ "$(env_get eth1addr)" = "$m1" ] || die "MAC addresses changed!"
+    say "U-Boot environment: A/B bootcmd installed, slot $(env_get reimu_slot)"
+}
+
+do_ram() {
+    flash_mounted || die "already running with nothing of the flash mounted"
+    k=$(booted kernel); [ -n "$k" ] || die "booted slot unknown"
+    w=/run/reimu-ab-ram; rm -rf $w; mkdir -p $w
+    reimu-fit $(mtd kernel-$k) $w >/dev/null || die "kernel-$k: can't read the FIT"
+    # nothing may write the environment or reboot on its own meanwhile
+    cmd="$(sed 's/ *reimu\.ram//; s/ *systemd\.mask=[^ ]*//g' /proc/cmdline) reimu.ram"
+    cmd="$cmd systemd.mask=set_mac.service systemd.mask=revert-to-mfg.service"
+    # the MAC addresses (U-Boot writes them into the device tree, kexec doesn't)
+    fdtput -t bx $w/fdt /ahb/ethernet@1e660000 local-mac-address $(env_get ethaddr | tr A-F: 'a-f ') || die "no MAC address for the device tree"
+    fdtput -t bx $w/fdt /ahb/ethernet@1e680000 local-mac-address $(env_get eth1addr | tr A-F: 'a-f ') || die "no MAC address for the device tree"
+    kexec -l $w/kernel --dtb=$w/fdt --initrd=$w/ramdisk --command-line="$cmd" || die "kexec -l failed"
+    log "restarting slot $k with the rwfs in RAM"
+    # the devices that keep DMA going over a kexec (no .shutdown): video
+    # capture, USB gadget, the NICs
+    systemctl stop reimu-kvm start-ipkvm obmc-ikvm bmcweb 2>/dev/null
+    for u in /sys/kernel/config/usb_gadget/*/UDC; do [ -f "$u" ] && echo > "$u"; done 2>/dev/null
+    sync; echo u > /proc/sysrq-trigger
+    ip link set eth1 down 2>/dev/null; ip link set eth0 down
+    kexec -e
+    die "kexec -e returned"
+}
+
+do_rwfs_init() {
+    tar=${1:-}
+    ! flash_mounted || die "the flash is in use: reimu-ab ram first"
+    d=$(mtd rwfs)
+    flash_eraseall $d >/dev/null || die "erasing the rwfs failed"
+    e=/tmp/reimu-ab-erased; dd if=/dev/zero bs=4096 count=$(($(size_of $d) / 4096)) 2>/dev/null | tr '\000' '\377' > $e
+    $FLASH verify $d 0 $e >/dev/null || { rm -f $e; die "the rwfs isn't erased after erasing"; }
+    rm -f $e
+    if [ -n "$tar" ]; then
+        m=/tmp/reimu-ab-rwfs; mkdir -p $m
+        mount -t jffs2 /dev/mtdblock${d#/dev/mtd} $m || die "can't mount the new rwfs"
+        mkdir -p $m/cow $m/work
+        tar -xf "$tar" -C $m/cow || { umount $m; die "$tar: can't unpack"; }
+        sync; umount $m || die "can't unmount the new rwfs"
+        say "rwfs: erased, settings from $tar in it"
+    else
+        say "rwfs: erased (empty settings)"
+    fi
+}
+
+do_restore_stock() {
+    d=${1:-}; [ -d "$d" ] || die "restore-stock DIR"
+    ! flash_mounted || die "the flash is in use: reimu-ab ram first"
+    for f in u-boot-env kernel rofs rwfs; do
+        want=$(sed -n "s/^\([0-9a-f]\{64\}\)  $f\.bin$/\1/p" "$d/SHA256SUMS")
+        [ -n "$want" ] || die "$d/SHA256SUMS: no $f.bin"
+        [ "$(sha256sum < "$d/$f.bin" | cut -d' ' -f1)" = "$want" ] || die "$d/$f.bin: damaged (SHA256SUMS)"
+    done
+    bmc=$(mtd bmc)
+    # stock REIMU 1.0.2: u-boot-env 0xe0000, kernel 0x100000, rofs 0x680000, rwfs 0x3000000
+    for p in u-boot-env:0xe0000 kernel:0x100000 rofs:0x680000 rwfs:0x3000000; do
+        f=$d/${p%%:*}.bin
+        [ -f $f ] || die "$f missing"
+        log "stock ${p%%:*} at ${p#*:}"
+        $FLASH write $bmc ${p#*:} $f 5 || die "${p%%:*}: write failed"
+    done
+    for p in u-boot-env:0xe0000 kernel:0x100000 rofs:0x680000 rwfs:0x3000000; do
+        $FLASH verify $bmc ${p#*:} $d/${p%%:*}.bin >/dev/null || die "${p%%:*}: differs on a second read"
+    done
+    say "stock firmware written and read back twice; reboot to start it"
+}
+
+case ${1:-} in
+    status) do_status ;;
+    install) shift; do_install "$@" ;;
+    verify) shift; do_verify "$@" ;;
+    set-slot) shift; do_set_slot "$@" ;;
+    boot) do_boot ;;
+    setup-env) do_setup_env ;;
+    ram) do_ram ;;
+    restore-stock) shift; do_restore_stock "$@" ;;
+    rwfs-init) shift; do_rwfs_init "$@" ;;
+    *) sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$0"; exit 2 ;;
+esac

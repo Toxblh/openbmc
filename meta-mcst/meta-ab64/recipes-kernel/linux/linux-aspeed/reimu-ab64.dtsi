@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0+
+// REIMU-5564: A/B on the one 64 MiB BMC flash. U-Boot and its environment stay
+// where the stock firmware has them (they are never rewritten); slot A's
+// kernel is at the stock kernel address, so the stock "bootm 20100000" boots
+// it. U-Boot passes reimu.slot=a|b; the initramfs mounts that slot's rofs.
+partitions {
+	compatible = "fixed-partitions";
+	#address-cells = <1>;
+	#size-cells = <1>;
+	/* the whole chip as a partition (not the MTD master, which a "read-only"
+	 * here wouldn't cover): reimu-ab restore-stock writes it at the stock
+	 * offsets; read-only with the rest in the test device tree */
+	bmc@0 { reg = <0x0 0x4000000>; label = "bmc"; };
+	u-boot@0 { reg = <0x0 0xe0000>; label = "u-boot"; read-only; };
+	u-boot-env@e0000 { reg = <0xe0000 0x20000>; label = "u-boot-env"; };
+	kernel-a@100000 { reg = <0x100000 0x600000>; label = "kernel-a"; };
+	rofs-a@700000 { reg = <0x700000 0x1500000>; label = "rofs-a"; };
+	kernel-b@1c00000 { reg = <0x1c00000 0x600000>; label = "kernel-b"; };
+	rofs-b@2200000 { reg = <0x2200000 0x1500000>; label = "rofs-b"; };
+	rwfs@3700000 { reg = <0x3700000 0x900000>; label = "rwfs"; };
+};

@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: GPL-2.0+
+// REIMU-5564 (1Э8СВ-uATX), ported from the MCST 5.10 tree (aspeed-bmc-mcst-*.dtsi)
+// with the A/B flash layout (reimu-ab64.dtsi). Only wdt1 is enabled (wdt2 has
+// the second-flash boot bit).
+/dts-v1/;
+
+#include "aspeed-g5.dtsi"
+#include <dt-bindings/gpio/aspeed-gpio.h>
+
+/ {
+	model = "REIMU-5564";
+	compatible = "mcst,reimu-5564", "aspeed,ast2500";
+
+	aliases {
+		serial4 = &uart5;
+		serial0 = &uart1;
+	};
+
+	chosen {
+		stdout-path = "serial4:115200n8";
+		bootargs = "console=ttyS4,115200 earlyprintk";
+	};
+
+	/* DRAM is at 0x80000000; U-Boot writes the size (512 MiB less the 16 MiB
+	 * it gives the VGA). The MCST dtsi had a "memory" node at 0x40000000
+	 * without device_type, which 5.10 ignored, and reserved regions at
+	 * 0x5c000000/0x5f000000, outside the DRAM. */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x1f000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		video_engine_memory: jpegbuffer {
+			size = <0x02000000>;
+			alignment = <0x01000000>;
+			compatible = "shared-dma-pool";
+			reusable;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		bmc_boot {
+			label = "platform:red:bmc_boot";
+			gpios = <&gpio ASPEED_GPIO(G, 1) GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "timer";
+		};
+		ohfanfail {
+			label = "platform:red:ohfanfail";
+			gpios = <&gpio ASPEED_GPIO(Q, 6) GPIO_ACTIVE_LOW>;
+		};
+		ohfanfail2 {
+			label = "platform:red:ohfanfail2";
+			gpios = <&gpio ASPEED_GPIO(A, 2) GPIO_ACTIVE_HIGH>;
+		};
+		pwrfail {
+			label = "platform:red:pwrfail";
+			gpios = <&gpio ASPEED_GPIO(A, 3) GPIO_ACTIVE_LOW>;
+		};
+		sysfail1 {
+			label = "platform:red:sysfail1";
+			gpios = <&gpio ASPEED_GPIO(C, 2) GPIO_ACTIVE_LOW>;
+		};
+		sysfail2 {
+			label = "platform:red:sysfail2";
+			gpios = <&gpio ASPEED_GPIO(C, 7) GPIO_ACTIVE_LOW>;
+		};
+		fanfail {
+			label = "platform:red:fanfail";
+			gpios = <&gpio ASPEED_GPIO(C, 6) GPIO_ACTIVE_LOW>;
+		};
+		overheat {
+			label = "platform:red:overheat";
+			gpios = <&gpio ASPEED_GPIO(C, 3) GPIO_ACTIVE_LOW>;
+		};
+		alarm {
+			label = "platform:red:alarm";
+			gpios = <&gpio ASPEED_GPIO(G, 0) GPIO_ACTIVE_LOW>;
+		};
+		uid {
+			label = "platform:blue:uid";
+			gpios = <&gpio ASPEED_GPIO(N, 4) GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		uid {
+			label = "uid";
+			linux,code = <148>;
+			gpios = <&gpio ASPEED_GPIO(N, 3) GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&fmc {
+	status = "okay";
+	flash@0 {
+		status = "okay";
+		m25p,fast-read;
+		label = "bmc";
+		#include "reimu-ab64.dtsi"
+	};
+};
+
+/* the PNS (host boot firmware) flash: shared with the host through a GPIO
+ * SPI switch (GPIO_SPI_CONNECT); found at a BMC cold boot, when the switch
+ * is on the BMC's side; /dev/mtd/sys for reimu-pns and update-host-flash */
+&spi1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_spi1_default>;
+	flash@0 {
+		status = "okay";
+		m25p,fast-read;
+		spi-max-frequency = <50000000>;
+		/* the whole chip as one partition (the kernel truncates it to the
+		 * chip's size): a partition can be made read-only (the test device
+		 * tree of reimu-ab), the MTD master can't */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			sys@0 { reg = <0x0 0x8000000>; label = "sys"; };
+		};
+	};
+};
+
+&wdt2 {
+	status = "disabled";
+};
+
+&video {
+	status = "okay";
+	memory-region = <&video_engine_memory>;
+};
+
+&rtc { status = "okay"; };
+
+&gpio {
+	gpioready {
+		gpios = <ASPEED_GPIO(N, 7) GPIO_ACTIVE_HIGH>;
+		gpio-hog;
+		output-high;
+		line-name = "CTRL_RDY";
+	};
+};
+
+&mac0 { status = "okay"; };
+&mac1 { status = "okay"; };
+&uart5 { status = "okay"; };
+&ibt { status = "okay"; };
+
+&uart1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_txd1_default &pinctrl_rxd1_default>;
+};
+&uart2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_txd2_default &pinctrl_rxd2_default>;
+};
+&uart3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_txd3_default &pinctrl_rxd3_default>;
+};
+&uart4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_txd4_default &pinctrl_rxd4_default>;
+};
+
+&pwm_tacho {
+	status = "okay";
+	fan@0 { reg = <0x00>; aspeed,fan-tach-ch = /bits/ 8 <0x07>; };
+	fan@1 { reg = <0x01>; aspeed,fan-tach-ch = /bits/ 8 <0x08>; };
+	fan@2 { reg = <0x02>; aspeed,fan-tach-ch = /bits/ 8 <0x09>; };
+	fan@3 { reg = <0x03>; aspeed,fan-tach-ch = /bits/ 8 <0x0a>; };
+	fan@4 { reg = <0x04>; aspeed,fan-tach-ch = /bits/ 8 <0x0c>; };
+	fan@5 { reg = <0x05>; aspeed,fan-tach-ch = /bits/ 8 <0x0d>; };
+	fan@6 { reg = <0x06>; aspeed,fan-tach-ch = /bits/ 8 <0x0e>; };
+	fan@7 { reg = <0x07>; aspeed,fan-tach-ch = /bits/ 8 <0x0f>; };
+};
+
+&adc { status = "okay"; };
+&vhub { status = "okay"; };
+&uhci { status = "okay"; };
+&ehci0 { status = "okay"; };
+
+&i2c0 { status = "okay"; };
+&i2c1 { status = "okay"; };
+&i2c2 { status = "okay"; };
+&i2c3 { status = "okay"; };
+&i2c4 { status = "okay"; };
+&i2c5 { status = "okay"; };
+&i2c6 { status = "okay"; };
+&i2c7 { status = "okay"; };
+&i2c8 { status = "okay"; };
+&i2c9 { status = "okay"; };
+&i2c13 { status = "okay"; };

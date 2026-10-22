@@ -1,0 +1,11 @@
+[Unit]
+Description=A/B firmware: confirm this boot (pending update: once healthy)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/reimu-ab boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
