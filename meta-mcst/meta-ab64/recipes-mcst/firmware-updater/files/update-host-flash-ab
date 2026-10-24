@@ -1,0 +1,25 @@
+#!/bin/bash
+# update-host-flash URL [--any-board]: the stock interface to the PNS flash
+# update; the image is fetched as before (libfirmware-updater), then
+# reimu-pns-flash checks it, backs up the chip, writes and verifies it
+# (only while the platform is off, power-on blocked meanwhile).
+
+. /libexec/libfirmware-updater
+
+if [ -z "$1" -o "$1" = "-h" -o "$1" = "--help" ]
+then
+    usage $0
+    echo "    The image is checked for this board, the PNS flash backed up, written"
+    echo "    and read back by reimu-pns-flash (see reimu-pns-flash --help)."
+    exit 0
+fi
+[ "`id -nu`" = "root" ] || error "Only root can perform flashing."
+
+DEST="/tmp/firmware"
+export WGET_PARAMS
+upload $1 $DEST || error "Upload failure. Check your network connectivity or URL."
+shift
+/usr/sbin/reimu-pns-flash write "$DEST" "$@"
+rc=$?
+[ "$PROTO" != "file" ] && rm -f $DEST
+exit $rc

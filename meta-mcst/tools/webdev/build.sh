@@ -234,7 +234,7 @@ $CC -O2 -Wall -fPIE -pie -I"$W/obj" -isystem "$SYS/usr/include" -isystem "$SYS/u
     -o "$W/obj/nbd-proxy" "$SRC/jsnbd/nbd-proxy.c" -L"$SYS/usr/lib" -ljson-c -ludev
 $CC -O2 -Wall -fPIE -pie -o "$W/obj/reimu-serial" "$MCST/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c"
 $CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-pnsd" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c" \
-    "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.c" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-journal.c" -L"$SYS/usr/lib" -lsystemd -lm
+    "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.c" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-journal.c" "$MCST/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsflash.c" -L"$SYS/usr/lib" -lsystemd -lm
 $CC -O2 -Wall -fPIE -pie -isystem "$SYS/usr/include" -o "$W/obj/reimu-kvm" "$MCST/meta-common/recipes-mcst/reimu-kvm/files/reimu-kvm.c" \
     "$W/obj/fastmem.o" -L"$SYS/usr/lib" -lssl -lcrypto -lsystemd -ldl
 

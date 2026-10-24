@@ -1,0 +1,767 @@
+#!/bin/sh
+# reimu-pns-flash: the host boot firmware (ПНС, Lintel unified-boot) flash.
+#
+# The PNS flash (64 MiB SPI NOR on spi1, MTD partition "sys") is the host's;
+# a GPIO switch (GPIO_SPI_CONNECT, 1 = BMC, 0 = host) gives it to the BMC.
+# It is switched to the BMC only while the platform is off, under a lock
+# that the power-on path (server_ctl) honours, and always switched back
+# (an EXIT trap, and a guard process for a kill -9).
+#
+#   reimu-pns-flash version [FILE]       versions in FILE; without FILE the
+#                                        ones last read from the chip
+#   reimu-pns-flash version --read [--boot]
+#                                        read them from the chip now (the
+#                                        platform must be off; --boot: quiet
+#                                        when it isn't, for the boot service)
+#   reimu-pns-flash check FILE [--any-board] [--json]
+#                                        is FILE a PNS image for this board,
+#                                        what it covers
+#   reimu-pns-flash read [FILE]          back up the whole chip into FILE
+#                                        (read twice, both reads compared)
+#   reimu-pns-flash write FILE [--any-board] [--blank-ok]
+#                                        back up the chip, write FILE from
+#                                        offset 0: only the erase blocks that
+#                                        differ, every one read back and
+#                                        compared (reimu-flash), then the
+#                                        whole chip read again: the image
+#                                        where it should be, the rest as
+#                                        before. Nothing beyond the image
+#                                        (rounded up to an erase block, the
+#                                        rest of that block kept) is written.
+#                                        The board must match the chip's
+#                                        device tree (--any-board: don't
+#                                        check), the chip must hold a Lintel
+#                                        image (--blank-ok: or be erased).
+#                                        FILE may be gzipped (.gz).
+#                                        A backup made here (its .sha256
+#                                        next to it) is a restore: onto any
+#                                        chip contents.
+#   reimu-pns-flash with-chip CMD [ARG...]
+#                                        run CMD with the flash switched to
+#                                        the BMC (its device in PNS_DEV), the
+#                                        same way as a read: for other readers
+#                                        (reimu-pns-scan)
+#   reimu-pns-flash status               the last job and the chip (JSON)
+#   reimu-pns-flash disconnect           give the flash back to the host
+#
+# Image layout (unified-boot 2.x, seen in release-2.30.13.1-E8C2 and
+# main f4c822e9): the boot loader at 0x0 (header 12 50 00 00 20 00 00 c0,
+# its checksum as 8 hex digits at 0x48fff8), the boot area up to 0x490000,
+# the platform device tree (DTB) at 0x700000 (at most 1 MiB), nothing
+# after it. An image may stop after the boot area or after the DTB.
+#
+# Files: /run/reimu-pns/state.json (the job, its progress), /run/reimu-pns/lock,
+# /var/lib/reimu-pns/chip.json (versions last read from the chip),
+# /tmp/reimu-pns/backup-*.bin.gz + .sha256 (RAM, ~1 MiB each: the chip is
+# mostly erased), /var/lib/reimu-pns/backup-last.bin.gz
+# (the chip before the last write, kept on the BMC flash when small).
+set -u
+me=reimu-pns-flash
+RUN=${REIMU_PNS_RUN:-/run/reimu-pns}
+WORK=${REIMU_PNS_WORK:-/tmp/reimu-pns}
+KEEP=${REIMU_PNS_KEEP:-/var/lib/reimu-pns}
+FLASH=${REIMU_FLASH:-reimu-flash}
+TRIES=${REIMU_PNS_TRIES:-5}
+KEEP_MAX=${REIMU_PNS_KEEP_MAX:-4194304}
+LOCK=$RUN/lock
+STATE=$RUN/state.json
+CHIP=$KEEP/chip.json
+
+BOOT_END=$((0x490000))
+TRAILER=$((0x48fff8))
+DTB_OFF=$((0x700000))
+DTB_MAX=$((0x100000))
+MAGIC=12500000200000c0
+
+say() { printf '%s\n' "$*"; }
+log() { printf '%s: %s\n' "$me" "$*" >&2; logger -t $me -- "$*" 2>/dev/null; }
+
+# ------------------------------------------------------------ JSON, state
+# a JSON string: no control characters, no double quotes (the guard edits
+# the file with sed), backslashes doubled; ja: printable ASCII only (text
+# from the flash: D-Bus strings must be valid UTF-8)
+js() { printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037\177' | tr '"' "'" | sed 's/\\/\\\\/g')"; }
+ja() { printf '"%s"' "$(printf '%s' "$1" | tr -cd ' -~' | tr '"' "'" | sed 's/\\/\\\\/g')"; }
+jn() { [ -n "$1" ] && printf '%s' "$1" || printf null; }
+
+S_JOB= S_STATE= S_PHASE= S_PROG=0 S_MSG= S_BACKUP= S_IMAGE= S_CHANGED= S_START= S_END= S_WARN=
+state() {
+    [ -n "$S_JOB" ] || return 0
+    mkdir -p $RUN
+    { printf '{"job":%s,"state":%s,"phase":%s,"progress":%d,"pid":%d,' \
+          "$(js "$S_JOB")" "$(js "$S_STATE")" "$(js "$S_PHASE")" "$S_PROG" $$
+      printf '"message":%s,"warning":%s,"backup":%s,"image":%s,"changedBlocks":%s,"started":%s,"finished":%s}\n' \
+          "$(js "$S_MSG")" "$(js "$S_WARN")" "$(js "$S_BACKUP")" "$(js "$S_IMAGE")" "$(jn "$S_CHANGED")" \
+          "$(jn "$S_START")" "$(jn "$S_END")"
+    } > $STATE.tmp.$$ && mv $STATE.tmp.$$ $STATE
+}
+phase() { S_PHASE=$1; S_PROG=$2; S_MSG=${3:-$S_MSG}; state; }
+begin() {
+    S_JOB=$1 S_STATE=running S_PHASE=start S_PROG=0 S_MSG=${2:-} S_START=$(date +%s)
+    state
+}
+finish() { # ok|failed MESSAGE
+    [ "$S_STATE" = running ] || return 0
+    S_STATE=$1 S_MSG=$2 S_END=$(date +%s)
+    [ "$1" = ok ] && S_PROG=100
+    state
+}
+die() {
+    log "$*"
+    if [ "$S_STATE" = running ]; then
+        m=$*
+        [ -n "$S_BACKUP" ] && [ "$S_JOB" = write ] && m="$m. Резервная копия флеша: $S_BACKUP (восстановить: reimu-pns-flash write $S_BACKUP)"
+        finish failed "$m"
+    fi
+    exit 1
+}
+
+# ------------------------------------------------------------ platform
+gpio_loaded=
+gpio() { [ -n "$gpio_loaded" ] || { . /libexec/gpio-funcs; gpio_loaded=1; }; }
+
+# the switch: 1 = the flash is the BMC's, 0 = the host's; read back.
+# (Not gpiowrite: its helpers end with a bare "return", which in an EXIT
+# trap returns the status the shell is exiting with.)
+switch() {
+    if [ -n "${REIMU_PNS_SWITCH:-}" ]; then
+        $REIMU_PNS_SWITCH $1
+        return $?
+    fi
+    local n g
+    gpio
+    n=$(gpio2num $GPIO_SPI_CONNECT) || return 1
+    g=/sys/class/gpio/gpio$n
+    [ -d $g ] || echo $n > /sys/class/gpio/export 2>/dev/null
+    echo out > $g/direction 2>/dev/null
+    echo $1 > $g/value 2>/dev/null
+    [ "$(cat $g/value 2>/dev/null)" = $1 ]
+}
+
+# platform power good (GPIO_POWER_IN): 1, 0 or empty
+power() {
+    if [ -n "${REIMU_PNS_POWER:-}" ]; then
+        $REIMU_PNS_POWER
+        return $?
+    fi
+    local n v i
+    gpio
+    n=$(gpio2num $GPIO_POWER_IN) || return 1
+    for i in 1 2 3; do
+        v=$(gpioread $n 2>/dev/null)
+        gpiounexport $n 2>/dev/null
+        case "$v" in 0|1) echo $v; return;; esac
+        sleep 1
+    done
+}
+
+host_state() {
+    busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 \
+        xyz.openbmc_project.State.Host CurrentHostState 2>/dev/null | cut -d'"' -f2
+}
+
+REASON=
+host_off() {
+    p=$(power)
+    case "$p" in
+        0) ;;
+        1) REASON="Платформа включена: флеш ПНС занят хостом. Выключите платформу и повторите"; return 1 ;;
+        *) REASON="Не удалось прочитать GPIO_POWER_IN: состояние платформы неизвестно"; return 1 ;;
+    esac
+    s=$(host_state)
+    case "$s" in
+        ""|*.Off) return 0 ;;
+        *) REASON="Платформа не выключена (${s##*.}): выключите её и повторите"; return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------ lock, switch
+locked=
+lock() {
+    mkdir -p $RUN $WORK
+    exec 9>>$LOCK
+    # (the guard of the job before holds it for up to a second after it ended)
+    i=0
+    until flock -n 9; do
+        i=$((i + 1))
+        [ $i -lt 5 ] && { sleep 1; continue; }
+        log "busy: another PNS flash job is running"; say "Флеш ПНС занят другой операцией" >&2; exit 1
+    done
+    locked=1
+    recover
+}
+
+# a job that died without its end state (the guard was killed too), and
+# the temporary files of dead jobs (RAM)
+recover() {
+    local f p
+    for f in $WORK/.tmp.*; do
+        [ -e "$f" ] || continue
+        p=${f#$WORK/.tmp.}; p=${p%%.*}
+        kill -0 "$p" 2>/dev/null || rm -f "$f"
+    done
+    [ -f $STATE ] && grep -q '"state":"running"' $STATE || return 0
+    pid=$(sed -n 's/.*"pid":\([0-9]*\),.*/\1/p' $STATE)
+    [ -n "$pid" ] && [ "$pid" != $$ ] && kill -0 "$pid" 2>/dev/null && return 0
+    sed -i 's/"state":"running"/"state":"interrupted"/' $STATE
+    switch 0 || log "can't switch the PNS flash back to the host"
+}
+
+connected=
+cleanup() {
+    rc=$?
+    if [ -n "$connected" ]; then
+        if switch 0; then
+            log "PNS flash switched back to the host"
+        else
+            log "CAN'T SWITCH THE PNS FLASH BACK TO THE HOST (GPIO_SPI_CONNECT): the platform won't boot"
+            S_WARN="Не удалось переключить флеш ПНС обратно на хост"
+        fi
+        connected=
+    fi
+    [ "$rc" = 0 ] || finish failed "${S_MSG:-прервано} (прервано)"
+    state
+    rm -f $WORK/.tmp.$$.*
+}
+
+# the job may be killed by anything (kill -9 too): a guard process switches
+# the flash back to the host when it is gone; it holds the lock (fd 9) until
+# then, so nothing else starts meanwhile
+guard() {
+    me_pid=$$
+    ( trap '' INT TERM HUP
+      while kill -0 $me_pid 2>/dev/null; do sleep 1; done
+      # a reimu-flash it started goes on writing: stop it first
+      d=$(cat $RUN/dev 2>/dev/null)
+      if [ -n "$d" ]; then
+          for sig in TERM TERM TERM KILL; do
+              killcmd $sig " write $d 0 " || break
+              sleep 1
+          done
+      fi
+      switch 0
+      if [ -f $STATE ] && grep -q "\"state\":\"running\",.*\"pid\":$me_pid," $STATE; then
+          sed -i 's/"state":"running"/"state":"interrupted"/; s/"message":"[^"]*"/"message":"Прервано: процесс записи завершился аварийно"/' $STATE
+          logger -t $me "job $me_pid killed: PNS flash switched back to the host" 2>/dev/null
+      fi ) </dev/null >/dev/null 2>&1 &
+}
+
+# kill SIG PATTERN: signal the processes whose command line has PATTERN
+# (no pkill in this busybox); 1 if there was none
+killcmd() {
+    local found=1 p c
+    for p in /proc/[0-9]*; do
+        c=$(tr '\000' ' ' < $p/cmdline 2>/dev/null) || continue
+        case " $c" in *"$2"*) kill -$1 ${p#/proc/} 2>/dev/null && found=0 ;; esac
+    done
+    return $found
+}
+
+DEV= CHIPSIZE= ES=
+find_dev() {
+    if [ -n "${REIMU_PNS_DEV:-}" ]; then
+        DEV=$REIMU_PNS_DEV
+    else
+        m=$(readlink /dev/mtd/sys 2>/dev/null)
+        DEV=${m:+/dev/${m##*/}}
+    fi
+    [ -n "$DEV" ] && [ -e "$DEV" ]
+}
+
+# the chip wasn't found when the BMC booted (the flash was the host's then):
+# probe the spi1 controller again now that it is connected
+probe() {
+    local c=1e630000.spi d=/sys/bus/platform/drivers/spi-aspeed-smc i
+    [ -d $d ] || return 1
+    log "PNS flash not found: probing $c again"
+    [ -e $d/$c ] && echo $c > $d/unbind
+    echo $c > $d/bind || return 1
+    for i in 1 2 3 4 5 6 7 8 9 10; do find_dev && return 0; sleep 1; done
+    return 1
+}
+
+connect() {
+    host_off || die "$REASON"
+    phase connect 1 "Подключение флеша ПНС к BMC"
+    guard
+    connected=1
+    switch 1 || die "Не удалось подключить флеш ПНС к BMC (GPIO_SPI_CONNECT)"
+    sleep 1
+    find_dev || probe || die "Флеш ПНС не найден (/dev/mtd/sys)"
+    echo $DEV > $RUN/dev
+    if [ -c "$DEV" ]; then
+        n=${DEV##*/}
+        CHIPSIZE=$(cat /sys/class/mtd/$n/size) ES=$(cat /sys/class/mtd/$n/erasesize)
+    else
+        CHIPSIZE=$(stat -c %s "$DEV") ES=4096
+    fi
+    [ "$CHIPSIZE" -ge $((DTB_OFF + DTB_MAX)) ] || die "Флеш ПНС $DEV: размер $CHIPSIZE меньше ожидаемого"
+}
+
+# ------------------------------------------------------------ reading
+tmp() { mkdir -p $WORK; echo $WORK/.tmp.$$.$1; }
+
+# DEV OFFSET BYTES (multiples of 4 KiB) -> stdout, progress P0..P1 of the job
+readdev() {
+    local o=$(($2 / 4096)) n=$(($3 / 4096)) i=0 c step=1024 p0=${4:-$S_PROG} p1=${5:-$S_PROG} p
+    while [ $i -lt $n ]; do
+        c=$step
+        [ $((i + c)) -gt $n ] && c=$((n - i))
+        dd if=$1 bs=4096 skip=$((o + i)) count=$c 2>/dev/null || return 1
+        i=$((i + c))
+        p=$((p0 + (p1 - p0) * i / n))
+        [ $p = $S_PROG ] || { S_PROG=$p; state; }
+    done
+}
+
+# sha256 of DEV OFFSET BYTES read now; empty on a read error
+devsum() {
+    local e s
+    e=$(tmp err); rm -f $e
+    s=$( { readdev "$@" || touch $e; } | sha256sum | cut -d' ' -f1)
+    [ -e $e ] && { rm -f $e; return 1; }
+    echo $s
+}
+filesum() { # FILE [OFFSET BYTES]
+    if [ $# -eq 1 ]; then sha256sum < "$1" | cut -d' ' -f1
+    else dd if="$1" bs=4096 skip=$(($2 / 4096)) count=$(($3 / 4096)) 2>/dev/null | sha256sum | cut -d' ' -f1
+    fi
+}
+
+# the whole chip into FILE, read twice and compared (up to 3 times)
+backup() {
+    local f=$1 p0=$2 p1=$3 mid a b t
+    mid=$(( (p0 + p1) / 2 ))
+    for t in 1 2 3; do
+        phase backup $p0 "Чтение флеша ПНС (резервная копия)"
+        readdev $DEV 0 $CHIPSIZE $p0 $mid > $f.tmp || { log "read error"; continue; }
+        a=$(filesum $f.tmp)
+        phase backup $mid "Повторное чтение флеша ПНС для сверки"
+        b=$(devsum $DEV 0 $CHIPSIZE $mid $p1) || { log "read error"; continue; }
+        if [ "$a" = "$b" ]; then
+            mv $f.tmp $f
+            echo "$a  ${f##*/}" > $f.sha256
+            return 0
+        fi
+        log "two reads of the PNS flash differ (try $t)"
+    done
+    rm -f $f.tmp
+    return 1
+}
+
+# keep the N newest backups in RAM, and EXCEPT (the image being written)
+prune() {
+    ls -t $WORK/backup-*.bin.gz 2>/dev/null | grep -vxF "${2:-/}" | sed "1,${1}d" |
+        while read -r f; do rm -f "$f" "${f%.gz}.sha256"; done
+}
+
+# room in WORK (RAM, tmpfs: shared with BMC updates) for N chip-sized files
+# while the job runs (the chip read, an unpacked image)
+room() {
+    local free
+    free=$(df -k $WORK 2>/dev/null | awk 'NR == 2 { print $4 }')
+    [ -z "$free" ] || [ "$free" -ge $((${1:-1} * CHIPSIZE / 1024 + 1024)) ] ||
+        die "Недостаточно памяти в $WORK (нужно $((${1:-1} * CHIPSIZE / 1048576)) МиБ, свободно $((free / 1024)) МиБ)"
+}
+
+# the chip read RAW (and RAW.sha256) as a backup NAME.gz + NAME.sha256 in WORK
+pack() {
+    gzip -c $1 > $WORK/$2.gz.tmp && mv $WORK/$2.gz.tmp $WORK/$2.gz &&
+        sed "s#  .*#  $2#" $1.sha256 > $WORK/$2.sha256 ||
+        { rm -f $WORK/$2.gz.tmp; die "Не удалось сохранить резервную копию в $WORK"; }
+}
+
+# ------------------------------------------------------------ image info
+hexat() { od -A n -t x1 -j $2 -N $3 "$1" 2>/dev/null | tr -d ' \n'; }
+be32() { h=$(hexat "$1" $2 4); [ ${#h} = 8 ] && printf '%d' 0x$h; }
+fsize() { stat -L -c %s "$1"; }
+
+# I_*: what FILE (BYTES of it, default all) holds
+info() {
+    local f=$1 len=${2:-$(fsize "$1")} t blocks s d
+    I_SIZE=$len I_MAGIC= I_TRAILER= I_BOOT= I_TAG= I_CPU= I_VBIOS= I_DTB= I_DTBERR= I_DTBSIZE=
+    I_DTBVER= I_MODEL= I_COMPAT= I_EMPTY=
+    [ "$(hexat "$f" 0 8)" = $MAGIC ] && I_MAGIC=1
+    [ "$(hexat "$f" 0 16)" = ffffffffffffffffffffffffffffffff ] && I_EMPTY=1
+    if [ "$len" -ge $BOOT_END ]; then
+        t=$(dd if="$f" bs=8 skip=$((TRAILER / 8)) count=1 2>/dev/null)
+        case "$t" in *[!0-9A-Fa-f]*|"") ;; *) [ ${#t} = 8 ] && I_TRAILER=$t ;; esac
+    fi
+    blocks=$(( (len < BOOT_END ? len : BOOT_END) / 4096 ))
+    s=$(tmp strings)
+    dd if="$f" bs=4096 count=$blocks 2>/dev/null | strings -n 8 > $s
+    I_BOOT=$(grep ' ::::::: ( unified-boot/' $s | awk '{ if (length($0) > length(m)) m = $0 } END { print m }')
+    I_TAG=$(printf '%s' "$I_BOOT" | sed -n 's/.*)(\([A-Za-z0-9_.-]*\))$/\1/p')
+    I_CPU=$(printf '%s' "$I_BOOT" | sed -n 's/^[^ ]*-\([Ee][0-9][A-Za-z0-9]*\) :::::::.*/\1/p')
+    I_VBIOS=$(grep -m1 -o 'VBIOS Version [0-9.]*' $s | sed 's/VBIOS Version //')
+    rm -f $s
+    if [ "$len" -gt $DTB_OFF ]; then
+        if [ "$(hexat "$f" $DTB_OFF 4)" != d00dfeed ]; then
+            I_DTBERR="нет device tree (DTB) @0x700000"
+        else
+            I_DTBSIZE=$(be32 "$f" $((DTB_OFF + 4)))
+            if [ -z "$I_DTBSIZE" ] || [ "$I_DTBSIZE" -gt $DTB_MAX ] || [ "$I_DTBSIZE" -lt 64 ]; then
+                I_DTBERR="device tree @0x700000: неверный размер ${I_DTBSIZE:-?}"
+            elif [ $((DTB_OFF + I_DTBSIZE)) -gt "$len" ]; then
+                I_DTBERR="device tree @0x700000 обрезан: $((len - DTB_OFF)) из $I_DTBSIZE байт"
+            else
+                d=$(tmp dtb)
+                dd if="$f" bs=4096 skip=$((DTB_OFF / 4096)) count=$(( (I_DTBSIZE + 4095) / 4096 )) 2>/dev/null > $d
+                if fdtget $d / compatible >/dev/null 2>&1; then
+                    I_DTB=1
+                    I_DTBVER=$(fdtget -t s $d / version 2>/dev/null)
+                    I_MODEL=$(fdtget -t s $d / model 2>/dev/null)
+                    I_COMPAT=$(fdtget -t s $d / compatible 2>/dev/null)
+                else
+                    I_DTBERR="device tree @0x700000 не разбирается"
+                fi
+                rm -f $d
+            fi
+        fi
+    fi
+}
+
+info_json() {
+    printf '{"size":%d,"boot":%s,"board":%s,"cpu":%s,"vbios":%s,"empty":%s,"dtb":' "$I_SIZE" \
+        "$(ja "$I_BOOT")" "$(ja "$I_TAG")" "$(ja "$I_CPU")" "$(ja "$I_VBIOS")" "$([ -n "$I_EMPTY" ] && echo true || echo false)"
+    if [ -n "$I_DTB" ]; then
+        printf '{"valid":true,"size":%d,"version":%s,"model":%s,"compatible":%s}}' "$I_DTBSIZE" \
+            "$(ja "$I_DTBVER")" "$(ja "$I_MODEL")" "$(ja "$I_COMPAT")"
+    else
+        printf '{"valid":false,"error":%s}}' "$(js "${I_DTBERR:-нет}")"
+    fi
+}
+
+# chip.json from the I_* of what was read; SOURCE [SHA256]
+save_chip() {
+    mkdir -p $KEEP
+    { printf '{"time":%d,"source":%s,"sha256":%s,"info":' $(date +%s) "$(js "$1")" "$(js "${2:-}")"
+      info_json; printf '}\n'; } > $CHIP.tmp && mv $CHIP.tmp $CHIP
+}
+
+# R_*: the board, from the chip (a backup just read) or chip.json
+ref_from_info() { R_COMPAT=$I_COMPAT R_SRC=$1; }
+ref_from_cache() {
+    R_COMPAT= R_SRC=
+    [ -f $CHIP ] || return 0
+    R_COMPAT=$(sed -n 's/.*"compatible":"\([^"]*\)".*/\1/p' $CHIP) R_SRC="сохранённые данные флеша"
+}
+
+# ------------------------------------------------------------ check
+C_ERR= C_WARN=
+err() { C_ERR="$C_ERR$*
+"; }
+warn() { C_WARN="$C_WARN$*
+"; }
+
+# FILE ANYBOARD [strict] (R_* set): C_ERR, C_WARN, I_* of the image;
+# strict: an unknown board is an error (the write, against the chip just read)
+check_image() {
+    local f=$1 any=$2 strict=${3:-} sz max b lc
+    C_ERR= C_WARN=
+    [ -f "$f" ] || { err "Файл $f не найден"; return 1; }
+    sz=$(fsize "$f")
+    max=${CHIPSIZE:-67108864}
+    [ "$sz" -gt 0 ] || { err "Пустой файл"; return 1; }
+    [ "$sz" -le "$max" ] || err "Образ больше флеша: $sz байт, флеш $max"
+    info "$f"
+    [ -n "$I_MAGIC" ] || err "Не образ ПНС: нет заголовка загрузчика Lintel в начале файла"
+    if [ "$sz" -lt $BOOT_END ]; then
+        err "Образ обрезан: область загрузчика 0x0-0x490000, в файле только $sz байт"
+    else
+        [ -n "$I_TRAILER" ] || err "Неизвестная разметка образа: нет контрольной суммы загрузчика @0x48fff8"
+    fi
+    [ -n "$I_BOOT" ] || err "Не найдена строка версии ПНС (unified-boot)"
+    [ "$sz" -gt $DTB_OFF ] && [ -z "$I_DTB" ] && err "${I_DTBERR:-device tree повреждён}"
+    [ "$sz" -le $DTB_OFF ] && [ "$sz" -ge $BOOT_END ] && warn "Образ без device tree: device tree на флеше (0x700000) не меняется"
+    [ -n "$C_ERR" ] && return 1
+    # the board
+    b=
+    lc=$(printf '%s' "$R_COMPAT" | tr A-Z a-z)
+    if [ -z "$R_COMPAT" ]; then
+        b="Плата неизвестна (на флеше нет device tree или он не читался): совместимость образа не проверена"
+        if [ "$any" = 1 ] || [ -z "$strict" ]; then warn "$b"; else err "$b (запись только с --any-board)"; fi
+    else
+        [ -n "$I_COMPAT" ] && [ "$I_COMPAT" != "$R_COMPAT" ] &&
+            b="Образ для другой платы: device tree образа $I_COMPAT, платы $R_COMPAT"
+        [ -z "$b" ] && [ -n "$I_TAG" ] && ! printf '%s' "$lc" | grep -qF "$(printf '%s' "$I_TAG" | tr A-Z a-z)" &&
+            b="Образ собран для платы $I_TAG, а плата $R_COMPAT"
+        [ -z "$b" ] && [ -n "$I_CPU" ] && ! printf '%s' "$lc" | grep -qF "$(printf '%s' "$I_CPU" | tr A-Z a-z)" &&
+            b="Образ для процессора $I_CPU, а плата $R_COMPAT"
+        if [ -n "$b" ]; then
+            if [ "$any" = 1 ]; then warn "$b"; else err "$b"; fi
+        fi
+    fi
+    [ -z "$C_ERR" ]
+}
+
+lines_json() {
+    printf '['
+    first=1
+    printf '%s\n' "$1" | while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        [ -n "$first" ] || printf ','
+        first=
+        js "$l"
+    done
+    printf ']'; }
+
+do_check() {
+    f= any=0 json=0
+    for a in "$@"; do
+        case $a in --any-board) any=1;; --json) json=1;; *) f=$a;; esac
+    done
+    [ -n "$f" ] || { say "usage: $me check FILE [--any-board] [--json]" >&2; exit 2; }
+    ref_from_cache
+    check_image "$f" $any; rc=$?
+    if [ $json = 1 ]; then
+        end=${I_SIZE:-0}
+        printf '{"ok":%s,"errors":%s,"warnings":%s,"board":%s,"covers":[0,%d],"image":' \
+            "$([ $rc = 0 ] && echo true || echo false)" "$(lines_json "$C_ERR")" "$(lines_json "$C_WARN")" \
+            "$(js "$R_COMPAT")" "$end"
+        if [ -n "${I_SIZE:-}" ]; then info_json; else printf null; fi
+        printf '}\n'
+    else
+        [ -n "$C_ERR" ] && printf '%s' "$C_ERR" | sed 's/^/ошибка: /'
+        [ -n "$C_WARN" ] && printf '%s' "$C_WARN" | sed 's/^/внимание: /'
+        if [ -n "${I_SIZE:-}" ] && [ -n "$I_MAGIC" ]; then
+            say "ПНС: ${I_BOOT:-?}"
+            say "VBIOS: ${I_VBIOS:-?}"
+            [ -n "$I_DTB" ] && say "device tree: $I_DTBVER ($I_MODEL, $I_COMPAT)"
+            say "покрывает: 0x0-$(printf '0x%x' $I_SIZE)"
+        fi
+        [ $rc = 0 ] && say "образ годен для записи"
+    fi
+    return $rc
+}
+
+# ------------------------------------------------------------ version
+print_info() {
+    say "boot=$I_BOOT"
+    say "board=$I_TAG"
+    say "vbios=$I_VBIOS"
+    say "devtree=$I_DTBVER"
+    say "model=$I_MODEL"
+    say "compatible=$I_COMPAT"
+    [ -n "$I_EMPTY" ] && say "empty=1"
+    return 0
+}
+
+do_version() {
+    case "${1:-}" in
+        "") [ -f $CHIP ] || { say "Флеш ПНС ещё не читался" >&2; exit 1; }; cat $CHIP ;;
+        --read)
+            boot=; [ "${2:-}" = --boot ] && boot=1
+            if [ -n "$boot" ] && ! host_off; then say "$REASON: версия ПНС не прочитана"; exit 0; fi
+            lock
+            trap cleanup EXIT; trap 'exit 130' INT TERM HUP
+            S_JOB=version; S_STATE=running; S_START=$(date +%s)
+            connect
+            n=$(( (DTB_OFF + DTB_MAX) / 4096 * 4096 ))
+            f=$(tmp head)
+            readdev $DEV 0 $n > $f || die "Ошибка чтения флеша ПНС"
+            [ "$(devsum $DEV 0 $n)" = "$(filesum $f)" ] || die "Два чтения флеша ПНС не совпали"
+            info $f $n; rm -f $f
+            switch 0 && connected=
+            save_chip $( [ -n "$boot" ] && echo boot || echo read)
+            print_info
+            finish ok "Версия прочитана" ;;
+        *) [ -f "$1" ] || { say "$1: нет такого файла" >&2; exit 1; }
+           info "$1"; print_info ;;
+    esac
+}
+
+# ------------------------------------------------------------ read
+# FILE: the chip as it is; none: backup-DATE.bin.gz in WORK
+do_read() {
+    lock
+    f=${1:-}
+    trap cleanup EXIT; trap 'exit 130' INT TERM HUP
+    begin read "Чтение флеша ПНС"
+    connect
+    room 1
+    raw=${f:-$(tmp chip)}
+    backup $raw 2 98 || die "Два чтения флеша ПНС не совпадают: чип или его подключение ненадёжны"
+    switch 0 && connected=
+    if [ -z "$f" ]; then
+        name=backup-$(date +%Y%m%d-%H%M%S).bin
+        pack $raw $name
+        prune 4
+        f=$WORK/$name.gz
+    fi
+    S_BACKUP=$f
+    info $raw; save_chip read $(cut -d' ' -f1 $raw.sha256)
+    finish ok "Флеш ПНС прочитан ($CHIPSIZE байт, sha256 $(cut -c1-16 $raw.sha256)…): $f"
+    say "$f"
+}
+
+# ------------------------------------------------------------ write
+do_write() {
+    f= any=0 blank=0
+    for a in "$@"; do
+        case $a in --any-board) any=1;; --blank-ok) blank=1;; *) f=$a;; esac
+    done
+    [ -n "$f" ] || { say "usage: $me write FILE [--any-board] [--blank-ok]" >&2; exit 2; }
+    case $f in /*) ;; *) f=$PWD/$f ;; esac
+    lock
+    trap cleanup EXIT; trap 'exit 130' INT TERM HUP
+    begin write "Проверка образа"
+    S_IMAGE=$f
+    # a gzipped image (the backups): unpacked into RAM for the job
+    img=$f sidecar=$f.sha256
+    if [ "${f%.gz}" != "$f" ]; then
+        CHIPSIZE=${CHIPSIZE:-67108864}; room 2
+        img=$(tmp image) sidecar=${f%.gz}.sha256
+        gzip -dc "$f" > $img 2>/dev/null || die "Не удалось распаковать $f"
+    fi
+    # the image as such (the board once the chip is read)
+    R_COMPAT=; check_image "$img" 1 || die "$(printf '%s' "$C_ERR" | tr '\n' ' ' | sed 's/ *$//')"
+    sz=$(fsize "$img") isum=$(filesum "$img")
+    # a backup of this chip made by us (its sha256 recorded): a restore. It
+    # may go onto a chip a failed write left erased or half-written, and
+    # it is this board's by definition
+    restore=
+    for s in "$sidecar" $KEEP/backup-last.bin.sha256; do
+        [ -f "$s" ] && grep -q "^$isum " "$s" && restore=1
+    done
+    [ -n "$restore" ] && { blank=1 any=1; log "$f: a backup of this chip, restoring"; }
+    connect
+    # the chip read into RAM for this job (bk), kept as backup-DATE.bin.gz
+    room 1
+    bk=$(tmp chip)
+    backup $bk 2 40 || die "Два чтения флеша ПНС не совпадают: запись отменена, флеш не изменён"
+    name=backup-$(date +%Y%m%d-%H%M%S).bin
+    pack $bk $name
+    prune 4 "$f"
+    S_BACKUP=$WORK/$name.gz
+    info $bk
+    [ -n "$I_EMPTY" ] && [ -z "$I_MAGIC" ] && [ $blank = 0 ] &&
+        die "Флеш ПНС читается пустым: он не подключился к BMC или пуст. Запись отменена (--blank-ok: писать в пустой)"
+    [ -z "$I_MAGIC" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
+        die "На флеше ПНС нет образа Lintel: он не подключился к BMC или повреждён. Запись отменена (--blank-ok: писать всё равно)"
+    save_chip backup $(cut -d' ' -f1 $bk.sha256)
+    ref_from_info "флеш"
+    check_image "$img" $any strict || die "$(printf '%s' "$C_ERR" | tr '\n' ' ' | sed 's/ *$//')"
+    S_WARN=$(printf '%s' "$C_WARN" | tr '\n' ' ' | sed 's/ *$//')
+    [ "$sz" -le "$CHIPSIZE" ] || die "Образ больше флеша"
+
+    # the target: the image, its last erase block completed from the chip
+    len=$(( (sz + ES - 1) / ES * ES ))
+    t=$img
+    if [ $len != $sz ]; then
+        t=$(tmp target)
+        { cat "$img"; dd if=$bk bs=1 skip=$sz count=$((len - sz)) 2>/dev/null; } > $t
+        [ "$(fsize $t)" = $len ] || die "Не удалось подготовить образ для записи (нет места в /tmp?)"
+    fi
+    tsum=$(filesum $t)
+    if [ "$(filesum $bk 0 $len)" = "$tsum" ]; then
+        S_CHANGED=0
+        info $t; save_chip write $(cut -d' ' -f1 $bk.sha256)
+        switch 0 && connected=
+        [ "$f" = $WORK/upload.bin ] && rm -f "$f"
+        finish ok "Флеш ПНС уже содержит этот образ: ничего не записано"
+        say "$S_MSG"
+        return 0
+    fi
+
+    # the chip before this write, on the BMC flash (not for a write that
+    # changes nothing: "last" stays the chip before the last real write)
+    keep_backup $WORK/$name
+
+    # erase + write the blocks that differ, every one read back (reimu-flash);
+    # an I/O error: again (it rewrites only what still differs)
+    ok=
+    for t2 in 1 2 3; do
+        phase write 40 "Запись флеша ПНС"
+        rcf=$(tmp rc) errf=$(tmp flasherr)
+        { $FLASH write $DEV 0 $t $TRIES 2>$errf; echo $? > $rcf; } | while read -r w p; do
+            case $w in
+                write) S_PHASE=write S_PROG=$((40 + ${p%\%} * 30 / 100)); state ;;
+                verify) S_PHASE=verify S_PROG=$((70 + ${p%\%} * 10 / 100)); state ;;
+                ok) echo $p > $(tmp changed) ;;
+            esac
+        done
+        [ -s $errf ] && log "$(cat $errf)"
+        [ "$(cat $rcf)" = 0 ] && { ok=1; break; }
+        log "reimu-flash failed (try $t2)"
+    done
+    S_CHANGED=$(cat $(tmp changed) 2>/dev/null)
+    [ -n "$ok" ] || die "Запись не удалась: флеш не совпадает с образом после $TRIES попыток записи ($(tail -1 $errf 2>/dev/null))"
+
+    # an independent read of the whole chip: the image, and the rest as it was
+    phase verify 80 "Сверка: повторное чтение всего флеша"
+    s=$(devsum $DEV 0 $len 80 92) || die "Ошибка чтения флеша при сверке"
+    [ "$s" = "$tsum" ] || die "Сверка не прошла: флеш не совпадает с образом (sha256 $s, ожидалось $tsum)"
+    if [ $len -lt $CHIPSIZE ]; then
+        s=$(devsum $DEV $len $((CHIPSIZE - len)) 92 99) || die "Ошибка чтения флеша при сверке"
+        [ "$s" = "$(filesum $bk $len $((CHIPSIZE - len)))" ] ||
+            die "Сверка не прошла: флеш за пределами образа (после 0x$(printf %x $len)) изменился"
+    fi
+    switch 0 && connected=
+    p=$(power)
+    [ "$p" = 0 ] || S_WARN="${S_WARN:+$S_WARN }Платформа включилась во время записи (флеш был отключён от неё)"
+    # what is on the chip now: the image; the device tree of the backup when
+    # the image doesn't reach it
+    info $t
+    if [ $len -le $DTB_OFF ]; then
+        b1=$I_BOOT b2=$I_TAG b3=$I_CPU b4=$I_VBIOS
+        info $bk
+        I_BOOT=$b1 I_TAG=$b2 I_CPU=$b3 I_VBIOS=$b4 I_MAGIC=1 I_EMPTY=
+    fi
+    I_SIZE=$CHIPSIZE
+    # the whole chip now (both parts were read back above)
+    csum=$( { cat $t; dd if=$bk bs=4096 skip=$((len / 4096)) 2>/dev/null; } | sha256sum | cut -d' ' -f1)
+    save_chip write $csum
+    finish ok "Флеш ПНС записан и сверен: $(printf '0x0-0x%x' $len), изменено блоков: ${S_CHANGED:-?}; ПНС $I_BOOT"
+    rm -f $WORK/.tmp.$$.target
+    # RAM: an uploaded image is on the chip now
+    [ "$f" = $WORK/upload.bin ] && rm -f "$f"
+    say "$S_MSG"
+    [ -n "$S_WARN" ] && say "внимание: $S_WARN"
+    return 0
+}
+
+# the chip before the write (WORK/NAME.gz), on the BMC flash if it is small
+keep_backup() {
+    mkdir -p $KEEP
+    [ "$(fsize $1.gz)" -le "$KEEP_MAX" ] &&
+        cp $1.gz $KEEP/backup-last.bin.gz.tmp && cp $1.sha256 $KEEP/backup-last.bin.sha256.tmp &&
+        mv $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.gz &&
+        mv $KEEP/backup-last.bin.sha256.tmp $KEEP/backup-last.bin.sha256 ||
+        rm -f $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.sha256.tmp
+    return 0
+}
+
+do_status() {
+    printf '{"state":'; if [ -f $STATE ]; then tr -d '\n' < $STATE; else printf null; fi
+    printf ',"chip":'; if [ -f $CHIP ]; then tr -d '\n' < $CHIP; else printf null; fi
+    printf '}\n'
+}
+
+do_with_chip() {
+    [ $# -gt 0 ] || { say "usage: $me with-chip CMD [ARG...]" >&2; exit 2; }
+    lock
+    trap cleanup EXIT; trap 'exit 130' INT TERM HUP
+    S_JOB=; connect
+    PNS_DEV=$DEV "$@"
+    rc=$?
+    switch 0 && connected=
+    return $rc
+}
+
+do_disconnect() {
+    lock
+    switch 0 || { say "Не удалось переключить флеш ПНС на хост" >&2; exit 1; }
+    say "Флеш ПНС переключён на хост"
+}
+
+case ${1:-} in
+    version) shift; do_version "$@" ;;
+    check) shift; do_check "$@" ;;
+    read) shift; do_read "$@" ;;
+    write) shift; do_write "$@" ;;
+    status) do_status ;;
+    disconnect) do_disconnect ;;
+    with-chip) shift; do_with_chip "$@" ;;
+    *) sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$0"; exit 2 ;;
+esac

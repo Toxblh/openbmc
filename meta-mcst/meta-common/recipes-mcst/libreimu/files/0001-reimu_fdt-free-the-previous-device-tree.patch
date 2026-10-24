@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: reimu <reimu@localhost>
+Date: Fri, 23 Oct 2026 22:18:20 +0000
+Subject: [PATCH] reimu_fdt: free the previous device tree in reimu_open_dtb()
+
+reimu_traverse_all_i2c() reads the device tree anew on every call, and the
+previous copy was never freed: a daemon that traverses on every poll
+(overheatd) leaked the whole DTB each time, ~13 KB per 5 s poll, and was
+OOM-killed after ~41 h. A failed read keeps the previous copy.
+Upstream-Status: Pending
+---
+ reimu_fdt.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/reimu_fdt.c b/reimu_fdt.c
+index 267657a..9b3c654 100644
+--- a/reimu_fdt.c
++++ b/reimu_fdt.c
+@@ -21,6 +21,7 @@ char *reimu_dtb = NULL;
+ static void reimu_free_dtb(void)
+ {
+     free(reimu_dtb);
++    reimu_dtb = NULL;
+ }
+ 
+ const void* __attribute__((format(printf, 6, 7))) reimu_getprop(enum cancel_type_t cancel_on_error, int node, const char *name, int mandatory, int failval, const char *fmt, ...)
+@@ -65,10 +66,16 @@ int reimu_for_each_subnode(enum cancel_type_t cancel_on_error, int parent, trave
+     return 0;
+ }
+ 
++/* Called on every reimu_traverse_all_i2c(): the previous copy is freed (it
++ * leaked once per call, ~13 KB a poll in overheatd), and kept if the file
++ * can't be read (reimu_readfile() leaves a freed pointer behind then) */
+ static int reimu_open_dtb(void)
+ {
++    char *dtb = NULL;
+     size_t dtb_size;
+-    if (reimu_readfile(reimu_devtree_path, &reimu_dtb, &dtb_size)) return 1;
++    if (reimu_readfile(reimu_devtree_path, &dtb, &dtb_size)) return 1;
++    free(reimu_dtb);
++    reimu_dtb = dtb;
+     reimu_set_atexit(&reimu_is_atexit_free_dtb, reimu_free_dtb);
+     return 0;
+ }

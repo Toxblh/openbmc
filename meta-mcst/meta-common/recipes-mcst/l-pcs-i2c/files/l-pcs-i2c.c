@@ -9,7 +9,7 @@ struct l_pcs_i2c_data
     struct mutex        lock;
     char                valid;
     unsigned long       last_updated;
-    u16                 temp;
+    int                 temp;   /* m°C, or -errno */
 };
 
 static void l_pcs_i2c_update_device(struct device *dev)
@@ -18,18 +18,17 @@ static void l_pcs_i2c_update_device(struct device *dev)
     mutex_lock(&data->lock);
     if (time_after(jiffies, data->last_updated + HZ + HZ / 2) || !data->valid)
     {
-        char bytes[2];
-        if (i2c_master_recv(data->client, bytes, 2) != 2)
+        /* 1/8 °C, big endian; 0: no sensor. In m°C that's up to
+         * 8191875, more than an u16 holds (it wrapped at 65.5 °C) */
+        u8 bytes[2];
+        if (i2c_master_recv(data->client, bytes, 2) != 2 || !(bytes[0] | bytes[1]))
         {
-            data->temp = 0;
+            data->temp = -EIO;
             data->valid = 0;
         }
         else
         {
-            u16 temp = bytes[0];
-            temp <<= 8;
-            temp |= ((u16)bytes[1] & 0xff);
-            data->temp = temp * 125;
+            data->temp = ((bytes[0] << 8) | bytes[1]) * 125;
             data->last_updated = jiffies;
             data->valid = 1;
         }
@@ -39,8 +38,11 @@ static void l_pcs_i2c_update_device(struct device *dev)
 
 static ssize_t temp_show(struct device *dev, struct device_attribute *da, char *buf)
 {
+    int temp;
     l_pcs_i2c_update_device(dev);
-    return sprintf(buf, "%d\n", ((struct l_pcs_i2c_data *)dev_get_drvdata(dev))->temp);
+    temp = ((struct l_pcs_i2c_data *)dev_get_drvdata(dev))->temp;
+    /* a failed read is an error, not 0 °C */
+    return temp < 0 ? temp : sprintf(buf, "%d\n", temp);
 }
 
 static SENSOR_DEVICE_ATTR_RO(temp1_input, temp, 0);

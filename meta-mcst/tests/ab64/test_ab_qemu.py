@@ -41,7 +41,14 @@ W = os.path.abspath(sys.argv[1])
 ONLY = sys.argv[2:]
 STOCK = os.environ.get("STOCK", os.path.expanduser("~/git/new-reimu/backup"))
 RQ = os.environ.get("RQ", "/tmp/rq")
-SSH, HTTPS = 2422, 2443
+# AB_SSH, AB_HTTPS: other ports for a second run at the same time (with its own RQ)
+SSH, HTTPS = int(os.environ.get("AB_SSH", 2422)), int(os.environ.get("AB_HTTPS", 2443))
+# AB_IPMI=PORT: also forward UDP 127.0.0.1:PORT to the BMC's IPMI (623);
+# AB_NETDEV_EXTRA: appended to the user netdev (",restrict=on" keeps the guest
+# from reaching the LAN, but slirp then drops UDP replies: no IPMI over LAN).
+# Both unset by default: nothing changes.
+IPMI = int(os.environ.get("AB_IPMI", 0))
+NETDEV_EXTRA = os.environ.get("AB_NETDEV_EXTRA", "")
 failed = []
 
 
@@ -101,7 +108,8 @@ class Bmc:
         self.p = subprocess.Popen(
             ["qemu-system-arm", "-M", "ast2500-evb,fmc-model=mx66l51235f", "-m", "512",
              "-nographic", "-drive", "file=%s,if=mtd,format=raw" % self.img,
-             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, HTTPS),
+             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, HTTPS)
+             + (",hostfwd=udp:127.0.0.1:%d-:623" % IPMI if IPMI else "") + NETDEV_EXTRA,
              "-net", "nic,netdev=n0,macaddr=98:a7:b0:00:00:01",
              "-qmp", "unix:%s/%s.qmp,server,nowait" % (RQ, self.name),
              "-qmp", "unix:%s/%s.qmp2,server,nowait" % (RQ, self.name),
@@ -167,6 +175,9 @@ class Bmc:
         for host, guest in ((SSH, 22), (HTTPS, 443)):
             hmp("hostfwd_remove n0 tcp:127.0.0.1:%d" % host)
             hmp("hostfwd_add n0 tcp:127.0.0.1:%d-%s:%d" % (host, ip, guest))
+        if IPMI:
+            hmp("hostfwd_remove n0 udp:127.0.0.1:%d" % IPMI)
+            hmp("hostfwd_add n0 udp:127.0.0.1:%d-%s:623" % (IPMI, ip))
         s.close()
 
     def wait_ssh(self, timeout=400):

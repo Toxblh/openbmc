@@ -7,6 +7,8 @@
  *     property Json (s)  - JSON document, see build_json()
  *     method   Rescan() -> s   JSON {"ok": bool, "message": string}
  *                         re-reads the flash partition table (host must be off)
+ *   object    /xyz/openbmc_project/reimu/pns_flash   (reimu-pnsflash.c)
+ *     backups, upload, check and write of the flash
  *   object    /xyz/openbmc_project/reimu/sensors
  *   interface xyz.openbmc_project.Reimu.Sensors
  *     property Json (s)  - platform sensors, see sensors_doc() and reimu-sensors.c
@@ -47,6 +49,9 @@
 #endif
 
 #include "reimu-sensors.h"
+#ifndef PARSER_ONLY
+#include "reimu-pnsflash.h"
+#endif
 
 #define FRU_XML   "/var/volatile/motherboard_info.xml"
 #define DTS_FILE  "/var/volatile/motherboard_devtree.dts"
@@ -786,6 +791,8 @@ static int run_daemon(void)
     if (r >= 0)
         r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/journal", "xyz.openbmc_project.Reimu.Journal",
                                      journal_vtable, NULL);
+    /* backups, upload, check and write of the flash (reimu-pnsflash.c) */
+    if (r >= 0) r = pnsflash_register(bus);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
     if (r < 0)

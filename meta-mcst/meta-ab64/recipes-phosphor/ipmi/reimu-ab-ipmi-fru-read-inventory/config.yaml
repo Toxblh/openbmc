@@ -1,0 +1,28 @@
+# IPMI FRU 0 (ipmitool fru print: "Builtin FRU Device"): the board info area
+# from the inventory object reimu-inventory publishes from the FRU ID EEPROM
+0x00:
+  /system/chassis/motherboard:
+    entityID: 7
+    entityInstance: 1
+    interfaces:
+      xyz.openbmc_project.Inventory.Item:
+        PrettyName:
+          IPMIFruProperty: Name
+          IPMIFruSection: Board
+      xyz.openbmc_project.Inventory.Decorator.Asset:
+        Manufacturer:
+          IPMIFruProperty: Manufacturer
+          IPMIFruSection: Board
+        SerialNumber:
+          IPMIFruProperty: Serial Number
+          IPMIFruSection: Board
+        PartNumber:
+          IPMIFruProperty: Part Number
+          IPMIFruSection: Board
+        BuildDate:
+          IPMIFruProperty: Mfg Date
+          IPMIFruSection: Board
+      xyz.openbmc_project.Inventory.Decorator.Revision:
+        Version:
+          IPMIFruProperty: FRU File ID
+          IPMIFruSection: Board

@@ -1,0 +1,13 @@
+[Unit]
+Description=A/B firmware: BMC updates through Redfish UpdateService (reimu-ab install)
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Software.BMC.Updater
+ExecStart=/usr/sbin/reimu-abd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

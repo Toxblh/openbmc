@@ -1,7 +1,7 @@
 [Match]
 Name=eth1
 [Network]
-DHCP=yes
+DHCP=true
 [DHCP]
 ClientIdentifier=mac
 UseDNS=yes

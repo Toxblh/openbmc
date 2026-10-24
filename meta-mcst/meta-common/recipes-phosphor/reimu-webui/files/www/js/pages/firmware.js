@@ -2,11 +2,15 @@
 // UpdateService and, on boards with two BMC flash chips, the reliable
 // upgrade state from reimu-firmwared (/xyz/openbmc_project/reimu/firmware):
 // which chip is running, whether a new image waits for its health check,
-// the backup chip contents and the sync/verify/restore jobs.
+// the backup chip contents and the sync/verify/restore jobs. On the A/B
+// firmware (two slots on one chip) the state comes from reimu-abd
+// (/xyz/openbmc_project/reimu/ab), which also takes the upload: the image
+// goes into the slot that isn't running, read back, and boots next.
 
 import { api, h, toast, fmtBytes } from "../api.js";
 
 const FW = "/xyz/openbmc_project/reimu/firmware";
+const AB = "/xyz/openbmc_project/reimu/ab";
 
 const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
 const when = (s) => (s ? new Date(s * 1000).toLocaleString() : "—");
@@ -17,7 +21,13 @@ export async function getStatus() {
     const r = await api.get(FW);
     return JSON.parse(r.data.Json);
   } catch (e) {
-    return e.status === 404 ? null : undefined; // null: no reliable upgrade on this board; undefined: request failed
+    if (e.status !== 404) return undefined; // request failed
+  }
+  try {
+    const r = await api.get(AB);
+    return { ab: JSON.parse(r.data.Json) };
+  } catch (e) {
+    return e.status === 404 ? null : undefined; // null: no reliable upgrade on this board
   }
 }
 
@@ -44,11 +54,13 @@ export function firmwareCard(mgr, onReboot) {
       return;
     }
     if (st === undefined) st = null;
-    const wasRunning = last && last.job && last.job.state === "running";
+    const lastJob = last && (last.ab ? last.ab.job : last.job);
+    const wasRunning = lastJob && lastJob.state === "running";
     last = st;
     card.replaceChildren(...render(st));
     // follow a running job, and look once more after it ended (results)
-    if (st && st.job && st.job.state === "running") timer = setTimeout(refresh, 2000);
+    const job = st && (st.ab ? st.ab.job : st.job);
+    if (job && job.state === "running") timer = setTimeout(refresh, 2000);
     else if (wasRunning) timer = setTimeout(refresh, 1500);
   }
   function stop() {
@@ -70,7 +82,9 @@ export function firmwareCard(mgr, onReboot) {
   function render(st) {
     const out = [h("h3", {}, "Прошивка BMC")];
     const backup = st && st.bootedFrom === "backup";
-    if (!st) {
+    if (st && st.ab) {
+      out.push(...renderAb(st.ab, onReboot));
+    } else if (!st) {
       out.push(kv([["Версия", (mgr && mgr.FirmwareVersion) || "—"]]), h("p", { class: "muted small" }, "Резервирования прошивки нет (один флеш-чип или сервис reimu-firmwared недоступен): неудачное обновление придётся восстанавливать программатором."));
     } else if (!st.strap || !st.dual) {
       out.push(kv([["Версия", st.running.name || st.running.version]]), h("p", { class: "muted small" }, !st.strap ? "Плата не настроена на загрузку со второго чипа (strap SCU70[17]): откат при неудачном обновлении не работает." : "Второй флеш-чип BMC не найден: откат при неудачном обновлении не работает."));
@@ -135,18 +149,57 @@ export function firmwareCard(mgr, onReboot) {
   return card;
 }
 
+const SLOT_TEXT = (v) => v || "пусто";
+
+function renderAb(ab, onReboot) {
+  const out = [];
+  const m = (ab.booted || "").match(/kernel=([ab]) rofs=([a-z]+) state=([a-z]+)/);
+  const slot = m ? m[1] : "?";
+  const other = slot === "a" ? "b" : slot === "b" ? "a" : "?";
+  out.push(
+    kv([
+      ["Версия", ab.running],
+      ["Работает слот", m ? `${slot.toUpperCase()}${m[3] === "fallback" ? ` (rofs из слота ${m[2].toUpperCase()}: rofs-${slot} повреждён)` : m[3] === "ram" ? " (из памяти, флеш только для чтения)" : ""}` : ab.booted || "—"],
+      ["Слот A", SLOT_TEXT(ab.slots && ab.slots.a)],
+      ["Слот B", SLOT_TEXT(ab.slots && ab.slots.b)],
+      ["Следующая загрузка", ab.next ? `слот ${ab.next.toUpperCase()}${ab.pending ? " — новый образ, ждёт проверки работоспособности" : ""}` : "—"],
+    ]),
+  );
+  if (ab.pending && ab.next === slot) out.push(h("div", { class: "alert warn" }, "Новый образ ждёт подтверждения: если он не заработает (веб, консоли) за 5 минут, BMC вернётся к другому слоту."));
+  const job = ab.job;
+  if (job) {
+    const running = job.state === "running";
+    const cls = job.state === "ok" ? "ok" : job.state === "failed" ? "err" : "warn";
+    out.push(
+      h(
+        "div",
+        { class: "section" },
+        h("div", { class: "small" }, `Установка ${job.version}: `, h("span", { class: `badge ${cls}` }, running ? "выполняется" : job.state === "ok" ? "готово" : "ошибка"), " ", h("span", { class: "muted" }, job.message)),
+        running ? h("div", { class: "progress" }, h("div", { style: { width: `${job.progress || 0}%` } })) : null,
+        job.state === "ok" && ab.next === other ? h("div", { class: "row" }, h("span", { class: "small" }, `Новый образ в слоте ${other.toUpperCase()} запустится после перезагрузки BMC (платформа будет перезапущена вместе с BMC).`), reboot(onReboot)) : null,
+      ),
+    );
+  }
+  if (ab.upload && !ab.upload.ok) out.push(h("div", { class: "alert err" }, ab.upload.message));
+  return out;
+}
+
 function uploadSection(st, backup, onReboot) {
   const file = h("input", { type: "file", accept: ".tar,.mtd.tar,application/x-tar" });
+  const job = st && st.ab && st.ab.job;
+  const installing = job && job.state === "running";
   const go = h("button", { class: "btn primary", disabled: true }, "Загрузить и активировать");
   const bar = h("div", { class: "progress hidden" }, h("div", {}));
   const note = h("div", { class: "muted small" });
-  file.addEventListener("change", () => (go.disabled = !file.files.length || backup));
+  file.addEventListener("change", () => (go.disabled = !file.files.length || backup || installing));
   go.addEventListener("click", async () => {
     const f = file.files[0];
     if (!f) return;
     const head = new Uint8Array(await f.slice(257, 262).arrayBuffer());
-    if (String.fromCharCode(...head) !== "ustar") return toast("Это не tar-архив образа (нужен obmc-phosphor-image-*.static.mtd.tar)", "err");
-    const guard = st && st.strap && st.dual ? "Текущий образ будет сохранён на резервный чип, новый должен пройти проверку после перезагрузки, иначе BMC вернётся к резервному." : "Резервного чипа нет: при неудачном обновлении BMC придётся восстанавливать программатором.";
+    if (String.fromCharCode(...head) !== "ustar") return toast(st && st.ab ? "Это не tar-архив обновления (нужен reimu-ab.tar)" : "Это не tar-архив образа (нужен obmc-phosphor-image-*.static.mtd.tar)", "err");
+    const guard = st && st.ab
+      ? "Образ будет записан в слот, который сейчас не работает (каждый блок читается обратно), и запустится после перезагрузки BMC. Если он не заработает, BMC вернётся к текущему слоту."
+      : st && st.strap && st.dual ? "Текущий образ будет сохранён на резервный чип, новый должен пройти проверку после перезагрузки, иначе BMC вернётся к резервному." : "Резервного чипа нет: при неудачном обновлении BMC придётся восстанавливать программатором.";
     if (!confirm(`Обновить прошивку BMC образом ${f.name} (${fmtBytes(f.size)})?\n\n${guard}`)) return;
     go.disabled = file.disabled = true;
     bar.classList.remove("hidden");
@@ -154,9 +207,23 @@ function uploadSection(st, backup, onReboot) {
       try {
         await upload(f, (p) => (bar.firstChild.style.width = `${Math.round(p * 100)}%`));
       } catch (e) {
+        // A/B: why reimu-abd refused it
+        if (st && st.ab) {
+          const s2 = await getStatus();
+          if (s2 && s2.ab && s2.ab.upload && !s2.ab.upload.ok) throw new Error(s2.ab.upload.message);
+          throw e;
+        }
         // bmcweb gives up waiting for the updater after a while, though the
         // image may still be accepted: look for it staged for flashing
         if (!(st && (await stagedSoon()))) throw e;
+      }
+      if (st && st.ab) {
+        note.replaceChildren("Образ принят: идёт запись в резервный слот (около 5 минут), ход записи — выше. BMC не перезагружается сам.");
+        toast("Образ принят, идёт запись", "ok");
+        const card = document.getElementById("fw-card");
+        if (card && card.refresh) setTimeout(card.refresh, 1000);
+        go.disabled = file.disabled = false;
+        return;
       }
       note.replaceChildren("Образ принят и активирован. Он будет записан во флеш при перезагрузке BMC (около 7 минут, платформа перезапустится).", " ", reboot(onReboot));
       toast("Образ активирован", "ok");
@@ -175,7 +242,11 @@ function uploadSection(st, backup, onReboot) {
     h("div", { class: "row" }, file, go),
     bar,
     note,
-    h("p", { class: "muted small" }, "Также из консоли: firmware-updater <URL образа>; прошивка ПНС: update-host-flash."),
+    h("p", { class: "muted small" }, st && st.ab
+        ? "Также из консоли BMC: reimu-ab install reimu-ab.tar. Прошивка ПНС — на странице «Оборудование» (или reimu-pns-flash в консоли)."
+        : st && st.dual !== undefined
+          ? "Также из консоли: firmware-updater <URL образа>. Прошивка ПНС — на странице «Оборудование»."
+          : "Также из консоли BMC: reimu-ab install reimu-ab.tar (A/B) или firmware-updater <URL образа>. Прошивка ПНС — на странице «Оборудование» (или reimu-pns-flash в консоли)."),
   );
 }
 

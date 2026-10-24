@@ -1,4 +1,5 @@
 import { api, h, healthBadge } from "../api.js";
+import { fanState, renderFans } from "./fans.js";
 
 let root, timer;
 let filter = "";
@@ -44,6 +45,7 @@ export async function mount(el) {
   });
   el.append(
     h("div", { class: "row section" }, h("h2", { class: "m-hide" }, "Датчики"), h("span", { class: "spacer m-hide" }), search, h("label", { class: "inline" }, auto, "автообновление 5 с")),
+    h("div", { id: "fans-body" }),
     h("div", { id: "sens-body" }, h("div", { class: "empty" }, "Загрузка…")),
   );
   await refresh();
@@ -53,8 +55,8 @@ export async function mount(el) {
 let last = null;
 
 async function refresh() {
-  const [chassis, plat] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors()]);
-  const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat };
+  const [chassis, plat, fans] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState()]);
+  const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat, fans };
   await Promise.all(
     chassis.map(async (c) => {
       const [t, p] = await Promise.all([
@@ -153,6 +155,7 @@ function platformNote(p) {
 
 function render(d) {
   if (!d || !root) return;
+  renderFans(root.querySelector("#fans-body"), d.fans, refresh);
   root
     .querySelector("#sens-body")
     .replaceChildren(

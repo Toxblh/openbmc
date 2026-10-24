@@ -1,0 +1,34 @@
+From 58cc04d83393d8d58430752b7395753a6ef48e98 Mon Sep 17 00:00:00 2001
+From: reimu <reimu@localhost>
+Date: Fri, 23 Oct 2026 23:59:52 +0000
+Subject: [PATCH] reimu_find_filename: copy the name before closedir()
+
+The dirent readdir() returned lives in the DIR that closedir() frees, so
+strdup() read freed memory (overheatd called it on every poll). The name is
+copied first; a closedir() failure frees it.
+
+Upstream-Status: Pending
+---
+ reimu.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/reimu.c b/reimu.c
+index eda6d75..eb4cd20 100644
+--- a/reimu.c
++++ b/reimu.c
+@@ -208,8 +208,10 @@ int reimu_find_filename(int order, char *path, char **name)
+         if (f->d_name[0] != '.') --order;
+     }
+ 
+-    if(closedir(d) != 0) return -EBADF;
+-    if((*name = strdup(f->d_name)) == NULL) return -ENOMEM;
++    /* f points into d: copied before closedir() frees it */
++    *name = strdup(f->d_name);
++    if(closedir(d) != 0) { free(*name); *name = NULL; return -EBADF; }
++    if(*name == NULL) return -ENOMEM;
+     return 0;
+ }
+ 
+-- 
+2.25.1
+

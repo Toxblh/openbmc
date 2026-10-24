@@ -1,0 +1,22 @@
+[Unit]
+Description=REIMU fan control (CPU, board and case fans)
+After=dbus.service
+# the fans must always have their controller back
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/reimu-fand
+# whatever stopped it (crash, watchdog, kill, systemctl stop): every fan 100 %
+ExecStopPost=/usr/sbin/reimu-fand --failsafe
+# re-reads /etc/reimu-fand.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+# pinged after each control poll (POLL_MS), not just by the event loop
+WatchdogSec=30
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,26 @@
 [Unit]
 Description=Overheat Check Daemon
 After=network.target network-online.target remote-fs.target
+# The overheat protection must come back whatever made it exit
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/sbin/overheatd
+Restart=always
+RestartSec=5
+# Pinged on every poll, sensor read and second of sleep (at most once a
+# second). A poll takes a few ms; with a dead I2C bus each of the 8 sensor
+# reads may take its timeout (~1.5 s seen on the board), so 60 s of silence
+# means a real hang
+WatchdogSec=60
+# The last-resort protection: the OOM killer takes anything else first. A
+# leak of its own is bounded by its address space instead (it needs ~3 MB):
+# malloc fails, it exits and is started again. (MemoryMax= would do nothing:
+# the kernel has no memory cgroup)
+OOMScoreAdjust=-1000
+LimitAS=32M
 
 [Install]
 WantedBy=multi-user.target

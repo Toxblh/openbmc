@@ -45,6 +45,41 @@ device tree can make it read-only too).
 `reimu-flash` writes the erase blocks that differ, reads the whole range back,
 rewrites on a mismatch (3-5 tries); it refuses to write U-Boot.
 
+## BMC updates from the web (reimu-abd)
+
+phosphor-bmc-code-mgmt is left out (its static-layout flow stages images
+for a shutdown flasher that has no partitions to write here). `reimu-abd`
+takes its place on D-Bus (xyz.openbmc_project.Software.BMC.Updater): an
+upload through Redfish UpdateService (the web UI's firmware card) that is a
+`reimu-ab.tar` becomes a Software object; bmcweb activates it and
+`reimu-ab install` writes the slot that isn't running (every write read back)
+and makes it boot next, pending until healthy; the task completes, the BMC
+is not rebooted. Anything else is refused at once (HTTP 400, ImageFailure).
+The running version is the functional one (Managers/bmc FirmwareVersion).
+State for the web UI: `/xyz/openbmc_project/reimu/ab` (Json).
+
+## The PNS flash (reimu-pns-flash)
+
+The host boot firmware's 64 MiB flash on spi1 ("sys"), switched to the BMC
+with GPIO_SPI_CONNECT (O0) only while the platform is off:
+
+    reimu-pns-flash version [FILE] | version --read
+    reimu-pns-flash check FILE [--any-board]
+    reimu-pns-flash read [FILE]           the whole chip, read twice
+    reimu-pns-flash write FILE            backup, only differing erase blocks,
+                                          each read back (reimu-flash), then
+                                          the whole chip compared
+    update-host-flash URL                 the old command, now the same write
+
+A lock (/run/reimu-pns/lock) is held for the whole job; server_ctl (every
+power-on/reset path: host-poweron.service, Redfish, IPMI, allow_host_boot)
+refuses while it is held, and switches the flash back to the host before it
+presses the power button. The flash is switched back on every exit (trap; a
+guard process for kill -9; ExecStopPost of the web job). Image layout,
+checks and what is never written: the comment at the top of the script.
+The web UI (Hardware page, reimu-pnsd `/xyz/openbmc_project/reimu/pns_flash`)
+uploads, checks, writes, downloads and writes back backups.
+
 ## Build
 
 Its own build directory (the layer after meta-device-reimu-5564):
@@ -58,6 +93,9 @@ whole flash, for QEMU) and `reimu-ab-kexec.tar` (to start it from RAM).
 ## Tests (meta-mcst/tests/ab64)
 
 * `test_reimu_flash.py`: reimu-flash with lost writes (LD_PRELOAD flaky-pwrite).
+* `test_pns_qemu.py`: the PNS flash on spi1 of QEMU (a copy of the board's
+  dump): versions, check, read, write, faults (pns-fault.c), power-on
+  blocking, the web endpoints and page, and the web BMC update (reimu-abd).
 * `test_ab_qemu.py`: QEMU with the U-Boot of the real board: boot, memory,
   regressions, update, damaged kernel, damaged rofs, hang + watchdog, and the
   whole way on the stock firmware dumped from the board: restore-stock, test

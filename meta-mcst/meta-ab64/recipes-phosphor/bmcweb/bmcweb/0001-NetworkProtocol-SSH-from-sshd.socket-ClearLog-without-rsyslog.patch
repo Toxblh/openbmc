@@ -1,0 +1,43 @@
+From: REIMU A/B <reimu@localhost>
+Subject: [PATCH] NetworkProtocol SSH from sshd.socket; EventLog ClearLog without rsyslog
+
+- The BMC runs OpenSSH (sshd.socket); NetworkProtocol looked for dropbear
+  and reported SSH ProtocolEnabled false.
+- EventLog ClearLog removed the log files and then answered 500 because
+  rsyslog.service couldn't be reloaded (the A/B image has no rsyslog, the
+  stock one none that reloads). The reload is only a courtesy to rsyslog.
+
+---
+diff --git a/redfish-core/lib/log_services.hpp b/redfish-core/lib/log_services.hpp
+index a4e483ea14..614c2b775c 100644
+--- a/redfish-core/lib/log_services.hpp
++++ b/redfish-core/lib/log_services.hpp
+@@ -1049,11 +1049,11 @@ class JournalEventLogClear : public Node
+         // Reload rsyslog so it knows to start new log files
+         crow::connections::systemBus->async_method_call(
+             [asyncResp](const boost::system::error_code ec) {
++                // REIMU: no rsyslog (or one without a reload) is no reason
++                // to fail: the log files are gone, ClearLog answered 500
+                 if (ec)
+                 {
+-                    BMCWEB_LOG_ERROR << "Failed to reload rsyslog: " << ec;
+-                    messages::internalError(asyncResp->res);
+-                    return;
++                    BMCWEB_LOG_DEBUG << "rsyslog not reloaded: " << ec;
+                 }
+ 
+                 messages::success(asyncResp->res);
+diff --git a/redfish-core/lib/network_protocol.hpp b/redfish-core/lib/network_protocol.hpp
+index 65b90f7571..5b3bd6d62a 100644
+--- a/redfish-core/lib/network_protocol.hpp
++++ b/redfish-core/lib/network_protocol.hpp
+@@ -55,7 +55,8 @@ using UnitStruct =
+                std::string, sdbusplus::message::object_path>;
+ 
+ const static std::array<std::pair<const char*, const char*>, 3> protocolToDBus{
+-    {{"SSH", "dropbear"}, {"HTTPS", "bmcweb"}, {"IPMI", "phosphor-ipmi-net"}}};
++    // REIMU: OpenSSH (sshd.socket), not dropbear: SSH read "disabled"
++    {{"SSH", "sshd"}, {"HTTPS", "bmcweb"}, {"IPMI", "phosphor-ipmi-net"}}};
+ 
+ inline void
+     extractNTPServersAndDomainNamesData(const GetManagedObjects& dbusData,

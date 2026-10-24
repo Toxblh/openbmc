@@ -1,0 +1,11 @@
+[Unit]
+Description=Board FRU ID into the inventory (Redfish Chassis, IPMI FRU)
+Wants=xyz.openbmc_project.Inventory.Manager.service
+After=xyz.openbmc_project.Inventory.Manager.service mcst-fruid.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/reimu-inventory
+
+[Install]
+WantedBy=multi-user.target

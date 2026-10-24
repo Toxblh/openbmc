@@ -68,3 +68,17 @@ info "memory: $(free | sed -n 2p)"
 info "RSS KiB: $(for s in /proc/[0-9]*/status; do awk '/^Name/{n=$2} /^VmRSS/{print $2, n}' $s; done 2>/dev/null | sort -rn | head -6 | tr '\n' ' ')"
 echo "$fails failed"
 [ $fails = 0 ]
+
+# IPMI, read only: the host side (BT) and the LAN side (netipmid). In-band
+# IPMI from the host needs a bridge holding /dev/ipmi-bt-host (btbridged);
+# neither the stock 1.0.2 firmware nor the A/B one has one (INFO, not FAIL).
+t "IPMI: /dev/ipmi-bt-host, driver bound to the BT controller" 'test -c /dev/ipmi-bt-host && ls -d /sys/bus/platform/drivers/ipmi-bt-host/*.ibt'
+t "IPMI: phosphor-ipmi-host (ipmid) active" 'systemctl is-active phosphor-ipmi-host'
+t "IPMI: ipmid on D-Bus (Ipmi.Host, Control.Host)" 'busctl list --no-pager | grep -qw xyz.openbmc_project.Ipmi.Host && busctl list --no-pager | grep -qw xyz.openbmc_project.Control.Host'
+t "IPMI: ipmid answers Get Device ID (D-Bus)" 'busctl call xyz.openbmc_project.Ipmi.Host /xyz/openbmc_project/Ipmi xyz.openbmc_project.Ipmi.Server execute yyyaya{sv} 6 0 1 0 0 | grep -q "^(yyyyay) 7 0 1 0 "'
+bt=$(for f in /proc/[0-9]*/fd/*; do case $(readlink $f 2>/dev/null) in /dev/ipmi-bt-host|/dev/ipmi-kcs*) cat ${f%/fd/*}/comm;; esac; done | sort -u | tr '\n' ' ')
+info "IPMI: BT device held by: ${bt:-nobody (the host's in-band IPMI is not served)}"
+t "IPMI: netipmid (phosphor-ipmi-net@eth0) active, UDP 623" 'systemctl is-active phosphor-ipmi-net@eth0 && netstat -lun | grep -q ":623 "'
+info "IPMI: restarts ipmid $(systemctl show -p NRestarts --value phosphor-ipmi-host), netipmid $(systemctl show -p NRestarts --value phosphor-ipmi-net@eth0), bmcweb $(systemctl show -p NRestarts --value bmcweb)"
+echo "$fails failed (with the IPMI checks)"
+[ $fails = 0 ]

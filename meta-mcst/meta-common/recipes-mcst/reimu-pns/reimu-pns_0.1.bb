@@ -1,5 +1,5 @@
 SUMMARY = "Host boot firmware (PNS) information for the web UI"
-DESCRIPTION = "D-Bus service xyz.openbmc_project.Reimu.Pns: FRU, device tree and partition table of the PNS flash"
+DESCRIPTION = "D-Bus service xyz.openbmc_project.Reimu.Pns: FRU, device tree and partition table of the PNS flash; backups, upload, check and write of the PNS flash (with reimu-pns-flash)"
 SECTION = "base"
 PR = "r1"
 LICENSE = "GPLv2"
@@ -20,6 +20,8 @@ SRC_URI = " \
             file://reimu-sensors.c \
             file://reimu-journal.c \
             file://reimu-sensors.h \
+            file://reimu-pnsflash.c \
+            file://reimu-pnsflash.h \
             file://reimu-pns-scan \
             file://reimu-pnsd.service \
             file://xyz.openbmc_project.Reimu.Pns.conf \

@@ -79,5 +79,14 @@ fw_setenv ethaddr $set_eth0addr
 fw_setenv eth1addr $set_eth1addr
 fw_setenv eth1addr $set_eth1addr
 
+# A reboot of the BMC resets the platform on this board: not while it's
+# powered; the new addresses are used from the next boot of the BMC on
+powered=`( . /libexec/gpio-funcs; n=$(gpio2num $GPIO_POWER_IN) && gpioread $n && gpiounexport $n ) 2>/dev/null`
+if [ "$powered" != "0" ]
+then
+    echo -e "\e[1;33m *** Note: MAC addresses are changed; the platform is powered (or its state unknown), so no reboot: they apply at the next BMC boot. *** \e[0m" 1>&2
+    exit 0
+fi
+
 echo -e "\e[1;33m *** Note: MAC addresses are changed, rebooting. *** \e[0m" 1>&2
 reboot

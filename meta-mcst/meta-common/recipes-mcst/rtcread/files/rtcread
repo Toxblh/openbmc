@@ -1,6 +1,7 @@
 #!/bin/bash
 
-TIME_LIMIT=`date +%s -d "Jan 1, 2010"`
+# 2010-01-01 00:00 UTC (busybox date -d does not parse "Jan 1, 2010")
+TIME_LIMIT=1262304000
 
 time_is_correct()
 {
@@ -28,6 +29,13 @@ show_rtc()
 {
     echo "Time from $1 RTC:"
     hwclock -r -f $2
+}
+
+# seconds since the epoch the RTC holds (hwclock -r's text isn't one busybox
+# date -d parses), 0 if unreadable
+read_rtc()
+{
+    cat /sys/class/rtc/${1#/dev/}/since_epoch 2>/dev/null || echo 0
 }
 
 # Should return something like "/dev/rtc2", or empty string on error
@@ -59,29 +67,30 @@ instantiate_rtc()
     fi
 }
 
-# Should return something like "mcp7941x:6f:2", or empty string on error
+# Should return something like "mcp7941x:6f:2", or empty string on error;
+# 1Э8СВ's device trees say mcp7940x (both are rtc-ds1307 devices)
 detect_rtc()
 {
-    /libexec/find_i2c_device-$1 mcp7941x
+    for model in mcp7941x mcp7940x
+    do
+        r=`/libexec/find_i2c_device-$1 $model`
+        [ -n "$r" ] && { echo "$r" | head -1; return; }
+    done
 }
 
 set_time_from()
 {
     echo "Setting system time from $1 RTC..."
-    hwclock --hctosys -f $2
+    hwclock -s -f $2
 }
 
 write_time_to()
 {
     [ -c $2 ] || echo "No device available." 1>&2
     echo "Writing time to $1 RTC..."
-    hwclock --systohc -f $2 || echo "Time write failed." 1>&2
+    hwclock -w -f $2 || echo "Time write failed." 1>&2
 }
 
-read_rtc()
-{
-    date +%s -d "`hwclock -r -f $1`"
-}
 
 # Search device trees for RTC identification string
 RTC_STRING_M=""
@@ -91,11 +100,37 @@ RTC_STRING_P=`detect_rtc platform`
 [ "$FRUID_SOURCE" = "module" ] && RTC_STRING_M=`detect_rtc module`
 [ -z "$RTC_STRING_P" -a -z "$RTC_STRING_M" ] && exit_ok "No onboard/on-module RTC in platform/BMC device tree defined, exitting."
 
+# The onboard RTC is the platform's boot loader's (lintel), on a bus it uses,
+# and powered with the platform: it is read only at a cold boot of the BMC
+# (the PNS flash found: the platform is held in reset until allow_host_boot,
+# ordered after this) of a powered platform. Off, it doesn't answer and the
+# bus stalls trying; after a kexec the platform may be running (and the
+# time survived the kexec anyway)
+if [ "$FRUID_SOURCE" != "module" ]
+then
+    [ -e /dev/mtd/sys ] || exit_ok "Not a cold boot (no PNS flash): the platform may be running, its RTC is left alone."
+    powered=`( . /libexec/gpio-funcs; n=\`gpio2num $GPIO_POWER_IN\` && gpioread $n && gpiounexport $n ) 2>/dev/null`
+    [ "$powered" = "1" ] || exit_ok "The platform is off: its RTC doesn't answer, the time is left as it is."
+fi
+
 # Instantiate and detect corresponding devtmpfs nodes
-RTC_I=/dev/`ls /sys/devices/platform/ahb/ahb:apb/1e781000.rtc/rtc/`
-[ -c $RTC_I ] || "No internal RTC detected, won't save the clock there." 1>&2
+# (the BMC's own: 1e781000.rtc, wherever the kernel puts it in /sys)
+RTC_I=
+for r in /sys/class/rtc/rtc*
+do
+    case "`readlink -f $r/device`" in */1e781000.rtc) RTC_I=/dev/${r##*/};; esac
+done
+[ -c "$RTC_I" ] || echo "No internal RTC detected, won't save the clock there." 1>&2
 RTC_M=""
 RTC_P="`instantiate_rtc $RTC_STRING_P onboard`"
+# then the platform's RTC goes again: nothing may use that bus later on
+# (the kernel's clock sync, a hwclock) while the platform runs
+if [ -n "$RTC_STRING_P" ]
+then
+    rtc_slave=`echo $RTC_STRING_P | cut -d: -f2`
+    rtc_bus=`echo $RTC_STRING_P | cut -d: -f3`
+    trap 'echo 0x$rtc_slave > /sys/bus/i2c/devices/i2c-$rtc_bus/delete_device 2>/dev/null' EXIT
+fi
 [ "$FRUID_SOURCE" = "module" ] && RTC_M="`instantiate_rtc $RTC_STRING_M on-module`"
 
 # Show date, if available
@@ -126,6 +161,7 @@ time_is_set=n
 # Save time to internal RTC
 [ $time_is_set = y ] && write_time_to internal $RTC_I
 
-[ $time_is_set = n ] && exit_err "No time is set. Correct your RTC and system time manually."
+# a warning, not a failed unit: NTP may still set the time
+[ $time_is_set = n ] && { echo "No time is set. Correct your RTC and system time manually." 1>&2; exit 0; }
 
 echo "Current system date:"; date; exit_ok "Succeeded."

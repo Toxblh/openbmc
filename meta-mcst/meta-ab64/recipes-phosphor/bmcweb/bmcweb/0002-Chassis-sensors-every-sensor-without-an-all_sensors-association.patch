@@ -1,0 +1,64 @@
+From: REIMU A/B <reimu@localhost>
+Subject: [PATCH] Chassis sensors: every sensor when the chassis has no all_sensors association
+
+The board's sensors are published by phosphor-hwmon while the platform is
+powered, named after its device tree; no association ties them to the
+inventory board. Chassis/<id>/Sensors, Thermal and Power then answered
+404. With one board, every sensor on D-Bus is its: list those (none while
+the platform is off: an empty collection; Thermal and Power answered 500
+then, the mapper having no /xyz/openbmc_project/sensors at all).
+
+---
+diff --git a/redfish-core/lib/sensors.hpp b/redfish-core/lib/sensors.hpp
+index 35114bfcfb..43a149f426 100644
+--- a/redfish-core/lib/sensors.hpp
++++ b/redfish-core/lib/sensors.hpp
+@@ -238,6 +238,14 @@ void getObjectsWithConnection(
+                         sensorNames](const boost::system::error_code ec,
+                                      const GetSubTreeType& subtree) {
+         BMCWEB_LOG_DEBUG << "getObjectsWithConnection resp_handler enter";
++        if (ec && sensorNames->empty())
++        {
++            // REIMU: no sensor on D-Bus at all (the platform is off): the
++            // mapper has no /xyz/openbmc_project/sensors, nothing to look up
++            callback(boost::container::flat_set<std::string>(),
++                     std::set<std::pair<std::string, std::string>>());
++            return;
++        }
+         if (ec)
+         {
+             messages::internalError(sensorsAsyncResp->res);
+@@ -514,6 +522,33 @@ void getChassis(const std::shared_ptr<SensorsAsyncResp>& sensorsAsyncResp,
+                 }
+                 const std::vector<std::string>* nodeSensorList =
+                     std::get_if<std::vector<std::string>>(&(variantEndpoints));
++                if (e || nodeSensorList == nullptr)
++                {
++                    // REIMU: one board, no all_sensors association (the
++                    // platform's sensors come and go with its power, their
++                    // names from its device tree): every sensor on D-Bus
++                    // belongs to it, none while it is off (an empty list)
++                    crow::connections::systemBus->async_method_call(
++                        [sensorsAsyncResp, callback](
++                            const boost::system::error_code ec2,
++                            const std::vector<std::string>& paths) {
++                            const std::vector<std::string> none;
++                            const std::shared_ptr<
++                                boost::container::flat_set<std::string>>
++                                culled = std::make_shared<
++                                    boost::container::flat_set<std::string>>();
++                            reduceSensorList(sensorsAsyncResp,
++                                             ec2 ? &none : &paths, culled);
++                            callback(culled);
++                        },
++                        "xyz.openbmc_project.ObjectMapper",
++                        "/xyz/openbmc_project/object_mapper",
++                        "xyz.openbmc_project.ObjectMapper", "GetSubTreePaths",
++                        "/xyz/openbmc_project/sensors", 0,
++                        std::array<const char*, 1>{
++                            "xyz.openbmc_project.Sensor.Value"});
++                    return;
++                }
+                 if (nodeSensorList == nullptr)
+                 {
+                     messages::resourceNotFound(

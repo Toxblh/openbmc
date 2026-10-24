@@ -1,0 +1,15 @@
+[Unit]
+Description=PNS flash: read its versions while the platform is still off
+# before allow_host_boot lets the platform out of reset and may power it on;
+# after mcst-fruid, which reads the device tree from the same flash
+After=mcst-fruid.service
+Before=allow_host_boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/reimu-pns-flash version --read --boot
+TimeoutStartSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

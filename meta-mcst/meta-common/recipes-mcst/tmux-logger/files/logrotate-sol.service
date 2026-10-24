@@ -2,6 +2,9 @@
 Description=Rotate SoL log file
 RequiresMountsFor=/var/log
 After=tmux-logger.service
+# the timer fires every minute, and many times at once when the clock jumps
+# (set at boot): no start limit, or it ends failed
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

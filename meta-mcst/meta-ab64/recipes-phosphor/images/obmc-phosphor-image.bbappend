@@ -7,6 +7,16 @@ IMAGE_FEATURES_remove = "obmc-system-mgmt"
 # syslog, debug collector (dreport), devtools
 IMAGE_FEATURES_remove = "obmc-user-mgmt-ldap obmc-telemetry obmc-dbus-monitor \
     obmc-health-monitor obmc-remote-logging-mgmt obmc-debug-collector obmc-devtools"
+# ...but the CA truststore stays (it came with the LDAP feature): Redfish
+# Managers/bmc/Truststore (500 without it) and the CAs bmcweb's TLS client
+# certificate login checks against (/etc/ssl/certs/authority); only a unit
+# of phosphor-certificate-manager, which is in the image for HTTPS anyway
+OBMC_IMAGE_EXTRA_INSTALL_append = " phosphor-nslcd-authority-cert-config"
+# the BMC's daemons restarted after any crash, without the start limit
+# (reimu-restart-policy: which ones and why)
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-restart-policy"
+# the board's FRU ID as the inventory board: Redfish Chassis (+ sensors), IPMI FRU
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-inventory"
 # legacy web UI (reimu-webui replaces it), debug and console tools, NFS
 # automount, locale sources and tools (the compiled en_US/ru_RU.UTF-8 stay:
 # tmux of the serial console needs a UTF-8 locale, shells have ru_RU.UTF-8)
@@ -19,8 +29,17 @@ OBMC_IMAGE_EXTRA_INSTALL_remove = "wget"
 # the dual-chip reliable upgrade: this board has one chip, A/B replaces it
 OBMC_IMAGE_EXTRA_INSTALL_remove = "reimu-bootguard"
 
-# A/B updates (and the way back to the stock firmware)
+# A/B updates (and the way back to the stock firmware); reimu-abd (in
+# reimu-ab) takes the uploads of Redfish UpdateService and the web UI in place
+# of phosphor-bmc-code-mgmt, whose static-layout flow can't write this layout
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-ab"
+IMAGE_FEATURES_remove = "obmc-software"
+# the PNS flash: checked, backed up, verified writes (update-host-flash, web UI)
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-pns-flash"
+# the fan control: the BMC is the only controller of this board's fans; phosphor-fan-control
+# (and its monitor, presence-tach) out: reimu-fand owns them
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-fand"
+IMAGE_FEATURES_remove = "obmc-fan-control"
 
 # ---------------------------------------------------------------- A/B image
 # The partitions (bytes) of reimu-ab64.dtsi; the build fails when a part

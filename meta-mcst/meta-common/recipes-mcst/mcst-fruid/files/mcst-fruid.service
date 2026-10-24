@@ -1,0 +1,14 @@
+[Unit]
+Description=Get FRU ID data and Device Tree from Motherboard
+After=syslog.target
+# allow_host_boot.service (After= this) lets the platform out of reset: the
+# PNS flash and the FRU EEPROM are read before that, see reimu-fru
+
+[Service]
+ExecStart=/usr/libexec/reimu-fru boot
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=basic.target

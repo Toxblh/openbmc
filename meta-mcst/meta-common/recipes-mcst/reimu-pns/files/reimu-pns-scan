@@ -3,10 +3,33 @@
 # /var/lib/reimu-pns/scan.json. The flash is shared with the host through a
 # GPIO-controlled SPI switch, so this is only allowed while the host is off.
 
-. /libexec/gpio-funcs
-
 OUT=${REIMU_PNS_SCAN_OUT:-/var/lib/reimu-pns/scan.json}
 PNSD=${REIMU_PNSD:-/usr/sbin/reimu-pnsd}
+FLASHTOOL=${REIMU_PNS_FLASH:-/usr/sbin/reimu-pns-flash}
+
+# With reimu-pns-flash (A/B image) the flash is switched to the BMC the way
+# its reads and writes do it: the platform checked off under the lock that
+# the power-on path honours (no power-on meanwhile), the switch restored on
+# every exit, kill -9 included.
+if [ -x "$FLASHTOOL" ]
+then
+    mkdir -p ${OUT%/*}
+    if REIMU_PNSD=$PNSD $FLASHTOOL with-chip sh -c '$REIMU_PNSD --parse $PNS_DEV' > $OUT.tmp 2>$OUT.err &&
+       grep -q '^{"ok":true' $OUT.tmp
+    then
+        mv $OUT.tmp $OUT
+        rm -f $OUT.err
+        echo "Флеш ПНС прочитан"
+        exit 0
+    fi
+    # the reason: reimu-pns-flash's message, else the parser's JSON
+    m=$(sed -n 's/^reimu-pns-flash: //p' $OUT.err | tail -1)
+    [ -n "$m" ] && echo "$m" || cat $OUT.tmp $OUT.err
+    rm -f $OUT.tmp $OUT.err
+    exit 1
+fi
+
+. /libexec/gpio-funcs
 
 state=$(busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 \
         xyz.openbmc_project.State.Host CurrentHostState 2>/dev/null | cut -d'"' -f2)
@@ -17,6 +40,9 @@ case "$state" in
 esac
 
 spigpio=$(gpio2num $GPIO_SPI_CONNECT) || { echo "GPIO_SPI_CONNECT не задан для этой платы"; exit 1; }
+# the flash back to the host whatever ends this
+trap 'echo 0 > /sys/class/gpio/gpio$spigpio/value' EXIT
+trap 'exit 1' INT TERM HUP
 gpiowrite $spigpio 1
 sleep 1
 

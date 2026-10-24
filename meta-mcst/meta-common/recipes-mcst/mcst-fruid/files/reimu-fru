@@ -1,0 +1,138 @@
+#!/bin/sh
+# The platform's device tree (from the PNS flash) and FRU ID (from its
+# EEPROM) for the BMC, read with mcst-fruid's get-devtree and get-fruid:
+#
+#   reimu-fru boot   mcst-fruid.service, at BMC boot, before allow_host_boot
+#                    lets the platform out of reset. The device tree from the
+#                    PNS flash if the BMC found it (/dev/mtd/sys: a cold boot,
+#                    the flash switched to the BMC), else the copy kept from
+#                    the last read (a kexec while the platform runs: the flash
+#                    is the host's then). The FRU ID only at a cold boot of a
+#                    powered platform: unpowered, the EEPROM doesn't answer and
+#                    stalls the bus, and a running platform uses that bus.
+#   reimu-fru power  reimu-fru-power.service, pulled in by hwmon-instantiator
+#                    at platform power-on: the FRU ID once the platform has run
+#                    FRU_SETTLE seconds (its boot loader uses the bus early),
+#                    if it wasn't read yet. Stopped at power-off.
+#
+# Only this reads the EEPROM (reimu-pnsd doesn't, see its unit), one reader
+# at a time (a lock), and nothing here writes the flash or the EEPROM. The
+# FRU ID read at boot is the only one set_mac sees (it runs once, at boot);
+# a later one is for the web UI and the others. Always exits 0: what is
+# missing is logged, not a failed unit.
+
+VOL=/var/volatile
+DTB=$VOL/motherboard_devtree.dtb
+DTS=$VOL/motherboard_devtree.dts
+XML=$VOL/motherboard_info.xml
+KEEP=/var/lib/reimu-fru
+# the copy reimu-pnsd shows while the platform is off
+FRU_CACHE=/var/lib/reimu-pns/fru.xml
+LOCK=/run/reimu-fru.lock
+FRU_SETTLE=${FRU_SETTLE:-120}
+FRU_TRIES=${FRU_TRIES:-3}
+
+# keep: a copy on the flash (rwfs) only when it changed
+keep() {
+    mkdir -p ${2%/*} && { cmp -s $1 $2 || { cp $1 $2.tmp && mv $2.tmp $2; }; }
+}
+
+# the platform's power good (GPIO_POWER_IN): 1, 0, or empty when unknown
+powered() {
+    ( . /libexec/gpio-funcs >/dev/null 2>&1 || exit
+      n=$(gpio2num $GPIO_POWER_IN) || exit
+      for i in 1 2 3; do
+          v=$(gpioread $n 2>/dev/null)
+          gpiounexport $n 2>/dev/null
+          case "$v" in 0|1) echo $v; exit;; esac
+          sleep 1
+      done )
+}
+
+devtree() {
+    if [ -e /dev/mtd/sys ]
+    then
+        rm -f $DTB
+        timeout 60 /usr/sbin/get-devtree
+        if [ -s $DTB ] && dtc -I dtb -O dts -o $DTS.tmp $DTB 2>/dev/null
+        then
+            mv $DTS.tmp $DTS
+            keep $DTB $KEEP/motherboard_devtree.dtb
+            echo "Platform device tree read from the PNS flash: $(fdtget $DTB / model 2>/dev/null), $(fdtget $DTB / version 2>/dev/null)"
+            return
+        fi
+        echo "Can't read the platform device tree from the PNS flash"
+    else
+        echo "No PNS flash (switched to the host at a kexec)"
+    fi
+    rm -f $DTB $DTS.tmp
+    if [ -s $KEEP/motherboard_devtree.dtb ] && cp $KEEP/motherboard_devtree.dtb $DTB.tmp &&
+       dtc -I dtb -O dts -o $DTS.tmp $DTB.tmp 2>/dev/null
+    then
+        mv $DTB.tmp $DTB
+        mv $DTS.tmp $DTS
+        echo "Using the platform device tree read before: $(fdtget $DTB / version 2>/dev/null)"
+    else
+        rm -f $DTB.tmp $DTS.tmp
+        echo "No platform device tree: no platform sensors, FRU ID at the default address"
+    fi
+}
+
+# one read of the EEPROM into $XML, one reader at a time; 0 when it's there
+fru() {
+    ( flock 9 && fru_read ) 9>$LOCK
+}
+
+fru_read() {
+    [ -s $XML ] && return 0
+    # at24 doesn't bind to an unpowered chip, and the client it left behind
+    # makes get-fruid's new_device fail: probe it again
+    for d in /sys/bus/i2c/devices/*-0057
+    do
+        [ -e $d/name ] && [ ! -e $d/driver ] || continue
+        case "$(cat $d/name)" in 24c*) echo ${d##*/} > /sys/bus/i2c/drivers/at24/bind 2>/dev/null;; esac
+    done
+    rm -f $XML.tmp
+    if FRU_XML=$XML.tmp timeout 60 /usr/sbin/get-fruid && grep -q '</fruinfo>' $XML.tmp 2>/dev/null
+    then
+        mv $XML.tmp $XML
+        keep $XML $FRU_CACHE
+        echo "FRU ID read: $(sed -n 's#.*<product_name>\(.*\)</product_name>.*#\1#p;s#.*<serial_number>\(.*\)</serial_number>.*#\1#p' $XML | tr '\n' ' ')"
+        return 0
+    fi
+    rm -f $XML.tmp
+    return 1
+}
+
+case "$1" in
+boot)
+    devtree
+    if [ ! -e /dev/mtd/sys ]
+    then
+        echo "FRU ID: left until the platform has run a while (it may run now)"
+    elif [ "$(powered)" = 1 ]
+    then
+        fru || echo "FRU ID EEPROM doesn't answer; tried again at the next platform power-on"
+    else
+        echo "Platform off: FRU ID EEPROM unpowered, read at platform power-on"
+    fi
+    ;;
+power)
+    [ -s $XML ] && exit 0
+    echo "FRU ID read in $FRU_SETTLE s, once the platform has started"
+    sleep $FRU_SETTLE
+    i=0
+    while [ $i -lt $FRU_TRIES ]
+    do
+        fru && exit 0
+        i=$((i + 1))
+        [ $i -lt $FRU_TRIES ] && sleep 60
+    done
+    echo "FRU ID EEPROM doesn't answer; tried again at the next platform power-on"
+    ;;
+*)
+    echo "usage: $0 boot|power" >&2
+    exit 2
+    ;;
+esac
+exit 0

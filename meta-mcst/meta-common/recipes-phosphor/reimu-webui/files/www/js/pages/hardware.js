@@ -2,8 +2,9 @@
 // from reimu-pnsd (D-Bus object /xyz/openbmc_project/reimu/pns).
 
 import { api, h, toast, healthBadge, fmtBytes } from "../api.js";
+import { pnsFlashCard } from "./pns.js";
 
-let root;
+let root, flashCard;
 
 const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
 const hex = (n) => "0x" + Number(n).toString(16).padStart(8, "0");
@@ -184,10 +185,13 @@ async function loadPns() {
     );
   }
 
+  if (flashCard) flashCard.stop();
+  flashCard = pnsFlashCard();
   box.replaceChildren(
     h(
       "div",
       { class: "grid" },
+      flashCard,
       ...fru.map((s) =>
         h(
           "div",
@@ -214,12 +218,14 @@ async function loadPns() {
       "p",
       { class: "note" },
       "Настройки, которые ПНС сохраняет командой «save params to NVRAM», хранятся в NVRAM часов реального времени платформы. ",
-      "Эта микросхема подключена только к хосту, у BMC к ней нет доступа, поэтому из веб-интерфейса доступно только чтение флеша ПНС: FRU, device tree и таблица разделов. ",
+      "Эта микросхема подключена только к хосту, у BMC к ней нет доступа. Флеш ПНС BMC читает и записывает только при выключенной платформе (карточка «Прошивка ПНС»): включение платформы на это время блокируется. ",
       "Изменить загрузку можно через консоль платформы (вкладка «Консоль») в меню ПНС или в /boot/boot.conf.",
     ),
   );
 }
 
 export function unmount() {
+  if (flashCard) flashCard.stop();
+  flashCard = null;
   root = null;
 }

@@ -1,0 +1,49 @@
+From e3a4badcdc7ea0bf847f5b6ccaf5be0c2b69b491 Mon Sep 17 00:00:00 2001
+From: reimu <reimu@localhost>
+Date: Fri, 23 Oct 2026 23:59:52 +0000
+Subject: [PATCH] reimu_readfile: without a size, read errors and the end of
+ the text
+
+With p_size NULL, fread() of one 4096-byte item never succeeds and its
+result was ignored: a read error (e.g. -EIO from a hwmon attribute)
+returned 0 with an uninitialised buffer, and the text was never
+NUL-terminated (callers run strtol() and strstr() on it). Now up to 4095
+bytes, NUL-terminated, and a read error returns 6.
+
+Upstream-Status: Pending
+---
+ reimu.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/reimu.c b/reimu.c
+index eb4cd20..57a0bd7 100644
+--- a/reimu.c
++++ b/reimu.c
+@@ -116,9 +116,21 @@ int reimu_readfile(const char *name, char **p_buf, size_t *p_size)
+ 
+     if ((*p_buf = malloc(size)) == NULL) { fclose(f); return 5; }
+ 
+-    if (p_size != NULL) *p_size = size;
+-    size = fread(*p_buf, size, 1, f);
+-    if((p_size != NULL) && (size != 1)) { free(*p_buf); fclose(f); return 6; }
++    if (p_size != NULL)
++    {
++        *p_size = size;
++        size = fread(*p_buf, size, 1, f);
++        if(size != 1) { free(*p_buf); fclose(f); return 6; }
++    }
++    else
++    {
++        /* text up to 4095 bytes, NUL-terminated; a read error (a sysfs
++         * attribute of a device that doesn't answer) is an error, not an
++         * uninitialised buffer */
++        size = fread(*p_buf, 1, 4095, f);
++        if(ferror(f)) { free(*p_buf); fclose(f); return 6; }
++        (*p_buf)[size] = 0;
++    }
+     if(fclose(f)) { free(*p_buf); return 7; }
+ 
+     return 0;
+-- 
+2.25.1
+

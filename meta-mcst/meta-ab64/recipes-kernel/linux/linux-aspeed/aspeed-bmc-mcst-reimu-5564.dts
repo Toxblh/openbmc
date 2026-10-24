@@ -196,11 +196,18 @@
 
 &i2c0 { status = "okay"; };
 &i2c1 { status = "okay"; };
-&i2c2 { status = "okay"; };
-&i2c3 { status = "okay"; };
+/* i2c2, i2c3, i2c5, i2c6: the platform's buses, which its own masters (the
+ * host's boot loader and OS: RTC, FRU ID; the E8C2) use too. Without
+ * multi-master the controller ignores arbitration and the driver "recovers"
+ * a busy bus before each transfer (clocks SCL, sends STOP), right through
+ * the other master's transfer. With it: hardware arbitration, a lost one is
+ * -EAGAIN for that transfer, recovery only after a timeout on a bus that
+ * stays busy */
+&i2c2 { status = "okay"; multi-master; };
+&i2c3 { status = "okay"; multi-master; };
 &i2c4 { status = "okay"; };
-&i2c5 { status = "okay"; };
-&i2c6 { status = "okay"; };
+&i2c5 { status = "okay"; multi-master; };
+&i2c6 { status = "okay"; multi-master; };
 &i2c7 { status = "okay"; };
 &i2c8 { status = "okay"; };
 &i2c9 { status = "okay"; };

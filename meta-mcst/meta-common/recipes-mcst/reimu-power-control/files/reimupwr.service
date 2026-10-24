@@ -5,6 +5,10 @@ After=network.target network-online.target remote-fs.target
 [Service]
 Type=simple
 ExecStart=/sbin/reimupwr
+# it gives up when GPIO_POWER_IN can't be read (another user of the line):
+# the platform's power state, sensors and FRU ID depend on it
+Restart=always
+RestartSec=2
 StandardOutput=journal
 StandardError=journal
 

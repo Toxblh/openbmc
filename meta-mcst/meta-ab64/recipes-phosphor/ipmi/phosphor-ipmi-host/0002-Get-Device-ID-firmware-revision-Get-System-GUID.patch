@@ -1,0 +1,61 @@
+From: REIMU A/B <reimu@localhost>
+Subject: [PATCH] Get Device ID firmware revision, Get System GUID on REIMU
+
+- The BMC version is "reimu-1.0.2[-N-gHASH[-dirty]]"; convertVersion()
+  only skipped a leading "v" and std::stoi("reimu-1", 16) threw: ipmitool
+  mc info showed Firmware Revision 0.00 (stock 1.0.2 as well). Read it as
+  1.02.
+- Get System GUID (ipmitool mc guid) wants an inventory object with
+  Inventory.Item.Bmc and Common.UUID, which this board doesn't have:
+  "Unspecified error". Answer the GUID derived from /etc/machine-id, as
+  Get Device GUID does (persistent: machine-id is kept with the settings).
+
+---
+diff --git a/apphandler.cpp b/apphandler.cpp
+index 90818a94..ff901c00 100644
+--- a/apphandler.cpp
++++ b/apphandler.cpp
+@@ -11,6 +11,7 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <regex>
+ #include <app/channel.hpp>
+ #include <app/watchdog.hpp>
+ #include <apphandler.hpp>
+@@ -486,6 +487,17 @@ int convertVersion(std::string s, Revision& rev)
+     std::string token;
+     uint16_t commits;
+ 
++    // REIMU: "reimu-1.0.2[-N-gHASH[-dirty]]" -> "v1.02[-N-gHASH...]", read
++    // below as firmware revision 1.02 (stoi threw on "reimu-1": 0.00)
++    static const std::regex reimuVersion(
++        "^reimu-([0-9]+)\\.([0-9])\\.([0-9])(-.*)?$");
++    std::smatch m;
++    if (std::regex_match(s, m, reimuVersion))
++    {
++        s = "v" + m[1].str() + "." + m[2].str() + m[3].str() +
++            (m[4].matched ? m[4].str() : std::string("-0"));
++    }
++
+     auto location = s.find_first_of('v');
+     if (location != std::string::npos)
+     {
+@@ -806,12 +818,12 @@ auto ipmiAppGetSystemGuid() -> ipmi::RspType<std::array<uint8_t, 16>>
+             ipmi::getDbusProperty(*busPtr, objectInfo.second, objectInfo.first,
+                                   uuidInterface, uuidProperty);
+     }
+-    catch (const InternalFailure& e)
++    catch (const std::exception& e)
+     {
+-        log<level::ERR>("Failed in reading BMC UUID property",
+-                        entry("INTERFACE=%s", uuidInterface),
+-                        entry("PROPERTY=%s", uuidProperty));
+-        return ipmi::responseUnspecifiedError();
++        // REIMU: no inventory object with a UUID: the GUID derived from
++        // /etc/machine-id (kept with the settings), as Get Device GUID
++        // (ipmitool mc guid failed: "Unspecified error")
++        return ipmiAppGetDeviceGuid();
+     }
+     std::array<uint8_t, 16> uuid;
+     std::string rfc4122Uuid = std::get<std::string>(propValue);

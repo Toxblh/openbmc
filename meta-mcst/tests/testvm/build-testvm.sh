@@ -78,13 +78,13 @@ fi
 [ -d jsnbd ] || git clone -q https://github.com/openbmc/jsnbd
 git -C jsnbd checkout -q -f "$JSNBD_REV"
 for p in "$MCST"/meta-common/recipes-connectivity/jsnbd/files/*.patch; do patch -s -d jsnbd -p1 < "$p"; done
-cp "$MCST"/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.[ch] "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-journal.c .
+cp "$MCST"/meta-common/recipes-mcst/reimu-serial/files/reimu-serial.c "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsd.c "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-sensors.[ch] "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-journal.c "$MCST"/meta-common/recipes-mcst/reimu-pns/files/reimu-pnsflash.[ch] .
 docker run --rm --network host -e https_proxy -e HTTPS_PROXY -v "$W/src:/w" -w /w reimu-testvm-build bash -c '
   set -e
   (cd bmcweb && { [ -d build ] || meson setup build -Dtests=disabled -Db_lto=false --buildtype=minsize >/dev/null; } && ninja -C build >/dev/null && strip -o build/bmcweb.stripped build/bmcweb)
   (cd jsnbd && autoreconf -fi >/dev/null 2>&1 && ./configure -q --prefix=/usr --sysconfdir=/etc --localstatedir=/var && make -s)
   gcc -O2 -Wall -o reimu-serial reimu-serial.c
-  gcc -O2 -Wall -o reimu-pnsd reimu-pnsd.c reimu-sensors.c reimu-journal.c -lsystemd -lm'
+  gcc -O2 -Wall -o reimu-pnsd reimu-pnsd.c reimu-sensors.c reimu-journal.c reimu-pnsflash.c -lsystemd -lm'
 
 echo "== 4. install REIMU components"
 install -m755 bmcweb/build/bmcweb.stripped "$R/usr/bin/bmcweb"

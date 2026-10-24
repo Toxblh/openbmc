@@ -5,6 +5,9 @@ After=mcst-fruid.service
 [Service]
 Type=dbus
 BusName=xyz.openbmc_project.Reimu.Pns
+# the FRU ID EEPROM is read by reimu-fru (mcst-fruid.service,
+# reimu-fru-power.service) only: no EEPROM here, its XML and cached copy
+Environment=REIMU_FRU_EEPROM=/run/reimu-fru/no-eeprom-here
 ExecStart=/usr/sbin/reimu-pnsd
 Restart=always
 

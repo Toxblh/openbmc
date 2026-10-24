@@ -2,11 +2,26 @@
 Description=Sensor instantiator for phosphor-hwmon
 After=systemd-udevd.service
 After=mcst-fruid.service
+# started at platform power-on, stopped at power-off (reimupwr); the FRU ID
+# is read then too, if it wasn't at boot
+Wants=reimu-fru-power.service
 
 [Service]
+# the platform's devices are left alone while it powers up; a power-off
+# meanwhile stops it there ("-": that's no failure)
+Environment=SETTLE=30
+ExecStartPre=-/bin/sleep ${SETTLE}
 ExecStartPre=/bin/mkdir -p /var/volatile/hwmon
-ExecStartPre=/bin/ln -sf /var/volatile/hwmon /etc/default/obmc/hwmon
+ExecStartPre=/bin/ln -sfn /var/volatile/hwmon /etc/default/obmc/hwmon
 ExecStart=/sbin/hwmon-instantiator start
-ExecStop=/sbin/hwmon-instantiator stop
+# killed by a power-off half-way: no failure either (ExecStopPost cleans up)
+SuccessExitStatus=SIGTERM
+# the cleanup is ExecStopPost, not ExecStop: that runs only after a start
+# that finished, this one also after one a power-off killed half-way (its
+# devices and the phosphor-hwmon instances it had started go too)
+ExecStopPost=-/sbin/hwmon-instantiator stop
+# a phosphor-hwmon that failed as its device went away
+ExecStopPost=-/bin/systemctl reset-failed xyz.openbmc_project.Hwmon@*.service
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=180

@@ -1,0 +1,10 @@
+[Unit]
+Description=Board FRU ID into the inventory when reimu-fru has read it
+
+[Path]
+PathChanged=/var/volatile/motherboard_info.xml
+PathChanged=/var/lib/reimu-pns/fru.xml
+Unit=reimu-inventory.service
+
+[Install]
+WantedBy=multi-user.target

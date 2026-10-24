@@ -1,0 +1,14 @@
+[Unit]
+Description=Get FRU ID data from Motherboard once it is powered
+After=mcst-fruid.service
+# pulled in by hwmon-instantiator.service (started at platform power-on,
+# stopped at power-off by reimupwr), stopped with it
+PartOf=hwmon-instantiator.service
+
+[Service]
+Type=oneshot
+Environment=FRU_SETTLE=120
+ExecStart=/usr/libexec/reimu-fru power
+TimeoutStartSec=15min
+# stopped at power-off while it waits: not a failure
+SuccessExitStatus=SIGTERM

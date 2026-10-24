@@ -464,17 +464,33 @@ static void pcs(struct out *o, int bus, int node)
     for (int k = 0; k < 8; k++)
     {
         int addr = 0x20 + 0x10 * node + k;
-        int fd = i2c_open(bus, addr);
-        if (fd < 0) return;
-        uint8_t b[2];
-        ssize_t n = read(fd, b, 2);
-        close(fd);
-        if (n != 2)
+        unsigned v;
+        char hw[128];
+        long mc;
+        if (!hwmon_dir(bus, addr, hw, sizeof(hw)))
         {
-            if (k == 0) return; /* no such CPU */
-            continue;
+            /* l_pcs_i2c (hwmon-instantiator): its reading, not a second one */
+            if (read_long(hw, "temp1_input", &mc))
+            {
+                if (k == 0) return;
+                continue;
+            }
+            v = mc / 125;
         }
-        unsigned v = (b[0] << 8) | b[1];
+        else
+        {
+            int fd = i2c_open(bus, addr);
+            if (fd < 0) return;
+            uint8_t b[2];
+            ssize_t n = read(fd, b, 2);
+            close(fd);
+            if (n != 2)
+            {
+                if (k == 0) return; /* no such CPU */
+                continue;
+            }
+            v = (b[0] << 8) | b[1];
+        }
         if (!v) continue;
         char name[64], src[24];
         if (k < (int)(sizeof(pcs_names) / sizeof(pcs_names[0]))) snprintf(name, sizeof(name), "%s", pcs_names[k]);

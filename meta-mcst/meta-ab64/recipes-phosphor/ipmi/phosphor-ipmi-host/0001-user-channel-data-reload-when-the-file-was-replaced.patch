@@ -1,0 +1,52 @@
+From: REIMU A/B <reimu@localhost>
+Subject: [PATCH] user/channel data: reload when the file was replaced
+
+ipmid writes /var/lib/ipmi/ipmi_user.json to a temporary file and renames
+it; netipmid (and ipmid) reload their copy when the file's mtime changed.
+jffs2 keeps seconds only: a reader that loaded the file in the same second
+as the next write kept the old table. In QEMU on the A/B firmware a user
+configured with ipmitool (set name, channel setaccess, enable, password in
+a row) was then refused over LAN with "invalid role" until netipmid was
+restarted. Tell the versions apart by the inode as well.
+
+---
+diff --git a/user_channel/channel_mgmt.cpp b/user_channel/channel_mgmt.cpp
+index b8e0b85b..08b36945 100644
+--- a/user_channel/channel_mgmt.cpp
++++ b/user_channel/channel_mgmt.cpp
+@@ -687,7 +687,14 @@ std::time_t ChannelConfig::getUpdatedFileTime(const std::string& fileName)
+         log<level::DEBUG>("Error in getting last updated time stamp");
+         return -EIO;
+     }
+-    return fileStat.st_mtime;
++    // The file is replaced (rename) on every write, and its mtime has 1 s
++    // resolution (jffs2): a process that read it in the same second as
++    // another one rewrote it kept stale data (netipmid refused a user
++    // configured a moment before: "invalid role"). The inode tells them
++    // apart. Only compared for equality.
++    return static_cast<std::time_t>(
++        static_cast<uint32_t>(fileStat.st_mtime) ^
++        (static_cast<uint32_t>(fileStat.st_ino) * 2654435761u));
+ }
+ 
+ EChannelAccessMode
+diff --git a/user_channel/user_mgmt.cpp b/user_channel/user_mgmt.cpp
+index 04eb2f95..1fa66186 100644
+--- a/user_channel/user_mgmt.cpp
++++ b/user_channel/user_mgmt.cpp
+@@ -1525,7 +1525,14 @@ std::time_t UserAccess::getUpdatedFileTime()
+         log<level::DEBUG>("Error in getting last updated time stamp");
+         return -EIO;
+     }
+-    return fileStat.st_mtime;
++    // The file is replaced (rename) on every write, and its mtime has 1 s
++    // resolution (jffs2): a process that read it in the same second as
++    // another one rewrote it kept stale data (netipmid refused a user
++    // configured a moment before: "invalid role"). The inode tells them
++    // apart. Only compared for equality.
++    return static_cast<std::time_t>(
++        static_cast<uint32_t>(fileStat.st_mtime) ^
++        (static_cast<uint32_t>(fileStat.st_ino) * 2654435761u));
+ }
+ 
+ void UserAccess::getUserProperties(const DbusUserObjProperties& properties,

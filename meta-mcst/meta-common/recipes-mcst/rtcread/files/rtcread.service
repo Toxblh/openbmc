@@ -1,11 +1,15 @@
 [Unit]
 Description=Read RTC from motherboard
 After=mcst-fruid.service
+# the platform's RTC is on a bus its boot loader uses: read while the
+# platform is still held in reset (allow_host_boot lets it out)
+Before=allow_host_boot.service time-set.target
 
 [Service]
 Type=oneshot
 ExecStart=/libexec/rtcread
 RemainAfterExit=yes
+TimeoutStartSec=60
 
 [Install]
-WantedBy=time-set.target
+WantedBy=basic.target time-set.target

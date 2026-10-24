@@ -84,17 +84,25 @@ int main(void)
         int pgood = poll_pgood();
         if ((pgood != old_pgood) || !success)
         {
-            reimu_message(stdout, "(%s) Power good state changed from %d to %d, changing power state\n", reimu_gettime(), old_pgood, pgood);
+            int changed = pgood != old_pgood;
+            if (changed) reimu_message(stdout, "(%s) Power good state changed from %d to %d, changing power state\n", reimu_gettime(), old_pgood, pgood);
             if (dbus_available())
             {
                 set_power_state_on_dbus(pgood);
             }
             else
             {
-                success = 1;
+                /* State.Host not up yet (BMC boot with the platform on):
+                 * again in a second, or the host state and the sensors
+                 * (hwmon-instantiator) would wait for the next change */
+                if (changed) reimu_message(stdout, "(%s) Host state service not available yet, retrying\n", reimu_gettime());
+                success = 0;
             }
-            reimu_message(stdout, "(%s) Deferring power state being saved for %d seconds\n", reimu_gettime(), s_update_delay);
-            update_delay = s_update_delay;
+            if (changed)
+            {
+                reimu_message(stdout, "(%s) Deferring power state being saved for %d seconds\n", reimu_gettime(), s_update_delay);
+                update_delay = s_update_delay;
+            }
             old_pgood = pgood;
         }
         if (update_delay == 0)

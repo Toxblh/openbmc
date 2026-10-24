@@ -1,0 +1,44 @@
+#!/bin/sh
+# reimu-inventory: the board's FRU ID (board info area, as reimu-fru read it
+# from the EEPROM into XML) as the inventory object
+# /xyz/openbmc_project/inventory/system/chassis/motherboard (Item.Board):
+# Redfish Chassis "motherboard" (its sensors: every sensor on D-Bus) and the
+# IPMI FRU 0 (fru print) through phosphor-ipmi-host's FRU map.
+#
+# Reads only files, never the EEPROM: /var/volatile/motherboard_info.xml
+# (this boot's read), else /var/lib/reimu-pns/fru.xml (the last read, kept
+# on the rwfs: the platform may be off and its EEPROM unpowered). Run at
+# boot and whenever one of them changes (reimu-inventory.path).
+# phosphor-inventory-manager keeps the object across reboots.
+X=/var/volatile/motherboard_info.xml
+[ -s $X ] || X=/var/lib/reimu-pns/fru.xml
+if [ ! -s $X ] || ! grep -q '</fruinfo>' $X
+then
+    echo "No FRU ID read yet: inventory unchanged"
+    exit 0
+fi
+
+# a tag of the board info area, XML entities undone
+board() {
+    sed -n '/<board_info_area>/,/<\/board_info_area>/s#.*<'"$1"'>\(.*\)</'"$1"'>.*#\1#p' $X | head -n1 |
+        sed 's/&lt;/</g;s/&gt;/>/g;s/&quot;/"/g;s/&apos;/'"'"'/g;s/&amp;/\&/g'
+}
+mfr=$(board manufacturer)
+prod=$(board product_name)
+sn=$(board serial_number)
+pn=$(board part_number)
+ver=$(board fru_file_id)
+ts=$(sed -n 's#.*<mfg_date_time type="timestamp">\([0-9]*\)<.*#\1#p' $X | head -n1)
+# phosphor-ipmi-host reads "%Y-%m-%d - %H:%M:%S" back into the FRU's date
+bd=
+[ -n "$ts" ] && bd=$(date -u -d @$ts '+%Y-%m-%d - %H:%M:%S' 2>/dev/null)
+
+busctl call xyz.openbmc_project.Inventory.Manager /xyz/openbmc_project/inventory \
+    xyz.openbmc_project.Inventory.Manager Notify 'a{oa{sa{sv}}}' 1 \
+    /system/chassis/motherboard 4 \
+    xyz.openbmc_project.Inventory.Item 2 PrettyName s "$prod" Present b true \
+    xyz.openbmc_project.Inventory.Item.Board 0 \
+    xyz.openbmc_project.Inventory.Decorator.Asset 5 Manufacturer s "$mfr" Model s "$prod" \
+        PartNumber s "$pn" SerialNumber s "$sn" BuildDate s "$bd" \
+    xyz.openbmc_project.Inventory.Decorator.Revision 1 Version s "$ver" || exit 1
+echo "Inventory: $mfr $prod, serial $sn, part $pn, made $bd (from $X)"
