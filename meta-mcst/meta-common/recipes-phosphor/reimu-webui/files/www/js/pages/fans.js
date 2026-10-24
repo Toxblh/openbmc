@@ -14,9 +14,11 @@ export async function fanState() {
 }
 
 const MODES = { auto: "Авто", manual: "Ручной", full: "100 %" };
-const INPUTS = { pcs: "процессор", vrm: "VRM", iohub: "IOHUB" };
+const INPUTS = { pcs: "процессор", vrm: "VRM", iohub: "IOHUB", gpu: "GPU хоста" };
 const num = (v, d = 0) => (v === undefined || v === null ? "—" : Number(v).toFixed(d));
-const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+const p2 = (n) => String(n).padStart(2, "0");
+const mmss = (s) => (s >= 3600 ? `${Math.floor(s / 3600)}:${p2(Math.floor(s / 60) % 60)}:${p2(s % 60)}` : `${Math.floor(s / 60)}:${p2(s % 60)}`);
+const UNTIL_OFF = 4294967295;
 
 async function call(method, args, refresh) {
   try {
@@ -25,13 +27,71 @@ async function call(method, args, refresh) {
     toast(`Вентиляторы: ${e.message || e}`, "err");
   }
   if (refresh) refresh();
+  updateChip();
+}
+
+// Турбо: every fan at full scale for a while, to dump heat fast
+function turboRow(st, refresh) {
+  if (st.turbo)
+    return h(
+      "div",
+      { class: "row section", id: "fan-turbo" },
+      h("span", { class: "badge warn" }, `Турбо: осталось ${mmss(st.turbo_left)}`),
+      h("span", { class: "muted small" }, "все вентиляторы на полную"),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => call("SetTurbo", [0], refresh) }, "Выключить турбо"),
+    );
+  return h(
+    "div",
+    { class: "row section", id: "fan-turbo" },
+    h("b", {}, "Турбо"),
+    h("span", { class: "muted small" }, "все вентиляторы на полную, чтобы быстро сбросить тепло:"),
+    [15, 30, 60].map((m) => h("button", { class: "btn small", onclick: () => call("SetTurbo", [m], refresh) }, m < 60 ? `${m} мин` : "1 ч")),
+    h("button", { class: "btn small", onclick: () => call("SetTurbo", [UNTIL_OFF], refresh) }, `до выключения (≤ ${Math.round((st.turbo_max_min || 720) / 60)} ч)`),
+  );
+}
+
+// The quick toggle in the top bar, on every page: off -> 30 min, on -> off
+let chip = null,
+  chipTimer = null;
+
+export async function updateChip(st) {
+  if (!chip) return;
+  if (st === undefined) st = await fanState();
+  if (!st) {
+    chip.classList.add("hidden");
+    return;
+  }
+  chip.classList.remove("hidden");
+  chip.classList.toggle("active", !!st.turbo);
+  chip.dataset.on = st.turbo ? "1" : "";
+  chip.textContent = st.turbo ? `Турбо ${Math.ceil(st.turbo_left / 60)} мин` : "Турбо";
+  chip.title = st.turbo ? `Турбо: все вентиляторы на полную ещё ${mmss(st.turbo_left)}; нажать — выключить` : "Турбо: все вентиляторы на полную на 30 мин";
+}
+
+export function startTurboChip() {
+  if (!chip) {
+    const bar = document.querySelector(".topbar-right");
+    if (!bar) return;
+    chip = h("button", { class: "btn small turbo-chip hidden", id: "turbo-chip" }, "Турбо");
+    chip.addEventListener("click", () => call("SetTurbo", [chip.dataset.on ? 0 : 30], () => document.dispatchEvent(new CustomEvent("reimu-fans"))));
+    bar.prepend(chip);
+  }
+  updateChip();
+  clearInterval(chipTimer);
+  chipTimer = setInterval(() => updateChip(), 10000);
+}
+
+export function stopTurboChip() {
+  clearInterval(chipTimer);
 }
 
 function zoneBlock(st, z, refresh) {
   const run = st.host === "on" || st.host === "unknown";
   const fan = z.fans.find((f) => f.rpm !== undefined);
   const inputs = z.inputs
-    .filter((i) => i.used)
+    // the host's GPU only while reimu-hostlink reports it
+    .filter((i) => i.used && !(i.id === "gpu" && i.temp === null))
     .map((i) => `${INPUTS[i.id] || i.id} ${num(i.temp, 1)} °C → ${num(i.demand)} %`)
     .join(" · ");
   const duty = h("input", { type: "number", min: st.floor, max: 100, step: 1, value: Math.round(z.manual_duty !== null ? z.manual_duty : z.duty !== null ? z.duty : 100), size: 4 });
@@ -89,6 +149,7 @@ function card(st, refresh) {
       h("span", { class: "muted small" }, `минимум ${st.floor} % · ручной режим — до ${Math.round(st.manual_timeout / 60)} мин`),
       st.alarm ? h("button", { class: "btn small", onclick: () => call("ClearAlarms", [], refresh) }, "Сбросить аварию") : null,
     ),
+    turboRow(st, refresh),
     notes,
     st.zones.map((z) => zoneBlock(st, z, refresh)),
   );
@@ -97,6 +158,7 @@ function card(st, refresh) {
 // Re-rendered on every refresh, except while its duty field is being edited
 export function renderFans(el, st, refresh) {
   if (!el) return;
+  updateChip(st || null);
   const a = document.activeElement;
   if (a && a.tagName === "INPUT" && el.contains(a)) return;
   el.replaceChildren(card(st, refresh));

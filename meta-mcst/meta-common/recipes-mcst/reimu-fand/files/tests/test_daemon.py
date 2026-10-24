@@ -164,6 +164,37 @@ try:
     p.send_signal(signal.SIGTERM)
     p.wait(5)
 
+    # Турбо kept in the run dir across a daemon restart (CLOCK_MONOTONIC ms,
+    # the clock of time.monotonic()); expired: back to the curves, file gone
+    conf("SETTLE_SEC=0\n")
+    os.makedirs(D + "/run", exist_ok=True)
+    open(D + "/run/host-on", "w").write("0\n")
+    open(D + "/run/turbo", "w").write("%d\n" % int((time.monotonic() + 6) * 1000))
+    p = start()
+    time.sleep(4)
+    check(full(), "turbo from the run dir: full scale after the start (4 s)")
+    time.sleep(5)
+    check(not full() and not os.path.exists(D + "/run/turbo"), "turbo expired: back to the curves, run file removed")
+    p.send_signal(signal.SIGTERM)
+    p.wait(5)
+
+    # the host's GPU temperature (reimu-hostlink's file): an optional input
+    # of the board zone
+    conf("SETTLE_SEC=0\nGPU_TEMP_FILE=%s/gpu-temp\n" % D)
+    p = start()
+    time.sleep(3)
+    check(reg(2, 0x2c, 0x30) < 0xff and not full(), "no GPU file: quiet")
+    open(D + "/gpu-temp", "w").write("96000\n")
+    time.sleep(8)  # up at SLEW_UP 10 %/s
+    check(reg(2, 0x2c, 0x30) == 0xff and reg(2, 0x2e, 0x70) == 0xff and reg(2, 0x4c, 0x4c) == 46 and reg(6, 0x4c, 0x4c) < 46,
+          "GPU 96 °C: the board zone's fans full scale, the CPU fan not")
+    os.unlink(D + "/gpu-temp")
+    time.sleep(2)
+    check(reg(2, 0x2c, 0x30) < 0xff and open(D + "/leds/platform:red:fanfail/trigger").read().strip() == "none",
+          "GPU file gone: back to the curves, no alarm")
+    p.send_signal(signal.SIGTERM)
+    p.wait(5)
+
     # --observe: reads, computes, prints, writes nothing (no fan, no LED)
     conf("SETTLE_SEC=0\n")
     for a in (0x2c, 0x2e):

@@ -1,0 +1,5 @@
+#!/bin/sh
+# vssh WORKDIR [COMMAND]: ssh into the HID test VM
+W=$1; shift
+exec ssh -q -i "$W/id_hidvm" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o SetEnv=LC_ALL=C \
+    -p ${HIDVM_SSH:-2522} root@127.0.0.1 "export LC_ALL=C; $*"

@@ -35,4 +35,29 @@ then
     fi
     echo "Powering on the platform"
     /usr/bin/server_pwr_on
+    rc=$?
+    # 53: the PNS flash is being read or written (reimu-pns-flash holds its
+    # lock): said loudly (<3>: an error in the journal), and once the lock
+    # is free (at most an hour) once more, in the background (the boot goes
+    # on; the unit stays active meanwhile)
+    if [ $rc = 53 ]
+    then
+        echo "<3>Power on REFUSED: the PNS flash is being read or written; once more when it is done"
+        (
+            i=0
+            until flock -n /run/reimu-pns/lock true
+            do
+                i=$((i + 1))
+                [ $i -gt 1800 ] && { echo "<3>The PNS flash still busy after an hour: the platform stays off"; exit 1; }
+                sleep 2
+            done
+            echo "Powering on the platform (the PNS flash is free now)"
+            /usr/bin/server_pwr_on
+            rc=$?
+            [ $rc = 0 ] || echo "<3>Power on failed again: server_pwr_on returned $rc, the platform stays off"
+        ) &
+    elif [ $rc != 0 ]
+    then
+        echo "<3>Power on failed: server_pwr_on returned $rc"
+    fi
 fi

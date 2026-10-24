@@ -1,0 +1,12 @@
+[Unit]
+Description=REIMU KVM: the virtual hub reset once when the powered host lost the keyboard/mouse
+After=reimu-kvm.service start-ipkvm.service
+ConditionPathExists=/sys/bus/platform/drivers/aspeed_vhub
+
+[Service]
+ExecStart=/usr/sbin/reimu-hid-watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

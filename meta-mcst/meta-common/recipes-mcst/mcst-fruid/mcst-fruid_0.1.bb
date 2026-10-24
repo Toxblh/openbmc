@@ -19,7 +19,8 @@ SRC_URI = "git://github.com/makise-homura/mcst-fruid.git;protocol=https \
            file://mcst-fruid.service \
            file://reimu-fru-power.service \
           "
-SRCREV = "${AUTOREV}"
+# pinned: a build must not change by itself
+SRCREV = "f378aaa09c5becd4446687efec6108f2a60c11c1"
 
 S = "${WORKDIR}/git"
 

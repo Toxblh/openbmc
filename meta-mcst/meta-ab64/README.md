@@ -45,6 +45,54 @@ device tree can make it read-only too).
 `reimu-flash` writes the erase blocks that differ, reads the whole range back,
 rewrites on a mismatch (3-5 tries); it refuses to write U-Boot.
 
+Which slot `install` writes (`/run/initramfs/reimu-ab`: `kernel=a|b
+rofs=a|b|ram state=ok|fallback|ram`): no slot given, the one not running
+(`state=ok`, `ram`), or, on a fallback (rofs-K damaged, kernel K running on
+the other slot's rofs), slot K itself: the other slot's rofs is the only
+intact one. It never writes a slot whose kernel or rofs is the only intact
+one (each part checked against the digests in its slot: U-Boot boots any
+intact kernel, the initramfs any intact rofs, so the board stays bootable
+while the other slot's parts are intact); `both` writes the damaged slot
+first (B when neither or both are intact). While a slot is written
+`reimu_slot` points at the other one; it is switched to the written slot only
+once its digests match. `reimu-ab boot` (reimu-ab.service) leaves the
+environment alone when the system was started by kexec (`reimu.ram`,
+`reimu.test`): `reimu-ab ram` doesn't confirm or cancel a pending install.
+
+### restore-stock: the order of the writes
+
+The stock layout over the A/B one: the stock kernel (0x100000-0x680000) is
+in kernel-a; the stock rofs (0x680000-0x3000000) covers the end of kernel-a,
+rofs-a, kernel-b and the start of rofs-b; the stock rwfs (0x3000000-0x4000000)
+the end of rofs-b (its digests) and the A/B rwfs. The A/B bootcmd falls
+through from a slot that is gone to kernel-a, i.e. to the stock kernel once
+that is written, but it arms WDT1, which nothing of the stock firmware
+feeds: the stock environment goes in as soon as the stock kernel and rofs
+are complete, one 64 KiB copy at a time (one copy is always valid), the
+stock rwfs (over the A/B rwfs, which a running A/B slot would mount) last,
+after erasing all of its place, 0x3000000-0x4000000 (a stock jffs2 cut
+short mixed with the A/B one left the stock firmware without ssh; the end
+of rofs-b in front of an erased A/B rwfs, the stock initramfs can't mount
+at all: a panic).
+What a power cut leaves (`test_ab_qemu.py restorecut`, each state booted):
+
+| slot B intact (the usual case) | a power cut here boots |
+|-|-|
+| `reimu_slot=b`, the stock kernel, the stock rofs to 0x1c00000 | A/B slot B |
+| the stock rofs from 0x1c00000 (20 MiB: kernel-b, rofs-b) | **nothing** (the window: kernel-b is gone, U-Boot falls through to the stock kernel, which panics on the half-written rofs; a reset loop) |
+| environment copy 1 | the stock firmware under the A/B environment: WDT1 resets it every 300 s |
+| environment copy 2 | the stock firmware (U-Boot takes the valid stock copy) |
+| 0x3000000-0x4000000 erased, the stock rwfs | the stock firmware (empty or cut-short settings) |
+
+With only slot A intact: the stock rofs from 0x1c00000 (slot A boots), then
+the kernel and the rofs to 0x1c00000 (the window, 27 MiB), the environment,
+the rwfs. With neither intact there is no fallback at all. The window can't
+be closed: the stock rofs alone covers kernel-b, rofs-a and the end of
+kernel-a, so no A/B slot survives its last part, and the stock firmware
+isn't complete before it. A power cut in the window leaves U-Boot with no
+bootable kernel + rofs (on the board every reset also resets the platform);
+the flash then has to be written from outside (or from U-Boot's console).
+
 ## BMC updates from the web (reimu-abd)
 
 phosphor-bmc-code-mgmt is left out (its static-layout flow stages images

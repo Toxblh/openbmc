@@ -20,7 +20,10 @@ FAND_MINUTES: length of the memory run (default 4). Tests (all by default):
          timeout, full mode, curves checked and saved; a sensor reading 0:
          100 %; the CPU fan stopping: alarm, LED, 100 %; SIGKILL: 100 % at
          once (ExecStopPost); host off: one 100 % write, then no I2C;
-         HOST_PROBE: off but devices answer -> controlled; memory flat
+         HOST_PROBE: off but devices answer -> controlled; Турбо over
+         D-Bus: every fan full scale, kept over a SIGKILL, back to the
+         curves when it expires (and the web card / top bar chip, FAND_E2E);
+         memory flat
 """
 import json, math, os, re, socket, subprocess, sys, time
 
@@ -29,6 +32,9 @@ import test_ab_qemu as T  # noqa: E402  (takes WORKDIR from sys.argv[1])
 from test_ab_qemu import check, fresh  # noqa: E402
 
 MINUTES = float(os.environ.get("FAND_MINUTES", 4))
+# FAND_E2E=DIR with node_modules/playwright: the browser test of the fan card
+# (../e2e/fans.qemu.mjs is copied there; CHROME: the chromium to use)
+E2E = os.environ.get("FAND_E2E")
 PCS = list(range(0x20, 0x27))
 LED = "/sys/class/leds/platform:red:fanfail/trigger"
 SVC = "xyz.openbmc_project.Reimu.Fans"
@@ -431,6 +437,55 @@ def t_board():
         s = b.wait_state(lambda s: s["host"] == "on", 20)
         check(s.get("host") == "on", "on again")
 
+        # the host's GPU temperature (reimu-hostlink's file; a file of our own
+        # here: reimu-hostlink manages /run/reimu-hostlink/gpu-temp)
+        G = "/run/fand-test-gpu-temp"
+        b.conf(GPU_TEMP_FILE=G, **FAST)
+        b.ssh("systemctl reload reimu-fand")
+        s = b.wait_state(lambda s: zone(s, "board")["duty"] < 100, 30)
+        gi = next((i for i in s.get("inputs", []) if i["id"] == "gpu"), {})
+        check(gi.get("optional") and gi.get("temp") is None and not s.get("alarm"), "no GPU file: the gpu input empty, no alarm")
+        b.ssh("echo 96000 > %s" % G)
+        s = b.wait_state(lambda s: zone(s, "board")["duty"] == 100, 20)
+        full, v = full_regs(b)
+        gi = next((i for i in s.get("inputs", []) if i["id"] == "gpu"), {})
+        check(v[1:] == [46] + [255] * 10 and v[0] < 46 and gi.get("temp") == 96.0 and not s.get("alarm"),
+              "GPU 96 °C: the board zone's fans full scale, the CPU fan not %s, no alarm" % v)
+        b.ssh("rm -f %s" % G)
+        s = b.wait_state(lambda s: zone(s, "board")["duty"] < 100, 20)
+        check(zone(s, "board")["duty"] < 100 and not s.get("alarm") and not zone(s, "board")["failsafe"],
+              "GPU file gone: back to the other inputs, no fail-safe, no alarm")
+
+        # Турбо
+        b.wait_state(lambda s: zone(s, "cpu")["duty"] < 100 and zone(s, "board")["duty"] < 100, 30)
+        if E2E:
+            e2e(b)
+        full, v = full_regs(b)
+        check(not full, "quiet before the turbo %s" % v)
+        r = b.busctl("SetTurbo", "u", "721")
+        check(r.returncode != 0, "SetTurbo 721 min refused: %s" % r.stderr.strip())
+        check(b.busctl("SetTurbo", "u", "1").returncode == 0, "SetTurbo 1 min")
+        time.sleep(1)
+        full, v = full_regs(b)
+        s = b.state()
+        check(full and s.get("turbo") and 50 <= s.get("turbo_left", 0) <= 60 and not s.get("alarm"),
+              "turbo: all 12 fan registers full scale %s, %s s left, no alarm" % (v, s.get("turbo_left")))
+        check(zone(s, "cpu")["reason"] == "турбо", "reason турбо")
+        b.ssh("kill -9 %s" % b.pid())
+        s = b.wait_state(lambda s: s.get("host") == "on" and "full_left" not in s, 30)
+        full, v = full_regs(b)
+        check(s.get("turbo") and full, "SIGKILL: restarted, turbo kept (%s s left) %s" % (s.get("turbo_left"), v))
+        s = b.wait_state(lambda s: not s["turbo"], 70)
+        check(not s.get("turbo"), "turbo expired")
+        s = b.wait_state(lambda s: zone(s, "cpu")["duty"] < 100, 10)
+        full, v = full_regs(b)
+        check(zone(s, "cpu")["duty"] < 100 and not full, "back to the curves %s" % v)
+        t1 = b.now()
+        check(b.ssh("reimu-fand --turbo on").returncode == 0 and b.state().get("turbo_left", 0) > 43000,
+              "--turbo on: until off, 12 h at most")
+        check(b.ssh("reimu-fand --turbo off").returncode == 0 and not b.state().get("turbo"), "--turbo off")
+        check("turbo: every fan full scale" in b.journal(t1), "logged")
+
         b.conf(**dict(FAST, POLL_MS=100))
         b.restart()
         b.wait_state(lambda s: s["host"] == "on" and zone(s, "cpu")["duty"] < 100, 30)
@@ -442,6 +497,22 @@ def t_board():
         print("    journal (last 15):\n      " + "\n      ".join(j.strip().splitlines()[-15:]))
     finally:
         b.stop()
+
+
+def e2e(b):
+    import shutil
+    spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "e2e", "fans.qemu.mjs")
+    if not os.path.exists(spec):
+        spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fans.qemu.mjs")
+    d = os.path.join(E2E, ".fans-e2e.mjs")
+    shutil.copyfile(spec, d)
+    if not os.path.exists(os.path.join(E2E, "common.mjs")):
+        shutil.copyfile(os.path.join(os.path.dirname(spec), "common.mjs"), os.path.join(E2E, "common.mjs"))
+    env = dict(os.environ, BASE="https://127.0.0.1:%d" % T.HTTPS, OUT=os.path.join(T.W, "shots"))
+    r = subprocess.run(["node", d], env=env, capture_output=True, text=True, timeout=600)
+    print("    " + (r.stdout + r.stderr).strip().replace("\n", "\n    "))
+    check(r.returncode == 0, "browser: the fan card's turbo and the top bar chip")
+    check(not b.state().get("turbo"), "browser: turbo off again")
 
 
 TESTS = [("bare", t_bare), ("board", t_board)]

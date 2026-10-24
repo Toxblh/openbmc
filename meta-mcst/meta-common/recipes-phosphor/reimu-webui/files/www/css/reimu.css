@@ -148,6 +148,16 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .tbl th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
 .tbl tr:hover td { background: #ffffff06; }
+/* a table that scrolls sideways inside its card (a sticky header inside it
+   would stick to this box, not under the top bar: none) */
+.tbl-wrap { overflow-x: auto; max-width: 100%; }
+.tbl-wrap > .tbl th { position: static; }
+.nw { white-space: nowrap; }
+/* grids whose cards hold such tables: the cards keep their column width
+   (min-width auto would let a table widen the column and the page); .wide:
+   columns of at least 600 px, one under 600 */
+.grid.shrink > * { min-width: 0; }
+.grid.wide { grid-template-columns: repeat(auto-fill, minmax(min(600px, 100%), 1fr)); }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--panel-2); }
 .badge.ok { background: #2d5a3a; color: #b9f0c8; }
 .badge.warn { background: #6b5214; color: #ffe39a; }

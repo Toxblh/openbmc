@@ -1,5 +1,6 @@
 import { api, h, healthBadge } from "../api.js";
 import { fanState, renderFans } from "./fans.js";
+import { hostSensorRows } from "./host.js";
 
 let root, timer;
 let filter = "";
@@ -55,7 +56,7 @@ export async function mount(el) {
 let last = null;
 
 async function refresh() {
-  const [chassis, plat, fans] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState()]);
+  const [chassis, plat, fans, host] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState(), hostSensorRows()]);
   const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat, fans };
   await Promise.all(
     chassis.map(async (c) => {
@@ -75,6 +76,9 @@ async function refresh() {
     }),
   );
   if (plat && plat.sensors) plat.sensors.forEach((s) => data[s.kind] && data[s.kind].push(rowOf(s)));
+  // the host agent's (reimu-hostlink): unless Redfish lists them already ("Host GPU Edge")
+  const seen = new Set([...data.temp, ...data.fan, ...data.power].map((r) => String(r.name).replace(/ /g, "_")));
+  host.filter((r) => !seen.has(r.name)).forEach((r) => data[r.kind] && data[r.kind].push(r));
   last = data;
   if (root) render(data);
 }

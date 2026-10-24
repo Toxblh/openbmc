@@ -40,6 +40,9 @@ OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-pns-flash"
 # (and its monitor, presence-tach) out: reimu-fand owns them
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-fand"
 IMAGE_FEATURES_remove = "obmc-fan-control"
+# the host agent's link (reimu-hostd on the host, meta-mcst/tools/host):
+# inventory, health, GPU sensors and fan policy, events
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-hostlink"
 
 # ---------------------------------------------------------------- A/B image
 # The partitions (bytes) of reimu-ab64.dtsi; the build fails when a part

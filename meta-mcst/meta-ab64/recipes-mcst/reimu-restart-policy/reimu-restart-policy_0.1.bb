@@ -8,6 +8,12 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 inherit allarch
 
+# A drop-in never sets what the unit's own file declares: a unit with its
+# own RestartSec= or StartLimit*= is not in REIMU_RESTART_ALWAYS (the units
+# there declare at most Restart=always, the same). Units that declare their
+# whole policy are in none of the lists: reimu-kvm (RestartSec=10: waits for
+# bmcweb's certificate), reimu-pnsd.
+#
 # Restart=always, RestartSec=5, no start limit. Socket-activated ones
 # (bmcweb, phosphor-ipmi-net@, busybox-syslog, triggerhappy) keep their
 # socket in PID 1 the whole time; the service is started again on it.
@@ -19,15 +25,10 @@ REIMU_RESTART_ALWAYS = " \
     xyz.openbmc_project.State.Host.service \
     xyz.openbmc_project.State.Chassis.service \
     xyz.openbmc_project.State.BMC.service \
-    reimupwr.service \
-    reimu-serial.service \
-    reimu-kvm.service \
     start-ipkvm.service \
-    reimu-pnsd.service \
     xyz.openbmc_project.User.Manager.service \
     xyz.openbmc_project.Network.service \
     phosphor-certificate-manager@.service \
-    xyz.openbmc_project.ObjectMapper.service \
     xyz.openbmc_project.Settings.service \
     xyz.openbmc_project.Logging.service \
     xyz.openbmc_project.Logging.IPMI.service \
@@ -35,7 +36,6 @@ REIMU_RESTART_ALWAYS = " \
     xyz.openbmc_project.Time.Manager.service \
     xyz.openbmc_project.LED.GroupManager.service \
     xyz.openbmc_project.led.controller@.service \
-    xyz.openbmc_project.Chassis.Buttons.service \
     phosphor-button-handler.service \
     obmc-fru-fault-monitor.service \
     phosphor-systemd-target-monitor.service \
@@ -45,12 +45,21 @@ REIMU_RESTART_ALWAYS = " \
     busybox-klogd.service \
     triggerhappy.service \
 "
-# their own Restart= stays (on-failure), only the limit and the delay change
+# their own Restart= stays (on-failure), only the limit and the delay change:
+# upstream's RestartSec=0 without a start limit would restart it in a loop
 REIMU_RESTART_NOLIMIT = "systemd-networkd.service"
-# oneshots restarted along with a service they Require (tmux-logger with
-# reimu-serial): no start limit, or the third restart of reimu-serial within
-# 30 s left the serial console's tmux failed
-REIMU_STARTLIMIT_ONLY = "tmux-logger.service"
+# only no start limit: units with their own Restart= and RestartSec=
+# (reimupwr 2 s, reimu-serial 2 s, ObjectMapper 5 s, Chassis.Buttons 3 s),
+# and oneshots restarted along with a service they Require (tmux-logger with
+# reimu-serial: the third restart of reimu-serial within 30 s left the serial
+# console's tmux failed)
+REIMU_STARTLIMIT_ONLY = " \
+    reimupwr.service \
+    reimu-serial.service \
+    xyz.openbmc_project.ObjectMapper.service \
+    xyz.openbmc_project.Chassis.Buttons.service \
+    tmux-logger.service \
+"
 
 do_install() {
     for u in ${REIMU_RESTART_ALWAYS}; do
@@ -67,7 +76,7 @@ do_install() {
     done
     for u in ${REIMU_STARTLIMIT_ONLY}; do
         install -d ${D}${systemd_system_unitdir}/$u.d
-        printf '%s\n' '# reimu-restart-policy: no start limit (restarted with what it requires)' \
+        printf '%s\n' '# reimu-restart-policy: no start limit (the rest of the policy: the unit)' \
             '[Unit]' 'StartLimitIntervalSec=0' \
             > ${D}${systemd_system_unitdir}/$u.d/reimu-restart.conf
     done

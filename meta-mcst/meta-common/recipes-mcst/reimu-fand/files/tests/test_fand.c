@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "fand.h"
@@ -882,6 +884,215 @@ static void t_tach_mode(void)
     CHECK(reg(6, 0x4c, 0x4a) == 0x2a, "fail-safe: bit 5 only (0x%02x)", reg(6, 0x4c, 0x4a));
 }
 
+/* FLOOR=100 (or any floor at or above a fan's useful maximum): a valid
+ * "always full" configuration, not an error */
+static void t_floor_full(void)
+{
+    struct config k;
+    char err[FAND_MAX_ERR][128];
+    cfg_defaults(&k);
+    int n = cfg_parse(&k, "FLOOR=100\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && k.floor == 100 && k.cpu_fan_max == 65 && k.board_fan_max == 100 && k.case_fan_max == 100,
+          "FLOOR=100: no error, ranges kept (%d: %s)", n, n ? err[0] : "");
+    cfg_defaults(&k);
+    n = cfg_parse(&k, "FLOOR=65\n", err, FAND_MAX_ERR);
+    CHECK(n == 0, "FLOOR=65 = CPU_FAN_MAX_DUTY: no error (%d: %s)", n, n ? err[0] : "");
+    cfg_defaults(&k);
+    n = cfg_parse(&k, "FLOOR=80\n", err, FAND_MAX_ERR);
+    CHECK(n == 0, "FLOOR=80 above CPU_FAN_MAX_DUTY: no error, the floor wins (%d: %s)", n, n ? err[0] : "");
+    cfg_defaults(&k);
+    n = cfg_parse(&k, "CPU_FAN_MIN_DUTY=50\nCPU_FAN_MAX_DUTY=50\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && k.cpu_fan_max == 50, "CPU_FAN_MAX_DUTY = CPU_FAN_MIN_DUTY: valid, a fixed duty (%d: %s)", n, n ? err[0] : "");
+    cfg_defaults(&k);
+    n = cfg_parse(&k, "CPU_FAN_MIN_DUTY=50\nCPU_FAN_MAX_DUTY=40\n", err, FAND_MAX_ERR);
+    CHECK(n == 1 && k.cpu_fan_max == 100, "CPU_FAN_MAX_DUTY below its own minimum: an error, 100 (%d)", n);
+
+    struct fand f;
+    char e[160];
+    cfg_defaults(&k);
+    k.floor = 100;
+    start(&f, &k);
+    run(&f, 300, HOST_ON);
+    CHECK(all_full() && f.z[Z_CPU].duty == 100 && !fand_alarm(&f), "FLOOR=100: every fan full scale, no alarm");
+    cfg_defaults(&k);
+    k.floor = 65;
+    start(&f, &k);
+    run(&f, 300, HOST_ON);
+    fand_set_duty(&f, Z_CPU, 70, e, sizeof(e));
+    run(&f, 1, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4c) == 30 && NEAR(f.z[Z_CPU].out[0].duty, 65, 0.01), "FLOOR=65: the CPU fan at its 65%% (%d)",
+          reg(6, 0x4c, 0x4c));
+    fand_set_duty(&f, Z_CPU, 100, e, sizeof(e));
+    run(&f, 1, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4c) == 46, "and 100%%: full scale");
+    cfg_defaults(&k);
+    k.floor = 80;
+    start(&f, &k);
+    run(&f, 300, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4c) == 37 && reg(2, 0x2c, 0x30) >= 204, "FLOOR=80: the CPU fan at the floor 80%% (%d), not 65",
+          reg(6, 0x4c, 0x4c));
+}
+
+/* Турбо: every zone at full scale until it expires or is turned off */
+static void t_turbo(void)
+{
+    struct fand f;
+    struct config c;
+    char e[160];
+    cfg_defaults(&c);
+    start(&f, &c);
+    run(&f, 300, HOST_ON);
+    CHECK(!all_full() && !fand_turbo_left(&f), "quiet, no turbo");
+    CHECK(!fand_set_turbo(&f, 15, e, sizeof(e)), "turbo 15 min");
+    run(&f, 1, HOST_ON);
+    CHECK(all_full() && reg(6, 0x4c, 0x4c) == 46, "turbo: every fan full scale (the CPU fan 46, not its 65%%)");
+    CHECK(!strcmp(f.z[Z_CPU].reason, "турбо") && !fand_alarm(&f) && !strcmp(led(), "none"), "reason турбо, no alarm, LED off (%s)",
+          f.z[Z_CPU].reason);
+    CHECK(fand_turbo_left(&f) == 899, "899 s left (%d)", fand_turbo_left(&f));
+    struct buf b = { 0 };
+    fand_json(&f, &b);
+    CHECK(b.s && strstr(b.s, "\"turbo\":true") && strstr(b.s, "\"turbo_left\":899"), "JSON: turbo, turbo_left");
+    free(b.s);
+    /* manual mode and its timeout don't matter */
+    fand_set_duty(&f, Z_CPU, 40, e, sizeof(e));
+    run(&f, 1, HOST_ON);
+    CHECK(all_full(), "manual 40%% during turbo: still full");
+    run(&f, 660, HOST_ON);
+    CHECK(f.z[Z_CPU].mode == MODE_AUTO && all_full() && fand_turbo_left(&f) > 0, "manual timed out, turbo still on");
+    run(&f, 239, HOST_ON);
+    CHECK(fand_turbo_left(&f) == 0 && !all_full(), "expired after 15 min: back to the curves (slewing down)");
+    b = (struct buf){ 0 };
+    fand_json(&f, &b);
+    CHECK(b.s && strstr(b.s, "\"turbo\":false"), "JSON: turbo false");
+    free(b.s);
+    /* off before it expires */
+    run(&f, 300, HOST_ON);
+    fand_set_turbo(&f, 60, e, sizeof(e));
+    run(&f, 10, HOST_ON);
+    CHECK(all_full(), "turbo 60");
+    CHECK(!fand_set_turbo(&f, 0, e, sizeof(e)) && fand_turbo_left(&f) == 0, "SetTurbo 0: off");
+    run(&f, 5, HOST_ON);
+    CHECK(!all_full(), "off: back to the curves");
+    /* limits */
+    CHECK(fand_set_turbo(&f, FAND_TURBO_MAX_MIN + 1, e, sizeof(e)) && fand_turbo_left(&f) == 0, "721 min refused (%s)", e);
+    CHECK(!fand_set_turbo(&f, FAND_TURBO_UNTIL_OFF, e, sizeof(e)) && fand_turbo_left(&f) == FAND_TURBO_MAX_MIN * 60,
+          "until off: capped at 12 h (%d s)", fand_turbo_left(&f));
+    run(&f, 12 * 3600 - 1, HOST_ON);
+    CHECK(fand_turbo_left(&f) == 1 && all_full(), "11:59:59 later: on");
+    run(&f, 2, HOST_ON);
+    CHECK(fand_turbo_left(&f) == 0, "12 h: off");
+    /* survives a daemon restart (the main loop keeps turbo_until in /run) */
+    fand_set_turbo(&f, 30, e, sizeof(e));
+    int64_t until = f.turbo_until;
+    struct fand g;
+    fand_init(&g, &c, T);
+    g.on_since_hint = T - 100000;
+    g.turbo_until = until;
+    run(&g, c.start_full_ms / 1000.0 + 10, HOST_ON);
+    CHECK(all_full() && fand_turbo_left(&g) > 1700, "restarted: turbo kept (%d s left)", fand_turbo_left(&g));
+    /* host off: no I2C, the clock runs; on again: full */
+    run(&g, 60, HOST_OFF);
+    CHECK(fand_turbo_left(&g) > 1600 && fand_turbo_left(&g) < 1750, "host off: turbo counts on (%d)", fand_turbo_left(&g));
+    unsigned long x = hw_transfers();
+    run(&g, 10, HOST_OFF);
+    CHECK(hw_transfers() == x, "host off: no I2C");
+    run(&g, 31, HOST_ON);
+    CHECK(all_full(), "on again: full (turbo)");
+    /* the fail-safe still names its cause */
+    hide(5, 0x20, 1);
+    run(&g, 6, HOST_ON);
+    CHECK(g.z[Z_CPU].failsafe && fand_alarm(&g) && strstr(g.z[Z_CPU].reason, "0x20"), "a sensor gone during turbo: alarm, reason");
+    hide(5, 0x20, 0);
+}
+
+static void gpu_temp(const char *text, int age_s)
+{
+    char p[512];
+    snprintf(p, sizeof(p), "%s/gpu-temp", R);
+    if (!text)
+    {
+        unlink(p);
+        return;
+    }
+    FILE *f = fopen(p, "w");
+    fputs(text, f);
+    fclose(f);
+    struct timeval tv[2];
+    gettimeofday(&tv[0], NULL);
+    tv[0].tv_sec -= age_s;
+    tv[1] = tv[0];
+    utimes(p, tv);
+}
+
+/* the host's GPU (reimu-hostlink: /run/reimu-hostlink/gpu-temp, m°C, gone
+ * when stale): an optional input of the board zone, never a fail-safe */
+static void t_gpu(void)
+{
+    struct config c;
+    char err[FAND_MAX_ERR][128];
+    cfg_defaults(&c);
+    CHECK(!strcmp(c.gpu_file, "/run/reimu-hostlink/gpu-temp") && c.use[Z_BOARD][G_GPU] && !c.use[Z_CPU][G_GPU] &&
+              c.curve[Z_BOARD][G_GPU].n == 4 && c.curve[Z_BOARD][G_GPU].t[0] == 65 && c.curve[Z_BOARD][G_GPU].d[3] == 100,
+          "defaults: the board zone, 65:30 75:45 85:70 95:100");
+    CHECK(curve_key(Z_BOARD, G_GPU) && !strcmp(curve_key(Z_BOARD, G_GPU), "BOARD_GPU_CURVE") && !curve_key(Z_CPU, G_GPU),
+          "BOARD_GPU_CURVE, no CPU_GPU_CURVE");
+    int n = cfg_parse(&c, "GPU_TEMP_FILE=none\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && !c.gpu_file[0], "GPU_TEMP_FILE=none: off");
+    cfg_defaults(&c);
+    n = cfg_parse(&c, "BOARD_GPU_CURVE=60:20 90:100\n", err, FAND_MAX_ERR);
+    CHECK(n == 1 && c.curve[Z_BOARD][G_GPU].t[0] == 65, "a GPU curve below the floor refused");
+
+    c = cfg_test();
+    snprintf(c.gpu_file, sizeof(c.gpu_file), "%.100s/gpu-temp", R);
+    struct fand f;
+    gpu_temp(NULL, 0);
+    start(&f, &c);
+    run(&f, 300, HOST_ON);
+    double cpu0 = f.z[Z_CPU].duty;
+    CHECK(NEAR(f.z[Z_BOARD].duty, 46, 0.01) && !f.z[Z_BOARD].failsafe && !fand_alarm(&f), "no GPU file: IOHUB rules (46%%), no alarm");
+    gpu_temp("90000\n", 0);
+    run(&f, 10, HOST_ON);
+    CHECK(NEAR(f.z[Z_BOARD].in[G_GPU].demand, 85, 0.01) && NEAR(f.z[Z_BOARD].duty, 85, 0.01), "GPU 90 °C: board 85%% (%.1f)",
+          f.z[Z_BOARD].duty);
+    CHECK(NEAR(f.z[Z_CPU].duty, cpu0, 0.01), "the CPU zone doesn't follow the GPU");
+    struct buf b = { 0 };
+    fand_json(&f, &b);
+    CHECK(b.s && strstr(b.s, "\"id\":\"gpu\"") && strstr(b.s, "\"temp\":90.0"), "JSON: the gpu input, 90.0");
+    free(b.s);
+    gpu_temp(NULL, 0);
+    run(&f, 2, HOST_ON);
+    CHECK(!f.z[Z_BOARD].failsafe && !fand_alarm(&f) && !strcmp(led(), "none") && NEAR(f.z[Z_BOARD].demand, 46, 0.01),
+          "file gone: no fail-safe, no alarm, IOHUB rules again (%.1f)", f.z[Z_BOARD].demand);
+    b = (struct buf){ 0 };
+    fand_json(&f, &b);
+    CHECK(b.s && strstr(b.s, "\"id\":\"gpu\"") && !strstr(b.s, "\"temp\":90.0"), "JSON: gpu without a temperature");
+    free(b.s);
+    gpu_temp("95000\n", 60);
+    run(&f, 2, HOST_ON);
+    CHECK(NEAR(f.z[Z_BOARD].demand, 46, 0.01) && !f.z[Z_BOARD].failsafe, "a 60 s old file: ignored");
+    static const char *const bad[] = { "abc\n", "", "-5000\n", "200000\n", "95000abc\n" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        gpu_temp(bad[i], 0);
+        run(&f, 2, HOST_ON);
+        CHECK(NEAR(f.z[Z_BOARD].demand, 46, 0.01) && !f.z[Z_BOARD].failsafe, "garbage \"%.8s\": ignored", bad[i]);
+    }
+    gpu_temp("60000\n", 0);
+    run(&f, 2, HOST_ON);
+    CHECK(NEAR(f.z[Z_BOARD].demand, 46, 0.01) && NEAR(f.z[Z_BOARD].in[G_GPU].demand, 30, 0.01), "GPU 60 °C (30%%): the max is IOHUB's");
+    gpu_temp("97000", 0);
+    run(&f, 10, HOST_ON); /* up at SLEW_UP */
+    CHECK(f.z[Z_BOARD].duty == 100 && f.z[Z_BOARD].hot && !fand_alarm(&f), "GPU 97 °C, no newline: board full, no alarm");
+    gpu_temp(NULL, 0);
+    /* off */
+    c.gpu_file[0] = 0;
+    fand_reconfig(&f, &c);
+    gpu_temp("97000\n", 0);
+    run(&f, 200, HOST_ON);
+    CHECK(f.z[Z_BOARD].duty < 100, "GPU_TEMP_FILE off: not read");
+    gpu_temp(NULL, 0);
+}
+
 static void t_fan_range(void)
 {
     struct fand f;
@@ -1043,7 +1254,7 @@ static void t_json(void)
         fputs(b.s, fp);
         fclose(fp);
         snprintf(cmd, sizeof(cmd), "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); "
-                 "assert d[\"zones\"][0][\"id\"]==\"cpu\" and len(d[\"inputs\"])==3' %s", file);
+                 "assert d[\"zones\"][0][\"id\"]==\"cpu\" and len(d[\"inputs\"])==4' %s", file);
         CHECK(!b.oom && system(cmd) == 0, "JSON parses (%s)", k ? "host off" : "running, alarm");
         CHECK(strstr(b.s, "nan") == NULL, "no nan in JSON");
         free(b.s);
@@ -1061,7 +1272,7 @@ int main(void)
         { "curves", t_curves }, { "config", t_config }, { "host", t_host }, { "hysteresis_slew", t_hysteresis_slew },
         { "failsafe_inputs", t_failsafe_inputs }, { "outputs", t_outputs }, { "tach", t_tach }, { "manual", t_manual },
         { "reload", t_reload }, { "json", t_json }, { "fan_model", t_fan_model }, { "fan_range", t_fan_range },
-        { "tach_mode", t_tach_mode },
+        { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {

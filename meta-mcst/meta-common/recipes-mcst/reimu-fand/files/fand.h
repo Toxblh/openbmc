@@ -14,9 +14,14 @@
 #define FAND_MAX_CASE   2
 #define FAND_MAX_OUT    (1 + FAND_MAX_CASE)
 #define FAND_MAX_ERR    12
+/* Турбо: every fan at full scale for 1..FAND_TURBO_MAX_MIN minutes, or
+ * FAND_TURBO_UNTIL_OFF (= until turned off, at most FAND_TURBO_MAX_MIN) */
+#define FAND_TURBO_MAX_MIN   720
+#define FAND_TURBO_UNTIL_OFF 0xffffffffu
 
 /* temperature inputs: groups of sensors read once per poll, shared by the zones */
-enum { G_PCS, G_VRM, G_IOHUB, NGROUPS };
+/* G_GPU: the host's GPU (reimu-hostlink), optional: never a fail-safe */
+enum { G_PCS, G_VRM, G_IOHUB, G_GPU, NGROUPS };
 /* cooling zones */
 enum { Z_CPU, Z_BOARD, NZONES };
 enum { MODE_AUTO, MODE_MANUAL, MODE_FULL };
@@ -62,6 +67,7 @@ struct config
     int pcs_bus, npcs, pcs[FAND_MAX_SENS];
     int vrm_bus, nvrm, vrm[FAND_MAX_SENS];
     struct devaddr cpu_fan, board_fan, iohub;
+    char gpu_file[128]; /* the GPU temperature (m°C) from the host, "" = none */
     int ncase;
     struct devaddr case_fan[FAND_MAX_CASE];
     struct curve curve[NZONES][NGROUPS];
@@ -148,6 +154,7 @@ struct fand
     unsigned tach_checks;
     int64_t tach_low_since, tach_ok_since, tach_alarm_at[3];
     int out_alarm;
+    int64_t turbo_until; /* ms, 0 = off (the daemon keeps it in /run) */
     int led;         /* LED state written, -1 = unknown */
     unsigned long ticks;
     unsigned gen;    /* bumped when something D-Bus shows as a property changes */
@@ -181,6 +188,9 @@ int fand_set_duty(struct fand *f, int zone, double duty, char *err, size_t n);
 int fand_confirm(struct fand *f, int zone, char *err, size_t n);
 int fand_set_curve(struct fand *f, int zone, int group, const char *pts, char *err, size_t n);
 void fand_clear_alarms(struct fand *f);
+/* minutes: 0 off, 1..FAND_TURBO_MAX_MIN, FAND_TURBO_UNTIL_OFF */
+int fand_set_turbo(struct fand *f, unsigned minutes, char *err, size_t n);
+int fand_turbo_left(const struct fand *f); /* seconds, 0 = off */
 int fand_alarm(const struct fand *f);
 void fand_alarm_text(const struct fand *f, char *buf, size_t n);
 const char *fand_host_name(const struct fand *f);

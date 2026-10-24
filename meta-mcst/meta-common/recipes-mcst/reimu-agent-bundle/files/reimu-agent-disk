@@ -1,0 +1,128 @@
+#!/bin/sh
+# reimu-agent-disk start|stop|status: the host agent's installer as a small
+# read-only USB disk «REIMU-AGENT» the BMC shows the host (reimu-hostlink's
+# AgentDisk() runs it: the web page Хост → «USB-диск с установщиком»).
+#
+#   start   the pairing string on stdin: a copy of the build's FAT image
+#           (/usr/share/reimu-agent/disk.img: install.sh, the agent's files,
+#           README.txt) in /run/reimu-agent-disk with the string written over
+#           PAIRING.TXT's placeholder (at disk.offset), as the configfs gadget
+#           reimu_agent (mass storage, read-only, removable) on a port of the
+#           virtual hub; on the host: sudo sh /run/media/$USER/REIMU-AGENT/install.sh
+#   stop    the gadget and the image (with the string) gone; always 0
+#   status  the port, or "off"
+#
+# The ports: p3, else p2. Never p1 (the KVM's keyboard and mouse, obmc_hid,
+# which takes the first free port from p1: kept there for the host's PNS) nor
+# p4, p5 (virtual media, jsnbd's reimu_state_hook). Endpoints: the vhub has
+# 15; HID 3, each disk 2. Without the virtual hub (a test VM) any other free
+# controller. Separate from the virtual media's hook on purpose.
+#
+# REIMU_AGENT_DISK_IMG, REIMU_AGENT_DISK_OFFSET, REIMU_AGENT_DISK_RUN,
+# REIMU_CONFIGFS, REIMU_UDC_CLASS: other paths (tests).
+
+IMG_SRC=${REIMU_AGENT_DISK_IMG:-/usr/share/reimu-agent/disk.img}
+OFF_FILE=${REIMU_AGENT_DISK_OFFSET:-/usr/share/reimu-agent/disk.offset}
+RUN=${REIMU_AGENT_DISK_RUN:-/run/reimu-agent-disk}
+CFS=${REIMU_CONFIGFS:-/sys/kernel/config}
+UDCS=${REIMU_UDC_CLASS:-/sys/class/udc}
+G=$CFS/usb_gadget/reimu_agent
+F=functions/mass_storage.agent
+VHUB=1e6a0000.usb-vhub
+MARK=REIMU-PAIRING-PLACEHOLDER
+
+err() { echo "reimu-agent-disk: $*" >&2; }
+
+find_udc() {
+    used=" $(cat "$CFS"/usb_gadget/*/UDC 2>/dev/null | tr '\n' ' ') "
+    for u in $VHUB:p3 $VHUB:p2 $(ls "$UDCS" 2>/dev/null); do
+        case $u in $VHUB:*) case $u in $VHUB:p2|$VHUB:p3) ;; *) continue ;; esac ;; esac
+        [ -e "$UDCS/$u" ] || continue
+        case $used in *" $u "*) continue ;; esac
+        echo "$u"
+        return 0
+    done
+    return 1
+}
+
+stop() {
+    if [ -d "$G" ]; then
+        echo "" > "$G/UDC" 2>/dev/null
+        rm -f "$G/configs/c.1/mass_storage.agent"
+        rmdir "$G/$F" "$G/configs/c.1/strings/0x409" "$G/configs/c.1" "$G/strings/0x409" "$G" 2>/dev/null
+    fi
+    rm -rf "$RUN"
+    return 0
+}
+
+start() {
+    IFS= read -r pair || [ -n "$pair" ] || pair=
+    pair=$(printf '%s' "$pair" | tr -d '\r')
+    # reimu1: and 16..480 of base64url (PAIRING.TXT's 512 bytes)
+    ok=1
+    case $pair in reimu1:*) ;; *) ok= ;; esac
+    case ${pair#reimu1:} in *[!A-Za-z0-9_-]*) ok= ;; esac
+    [ ${#pair} -ge 23 ] && [ ${#pair} -le 487 ] || ok=
+    if [ -z "$ok" ]; then
+        err "not a pairing string on stdin"
+        return 2
+    fi
+    stop
+    off=$(cat "$OFF_FILE" 2>/dev/null)
+    case $off in ''|*[!0-9]*) err "no offset in $OFF_FILE"; return 1 ;; esac
+    if [ $((off % 512)) != 0 ]; then err "offset $off not on a sector"; return 1; fi
+    (umask 077 && mkdir -p "$RUN") || { err "mkdir $RUN"; return 1; }
+    chmod 700 "$RUN"
+    img=$RUN/disk.img
+    cp "$IMG_SRC" "$img.new" || { err "no image $IMG_SRC"; stop; return 1; }
+    have=$(dd if="$img.new" bs=512 skip=$((off / 512)) count=1 2>/dev/null | head -n 1 | cut -c1-${#MARK})
+    if [ "$have" != "$MARK" ]; then
+        err "the image has no placeholder at $off: damaged (reinstall the firmware)"
+        stop
+        return 1
+    fi
+    # the line, spaces up to 511 bytes, a newline: PAIRING.TXT's 512 bytes
+    printf '%-511s\n' "$pair" | dd of="$img.new" bs=512 seek=$((off / 512)) count=1 conv=notrunc 2>/dev/null ||
+        { err "writing the image"; stop; return 1; }
+    mv -f "$img.new" "$img"
+    udc=$(find_udc) || { err "no free USB port ($VHUB:p2, p3 in use)"; stop; return 1; }
+    set -e
+    mkdir -p "$G"
+    cd "$G"
+    echo 0x1d6b > idVendor      # Linux Foundation
+    echo 0x0104 > idProduct     # Multifunction Composite Gadget
+    echo 0x0100 > bcdDevice
+    mkdir -p strings/0x409
+    echo "OpenBMC" > strings/0x409/manufacturer
+    echo "REIMU agent installer" > strings/0x409/product
+    echo "REIMUAGENT" > strings/0x409/serialnumber
+    mkdir -p configs/c.1/strings/0x409
+    echo "config 1" > configs/c.1/strings/0x409/configuration
+    mkdir -p $F
+    # no endpoint halts for "phase errors" (as reimu_state_hook)
+    echo 0 > $F/stall
+    [ -d $F/lun.0 ] || mkdir -p $F/lun.0
+    echo 1 > $F/lun.0/removable
+    echo 1 > $F/lun.0/ro
+    echo 0 > $F/lun.0/cdrom
+    echo 1 > $F/lun.0/nofua
+    printf '%-8s%-16s%-4s' REIMU "Agent installer" 1.00 > $F/lun.0/inquiry_string
+    echo "$img" > $F/lun.0/file
+    ln -s "$G/$F" configs/c.1/mass_storage.agent
+    echo "$udc" > UDC
+    set +e
+    echo "$udc" > "$RUN/udc"
+    echo "the installer's USB disk on $udc" >&2
+    return 0
+}
+
+status() {
+    if [ -s "$RUN/udc" ] && [ -d "$G" ]; then echo "on $(cat "$RUN/udc")"; else echo off; fi
+}
+
+case ${1:-} in
+    start) (start); rc=$?; [ $rc = 0 ] || [ $rc = 2 ] || stop; exit $rc ;;
+    stop) stop; exit 0 ;;
+    status) status; exit 0 ;;
+    *) echo "usage: $0 start|stop|status (start: the pairing string on stdin)" >&2; exit 2 ;;
+esac

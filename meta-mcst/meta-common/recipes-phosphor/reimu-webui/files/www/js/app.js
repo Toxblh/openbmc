@@ -1,4 +1,5 @@
 import { api, toast } from "./api.js";
+import { startTurboChip, stopTurboChip } from "./pages/fans.js";
 
 const pages = {
   overview: () => import("./pages/overview.js"),
@@ -7,6 +8,7 @@ const pages = {
   media: () => import("./pages/media.js"),
   sensors: () => import("./pages/sensors.js"),
   hardware: () => import("./pages/hardware.js"),
+  host: () => import("./pages/host.js"),
   logs: () => import("./pages/journal.js"),
   settings: () => import("./pages/settings.js"),
 };
@@ -23,6 +25,7 @@ const $ = (id) => document.getElementById(id);
 function showLogin(msg = "") {
   state.loggedIn = false;
   clearInterval(state.powerTimer);
+  stopTurboChip();
   $("app").classList.add("hidden");
   $("login").classList.remove("hidden");
   $("login-error").textContent = msg;
@@ -40,6 +43,7 @@ async function showApp(user) {
   pollPower();
   clearInterval(state.powerTimer);
   state.powerTimer = setInterval(pollPower, 5000);
+  startTurboChip();
   route();
 }
 

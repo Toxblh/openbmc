@@ -17,7 +17,10 @@
 #                                write the update (image-kernel, image-rofs,
 #                                SHA256SUMS) into the other slot (or the one
 #                                given), then boot it next (pending until
-#                                healthy); no reboot
+#                                healthy); no reboot. Running on the other
+#                                slot's rofs (fallback): the damaged slot.
+#                                Never a slot whose kernel or rofs is the only
+#                                intact one; both: the damaged slot first
 #   reimu-ab verify [a|b]        re-read the slots, check them against their
 #                                digests
 #   reimu-ab set-slot a|b        boot this slot next
@@ -35,7 +38,9 @@
 #   reimu-ab restore-stock DIR   (in "ram" mode) write back the stock
 #                                firmware dumped into DIR (u-boot-env.bin,
 #                                kernel.bin, rofs.bin, rwfs.bin, SHA256SUMS)
-#                                at the stock offsets; U-Boot is not touched
+#                                at the stock offsets, an A/B slot bootable
+#                                as long as can be, the environment last;
+#                                U-Boot is not touched
 set -u
 me=reimu-ab
 FLASH=${REIMU_FLASH:-reimu-flash}
@@ -105,33 +110,76 @@ do_verify() {
     return $rc
 }
 
+# 0 if PART (kernel|rofs) of slot S matches its digest (quiet)
+part_ok() {
+    pt=$(trailer $1 | field $2)
+    pn=${pt%% *} ps=${pt#* }
+    case $pn in ""|*[!0-9]*) return 1 ;; esac
+    [ $((pn % 4096)) = 0 ] && [ ${#ps} = 64 ] || return 1
+    [ "$(dd if=$(mtd $2-$1) bs=4096 count=$((pn / 4096)) 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$ps" ]
+}
+
+# DEV OFFSET FILE WHAT: reimu-flash write (read back, rewritten on a
+# mismatch), its "ok N" as "WHAT written and read back: N"; the status is
+# reimu-flash's (a pipe's would be the filter's)
+flash_write() {
+    fw_rc=$(mktemp /tmp/reimu-ab-rc.XXXXXX) || return 1
+    { $FLASH write "$1" "$2" "$3" 5; echo $? > $fw_rc; } | sed -n "s/^ok/$4 written and read back:/p"
+    fw_st=$(cat $fw_rc); rm -f $fw_rc
+    [ "$fw_st" = 0 ]
+}
+
 do_install() {
-    tar=$1; slots=${2:-}
+    tar=${1:-}; slots=${2:-}
     [ -f "$tar" ] || die "$tar: no such file"
+    case $slots in ""|a|b|both) ;; *) die "slot: a, b or both" ;; esac
     cur=$(booted kernel)
-    [ -n "$slots" ] || { [ -n "$cur" ] || die "booted slot unknown: say which slot"; slots=$(other $cur); }
-    # both (the first install): B first, then make it the slot that boots, then
-    # A: whenever the power goes, one slot is complete and U-Boot finds it
-    [ "$slots" = both ] && slots="b a"
-    for s in $slots; do
-        case $s in a|b) ;; *) die "slot: a, b or both" ;; esac
-    done
+    if [ -z "$slots" ]; then
+        [ -n "$cur" ] || die "booted slot unknown: say which slot"
+        # fallback: kernel-$cur runs on the other slot's rofs, because
+        # rofs-$cur is damaged: that slot is the one to write (the other
+        # slot's rofs is the only intact one); else the slot not running
+        [ "$(booted state)" = fallback ] && slots=$cur || slots=$(other $cur)
+    fi
+    # What is intact now (each part against the digests in its slot). U-Boot
+    # boots any intact kernel (a bad FIT falls through to the other slot), the
+    # initramfs any intact rofs: the board stays bootable while a slot is
+    # written as long as the other slot has an intact kernel and rofs, or the
+    # written slot's part was no good anyway.
+    good=
+    for s in a b; do for p in kernel rofs; do part_ok $s $p && good="$good $p-$s"; done; done
+    has() { case "$good " in *" $1 "*) return 0 ;; esac; return 1; }
+    # both (the first install, a repair): the damaged slot first, then make it
+    # the slot that boots, then the other: whenever the power goes, one slot
+    # is complete and U-Boot finds it. Neither damaged (or neither intact,
+    # the first install from the stock firmware): B first
+    if [ "$slots" = both ]; then
+        has kernel-b && has rofs-b && ! { has kernel-a && has rofs-a; } && slots="a b" || slots="b a"
+    fi
     w=$(mktemp -d /tmp/reimu-ab.XXXXXX) || die "no /tmp"
     trap 'rm -rf "$w"' EXIT
     tar -xf "$tar" -C "$w" image-kernel image-rofs SHA256SUMS || die "$tar: needs image-kernel, image-rofs, SHA256SUMS"
     (cd "$w" && sha256sum -c SHA256SUMS >/dev/null) || die "$tar: damaged (SHA256SUMS)"
     for s in $slots; do
+        o=$(other $s)
         k=$(mtd kernel-$s) r=$(mtd rofs-$s)
         [ $(stat -c %s $w/image-kernel) -le $(size_of $k) ] || die "kernel bigger than kernel-$s"
         [ $(stat -c %s $w/image-rofs) -eq $(size_of $r) ] || die "image-rofs is not the size of rofs-$s"
-        # the slot is not bootable while it's being written
-        [ "$(env_get reimu_slot)" = $s ] && env_set reimu_slot $(other $s)
+        for p in kernel rofs; do
+            if has $p-$s && ! has $p-$o; then
+                die "slot $s: $p-$s is the only intact $p ($p-$o is damaged): not writing slot $s (write slot $o first)"
+            fi
+        done
+        # the slot is not bootable while it's being written: U-Boot boots the other
+        [ "$(env_get reimu_slot)" = $s ] && { env_set reimu_slot $o; env_set reimu_tries 0; }
+        good=$(echo "$good" | sed "s/ kernel-$s//; s/ rofs-$s//")
         log "slot $s: kernel"
-        $FLASH write $k 0 $w/image-kernel 5 | sed -n 's/^ok/kernel written and read back:/p' || die "slot $s: kernel write failed"
+        flash_write $k 0 $w/image-kernel kernel || die "slot $s: kernel write failed"
         log "slot $s: rofs"
-        $FLASH write $r 0 $w/image-rofs 5 | sed -n 's/^ok/rofs written and read back:/p' || die "slot $s: rofs write failed"
+        flash_write $r 0 $w/image-rofs rofs || die "slot $s: rofs write failed"
         verify_slot $s || die "slot $s: digests don't match after writing"
         env_set reimu_slot $s
+        good="$good kernel-$s rofs-$s"
     done
     rm -rf "$w"; trap - EXIT
     set -- $slots; s=${2:-$1}
@@ -149,7 +197,14 @@ healthy() {
 do_boot() {
     k=$(booted kernel) r=$(booted rofs) st=$(booted state)
     [ -n "$k" ] || { log "not booted by the A/B initramfs"; return 0; }
-    [ "$st" = ram ] && { log "running from RAM (kexec test): nothing to confirm"; return 0; }
+    # started by kexec, not by U-Boot: "reimu-ab ram" (whose initramfs, the
+    # FIT's, still says state=ok or fallback) or a test from another firmware
+    # (state=ram): not a boot to confirm, and the environment stays as it is
+    # (a pending install stays pending, restore-stock owns it)
+    if [ "$st" = ram ] || grep -qwE 'reimu\.(ram|test)' /proc/cmdline; then
+        log "started by kexec (reimu.ram/reimu.test): nothing to confirm, the U-Boot environment is left alone"
+        return 0
+    fi
     [ "$(env_get reimu_slot)" = "$k" ] || log "U-Boot booted slot $k, not slot $(env_get reimu_slot): slot $(env_get reimu_slot) didn't start"
     if [ "$st" = fallback ]; then
         # kernel of one slot, rofs of the other: next time boot the slot the rofs is from
@@ -200,12 +255,18 @@ do_ram() {
     k=$(booted kernel); [ -n "$k" ] || die "booted slot unknown"
     w=/run/reimu-ab-ram; rm -rf $w; mkdir -p $w
     reimu-fit $(mtd kernel-$k) $w >/dev/null || die "kernel-$k: can't read the FIT"
-    # nothing may write the environment or reboot on its own meanwhile
+    # nothing may write the environment or reboot on its own meanwhile:
+    # set_mac (FRU MAC -> environment, reboot) and revert-to-mfg (UID button:
+    # wipe, reboot) masked; reimu-ab.service (reimu-ab boot) sees reimu.ram
+    # and leaves the environment alone
     cmd="$(sed 's/ *reimu\.ram//; s/ *systemd\.mask=[^ ]*//g' /proc/cmdline) reimu.ram"
     cmd="$cmd systemd.mask=set_mac.service systemd.mask=revert-to-mfg.service"
     # the MAC addresses (U-Boot writes them into the device tree, kexec doesn't)
-    fdtput -t bx $w/fdt /ahb/ethernet@1e660000 local-mac-address $(env_get ethaddr | tr A-F: 'a-f ') || die "no MAC address for the device tree"
-    fdtput -t bx $w/fdt /ahb/ethernet@1e680000 local-mac-address $(env_get eth1addr | tr A-F: 'a-f ') || die "no MAC address for the device tree"
+    for n in "ethaddr 1e660000" "eth1addr 1e680000"; do
+        mac=$(env_get ${n% *} | tr A-F: 'a-f ')
+        [ $(echo $mac | wc -w) = 6 ] || die "no ${n% *} in the U-Boot environment for the device tree"
+        fdtput -t bx $w/fdt /ahb/ethernet@${n#* } local-mac-address $mac || die "no MAC address for the device tree"
+    done
     kexec -l $w/kernel --dtb=$w/fdt --initrd=$w/ramdisk --command-line="$cmd" || die "kexec -l failed"
     log "restarting slot $k with the rwfs in RAM"
     # the devices that keep DMA going over a kexec (no .shutdown): video
@@ -238,23 +299,90 @@ do_rwfs_init() {
     fi
 }
 
+# The stock REIMU 1.0.2 layout over the A/B one:
+#   u-boot-env 0xe0000-0x100000      the same partition
+#   kernel     0x100000-0x680000     kernel-a (0x100000-0x700000)
+#   rofs       0x680000-0x3000000    the end of kernel-a, rofs-a (0x700000-
+#                                    0x1c00000), kernel-b (0x1c00000-0x2200000),
+#                                    the start of rofs-b (0x2200000-0x3700000)
+#   rwfs       0x3000000-0x4000000   the end of rofs-b (its digests), rwfs
+# Written so that an A/B slot stays bootable as long as it can; the stock
+# environment (its bootcmd boots the stock kernel only) only once the stock
+# kernel and rofs are complete, the stock rwfs (the A/B rwfs is in it: the
+# running A/B slot would mount the stock settings) after that:
+#   slot B intact: reimu_slot=b; the stock kernel and the stock rofs up to
+#     0x1c00000 (slot A's region; slot B boots); the rest of the rofs (kernel-b
+#     and rofs-b: neither an A/B slot nor the stock firmware is complete, the
+#     one window); the environment, one 64 KiB copy at a time; the rwfs
+#   else slot A intact: reimu_slot=a; the rofs from 0x1c00000 (kernel-b and
+#     rofs-b but its end; slot A boots); the kernel, the rofs up to 0x1c00000
+#     (the window); the environment; the rwfs (its place erased first)
+# With neither intact there is no fallback: B's order. In between (the stock
+# kernel and rofs complete, the A/B environment) U-Boot's A/B bootcmd falls
+# through from the slot that is gone to kernel-a, the stock kernel: the stock
+# firmware runs, but the A/B bootcmd armed WDT1, which nothing of the stock
+# firmware feeds: a reset every 300 s, until the stock environment is in.
 do_restore_stock() {
     d=${1:-}; [ -d "$d" ] || die "restore-stock DIR"
     ! flash_mounted || die "the flash is in use: reimu-ab ram first"
-    for f in u-boot-env kernel rofs rwfs; do
+    for f in u-boot-env:131072 kernel:5767168 rofs:43515904 rwfs:16777216; do
+        n=${f#*:} f=${f%%:*}
         want=$(sed -n "s/^\([0-9a-f]\{64\}\)  $f\.bin$/\1/p" "$d/SHA256SUMS")
         [ -n "$want" ] || die "$d/SHA256SUMS: no $f.bin"
+        [ -f "$d/$f.bin" ] || die "$d/$f.bin missing"
+        [ "$(stat -c %s "$d/$f.bin")" = $n ] || die "$d/$f.bin: not the size of the stock $f ($n bytes)"
         [ "$(sha256sum < "$d/$f.bin" | cut -d' ' -f1)" = "$want" ] || die "$d/$f.bin: damaged (SHA256SUMS)"
     done
     bmc=$(mtd bmc)
-    # stock REIMU 1.0.2: u-boot-env 0xe0000, kernel 0x100000, rofs 0x680000, rwfs 0x3000000
-    for p in u-boot-env:0xe0000 kernel:0x100000 rofs:0x680000 rwfs:0x3000000; do
-        f=$d/${p%%:*}.bin
-        [ -f $f ] || die "$f missing"
-        log "stock ${p%%:*} at ${p#*:}"
-        $FLASH write $bmc ${p#*:} $f 5 || die "${p%%:*}: write failed"
+    w=$(mktemp -d /tmp/reimu-ab.XXXXXX) || die "no /tmp"
+    trap 'rm -rf "$w"' EXIT
+    if verify_slot b; then
+        keep=b order="kernel rofs1 rofs2 env1 env2 rwfs"
+    elif verify_slot a; then
+        keep=a order="rofs2 kernel rofs1 env1 env2 rwfs"
+    else
+        keep= order="kernel rofs1 rofs2 env1 env2 rwfs"
+        log "neither slot is intact: nothing to boot if the restore is cut short"
+    fi
+    if [ -n "$keep" ]; then
+        env_set reimu_slot $keep; env_set reimu_tries 0; env_set reimu_pending 0
+        log "slot $keep boots until the stock firmware is complete"
+    fi
+    for p in $order; do
+        # PIECE: FILE, 64 KiB blocks skipped, blocks (0: to the end), offset
+        case $p in
+            kernel) set -- kernel 0 0 0x100000 ;;
+            rofs1) set -- rofs 0 344 0x680000 ;;   # 0x680000-0x1c00000
+            rofs2) set -- rofs 344 0 0x1c00000 ;;  # 0x1c00000-0x3000000
+            rwfs) set -- rwfs 0 0 0x3000000 ;;
+            env1) set -- u-boot-env 0 1 0xe0000 ;;
+            env2) set -- u-boot-env 1 1 0xf0000 ;;
+        esac
+        f=$d/$1.bin
+        if [ $2 != 0 ] || [ $3 != 0 ]; then
+            f=$w/piece
+            if [ $3 = 0 ]; then
+                dd if=$d/$1.bin of=$f bs=65536 skip=$2 2>/dev/null
+            else
+                dd if=$d/$1.bin of=$f bs=65536 skip=$2 count=$3 2>/dev/null
+            fi || die "$1: no room in /tmp for a piece of it"
+        fi
+        # all of the stock rwfs's place erased first (and checked): a stock
+        # rwfs cut short is then the start of the stock jffs2 on erased flash
+        # (which the stock firmware mounts), not mixed with the end of rofs-b
+        # and the A/B jffs2 (which it can't, or can, but without its ssh)
+        if [ $p = rwfs ]; then
+            dd if=/dev/zero bs=65536 count=256 2>/dev/null | tr '\000' '\377' > $w/piece
+            [ "$(stat -c %s $w/piece)" = 16777216 ] || die "rwfs: no room in /tmp to erase it"
+            log "erasing 0x3000000-0x4000000"
+            flash_write $bmc 0x3000000 $w/piece "erased rwfs" || die "erasing the rwfs's place failed"
+            rm -f $w/piece
+        fi
+        log "stock $p at $4"
+        flash_write $bmc $4 $f "stock $p" || die "stock $p: write failed"
+        rm -f $w/piece
     done
-    for p in u-boot-env:0xe0000 kernel:0x100000 rofs:0x680000 rwfs:0x3000000; do
+    for p in kernel:0x100000 rofs:0x680000 rwfs:0x3000000 u-boot-env:0xe0000; do
         $FLASH verify $bmc ${p#*:} $d/${p%%:*}.bin >/dev/null || die "${p%%:*}: differs on a second read"
     done
     say "stock firmware written and read back twice; reboot to start it"

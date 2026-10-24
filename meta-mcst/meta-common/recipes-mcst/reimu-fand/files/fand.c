@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "fand.h"
@@ -43,8 +44,8 @@
 #define TEMP_MIN 5.0       /* below: not a reading of a running part */
 #define TEMP_MAX 150.0
 
-const char *const group_id[NGROUPS] = { "pcs", "vrm", "iohub" };
-static const char *const group_name[NGROUPS] = { "Процессор (PCS)", "VRM", "IOHUB" };
+const char *const group_id[NGROUPS] = { "pcs", "vrm", "iohub", "gpu" };
+static const char *const group_name[NGROUPS] = { "Процессор (PCS)", "VRM", "IOHUB", "GPU (агент хоста)" };
 const char *const zone_id[NZONES] = { "cpu", "board" };
 static const char *const zone_name[NZONES] = { "Процессор (X37)", "Плата и корпус (X38–X40, EMC2305)" };
 const char *const mode_name[3] = { "auto", "manual", "full" };
@@ -205,8 +206,8 @@ int curve_parse(const char *s, struct curve *cv, double floor, char *err, size_t
 
 /* ------------------------------------------------------------------ config */
 static const char *const curve_keys[NZONES][NGROUPS] = {
-    { "CPU_PCS_CURVE", "CPU_VRM_CURVE", NULL },
-    { "BOARD_PCS_CURVE", "BOARD_VRM_CURVE", "BOARD_IOHUB_CURVE" },
+    { "CPU_PCS_CURVE", "CPU_VRM_CURVE", NULL, NULL },
+    { "BOARD_PCS_CURVE", "BOARD_VRM_CURVE", "BOARD_IOHUB_CURVE", "BOARD_GPU_CURVE" },
 };
 
 const char *curve_key(int zone, int group)
@@ -223,8 +224,10 @@ const char *curve_key(int zone, int group)
  * quieter below 70 °C; IOHUB (82-84 °C at full fans; warn 105, crit 110)
  * full speed at 98 °C; VRMs (ir38064, 62-74 °C) from 80 °C. */
 static const char *const curve_defaults[NZONES][NGROUPS] = {
-    { "45:30 55:38 60:47 65:60 70:80 75:100", "80:30 95:50 105:75 115:100", NULL },
-    { "50:30 60:40 65:55 70:75 75:100", "80:30 95:50 105:75 115:100", "75:30 85:50 92:75 98:100" },
+    { "45:30 55:38 60:47 65:60 70:80 75:100", "80:30 95:50 105:75 115:100", NULL, NULL },
+    /* GPU: the IOHUB sits behind the RX 5700 XT (it went 82 -> 90 °C when
+     * the GPU fans stopped, and 82 -> 56 °C with them at 40 %) */
+    { "50:30 60:40 65:55 70:75 75:100", "80:30 95:50 105:75 115:100", "75:30 85:50 92:75 98:100", "65:30 75:45 85:70 95:100" },
 };
 
 void cfg_defaults(struct config *c)
@@ -271,6 +274,7 @@ void cfg_defaults(struct config *c)
     c->cpu_fan = (struct devaddr){ 6, 0x4c };
     c->board_fan = (struct devaddr){ 2, 0x4c };
     c->iohub = (struct devaddr){ 2, 0x4c };
+    snprintf(c->gpu_file, sizeof(c->gpu_file), "/run/reimu-hostlink/gpu-temp");
     c->ncase = 2;
     c->case_fan[0] = (struct devaddr){ 2, 0x2c };
     c->case_fan[1] = (struct devaddr){ 2, 0x2e };
@@ -453,6 +457,13 @@ static void cfg_line(struct config *c, char *line, int lineno, int pass, char er
         else c->host_probe = b;
         return;
     }
+    if (!strcmp(k, "GPU_TEMP_FILE"))
+    {
+        if (!*v || !strcasecmp(v, "none")) c->gpu_file[0] = 0;
+        else if (v[0] != '/' || strlen(v) >= sizeof(c->gpu_file)) add_err(err, maxerr, nerr, "%s=%s: not an absolute path", k, v);
+        else snprintf(c->gpu_file, sizeof(c->gpu_file), "%s", v);
+        return;
+    }
     if (!strcmp(k, "TACH_MODE"))
     {
         if (!strcasecmp(v, "accurate")) c->tach_mode = 2;
@@ -533,22 +544,12 @@ int cfg_parse(struct config *c, const char *text, char err[][128], int maxerr)
             p += len + (e ? 1 : 0);
         }
     }
-    /* a useful range is a range: above its own minimum and the FLOOR */
-    if (c->cpu_fan_max <= fmax(c->cpu_fan_min, c->floor))
+    /* a range can't end below its own start. A FLOOR at or above a fan's
+     * maximum is fine: that fan runs at the FLOOR (FLOOR=100: always full) */
+    if (c->cpu_fan_max < c->cpu_fan_min)
     {
-        add_err(err, maxerr, &nerr, "CPU_FAN_MAX_DUTY %g not above CPU_FAN_MIN_DUTY %g and FLOOR %g: 100", c->cpu_fan_max,
-                c->cpu_fan_min, c->floor);
+        add_err(err, maxerr, &nerr, "CPU_FAN_MAX_DUTY %g below CPU_FAN_MIN_DUTY %g: 100", c->cpu_fan_max, c->cpu_fan_min);
         c->cpu_fan_max = 100;
-    }
-    if (c->board_fan_max <= c->floor)
-    {
-        add_err(err, maxerr, &nerr, "BOARD_FAN_MAX_DUTY %g not above FLOOR: 100", c->board_fan_max);
-        c->board_fan_max = 100;
-    }
-    if (c->case_fan_max <= c->floor)
-    {
-        add_err(err, maxerr, &nerr, "CASE_FAN_MAX_DUTY %g not above FLOOR: 100", c->case_fan_max);
-        c->case_fan_max = 100;
     }
     /* the stale time must be longer than a poll */
     if (c->stale_ms < 2 * c->poll_ms)
@@ -671,6 +672,7 @@ static void setup_groups(struct fand *f)
     for (int i = 0; i < c->nvrm; i++) f->g[G_VRM].s[i].addr = c->vrm[i];
     f->g[G_IOHUB].n = c->iohub.bus >= 0 ? 1 : 0;
     f->g[G_IOHUB].s[0].addr = c->iohub.addr;
+    f->g[G_GPU].n = c->gpu_file[0] ? 1 : 0;
 }
 
 void fand_init(struct fand *f, const struct config *c, int64_t now)
@@ -800,6 +802,27 @@ static double read_sensor(struct fand *f, int g, struct sensor *s, const char **
     return v;
 }
 
+/* the host's GPU, from reimu-hostlink: an integer of m°C, the file not
+ * older than 30 s; NAN = none (the host off, no agent, stale, garbage) */
+static double read_gpu(const char *file)
+{
+    char s[32];
+    struct stat st;
+    int fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NAN;
+    ssize_t n = fstat(fd, &st) ? -1 : read(fd, s, sizeof(s) - 1);
+    close(fd);
+    if (n <= 0) return NAN;
+    time_t now = time(NULL);
+    if (st.st_mtime > now + 5 || now - st.st_mtime > 30) return NAN;
+    s[n] = 0;
+    char *e;
+    long v = strtol(s, &e, 10);
+    if (e == s || (*e && *e != '\n')) return NAN;
+    double t = v / 1000.0;
+    return t >= TEMP_MIN && t <= TEMP_MAX ? t : NAN;
+}
+
 static void read_groups(struct fand *f)
 {
     for (int g = 0; g < NGROUPS; g++)
@@ -811,6 +834,17 @@ static void read_groups(struct fand *f)
         gr->max = NAN;
         gr->why[0] = 0;
         if (!gr->n || !used) continue;
+        if (g == G_GPU)
+        {
+            /* optional: never "failing", whatever the file says */
+            gr->max = read_gpu(f->c.gpu_file);
+            if (!isnan(gr->max))
+            {
+                gr->s[0].v = gr->max;
+                gr->s[0].last_ok = f->now;
+            }
+            continue;
+        }
         for (int i = 0; i < gr->n; i++)
         {
             struct sensor *s = &gr->s[i];
@@ -961,12 +995,13 @@ static int write_emc2305(struct fand *f, struct output *o, double duty)
 }
 
 /* zone duty (FLOOR..100) -> this fan's duty: spread over its useful range,
- * 100 stays 100 (full scale) */
+ * 100 stays 100 (full scale). A range that is a point (its maximum at or
+ * below the FLOOR or its minimum): that duty */
 static double fan_duty(const struct output *o, double floor, double z)
 {
     if (z >= 100) return 100;
     double lo = fmax(o->min_duty, floor), hi = o->max_duty;
-    if (hi <= lo || floor >= 100) return fmax(z, lo);
+    if (hi <= lo || floor >= 100) return lo;
     double d = lo + (z - floor) * (hi - lo) / (100 - floor);
     return fmin(fmax(d, lo), hi);
 }
@@ -1207,6 +1242,13 @@ static void zone_step(struct fand *f, int zi, double dt)
             continue;
         }
         double t = f->g[g].max;
+        if (g == G_GPU && isnan(t))
+        {
+            /* an optional input without a reading: no demand */
+            in->have = 0;
+            in->demand = NAN;
+            continue;
+        }
         if (!in->have || t >= in->t_eff) in->t_eff = t;
         else if (t <= in->t_eff - c->hyst) in->t_eff = t + c->hyst;
         in->have = 1;
@@ -1225,6 +1267,11 @@ static void zone_step(struct fand *f, int zi, double dt)
     {
         target = 100;
         snprintf(reason, sizeof(reason), "%s", f->tach_alarm ? "отказ вентилятора процессора" : "вентилятор не управляется");
+    }
+    else if (f->turbo_until > f->now)
+    {
+        target = 100;
+        snprintf(reason, sizeof(reason), "турбо");
     }
     else if (zi == Z_CPU && f->tach_verify)
     {
@@ -1350,6 +1397,12 @@ void fand_step(struct fand *f, int64_t now, int host)
     if (host != f->host) f->gen++;
     f->host = host;
     manual_timeouts(f);
+    if (f->turbo_until && now >= f->turbo_until)
+    {
+        f->turbo_until = 0;
+        fand_log(5, "turbo over: back to the curves");
+        f->gen++;
+    }
 
     if (host == HOST_PENDING)
     {
@@ -1512,6 +1565,34 @@ void fand_clear_alarms(struct fand *f)
     f->gen++;
 }
 
+int fand_set_turbo(struct fand *f, unsigned minutes, char *err, size_t n)
+{
+    if (minutes == FAND_TURBO_UNTIL_OFF) minutes = FAND_TURBO_MAX_MIN;
+    else if (minutes > FAND_TURBO_MAX_MIN)
+    {
+        snprintf(err, n, "turbo %u min: 1..%d, 0 = off, %u = until off (%d h at most)", minutes, FAND_TURBO_MAX_MIN,
+                 FAND_TURBO_UNTIL_OFF, FAND_TURBO_MAX_MIN / 60);
+        return -1;
+    }
+    if (!minutes)
+    {
+        if (f->turbo_until) fand_log(5, "turbo off: back to the curves");
+        f->turbo_until = 0;
+    }
+    else
+    {
+        f->turbo_until = f->now + (int64_t)minutes * 60000;
+        fand_log(5, "turbo: every fan full scale for %u min", minutes);
+    }
+    f->gen++;
+    return 0;
+}
+
+int fand_turbo_left(const struct fand *f)
+{
+    return f->turbo_until > f->now ? (int)((f->turbo_until - f->now + 999) / 1000) : 0;
+}
+
 int fand_alarm(const struct fand *f)
 {
     if (f->tach_alarm || f->out_alarm) return 1;
@@ -1567,6 +1648,8 @@ void fand_json(const struct fand *f, struct buf *b)
         buf_printf(b, "\"settle_left\":%lld,", (long long)((c->settle_ms - (f->now - f->on_since) + 999) / 1000));
     if (f->phase == PH_RUN && f->now < f->full_until)
         buf_printf(b, "\"full_left\":%lld,", (long long)((f->full_until - f->now + 999) / 1000));
+    buf_printf(b, "\"turbo\":%s,\"turbo_left\":%d,\"turbo_max_min\":%d,", fand_turbo_left(f) ? "true" : "false",
+               fand_turbo_left(f), FAND_TURBO_MAX_MIN);
     buf_printf(b, "\"floor\":%g,\"hysteresis\":%g,\"slew_up\":%g,\"slew_down\":%g,\"manual_timeout\":%d,", c->floor, c->hyst,
                c->slew_up, c->slew_down, c->manual_timeout_ms / 1000);
     buf_printf(b, "\"alarm\":%s,\"alarm_text\":", fand_alarm(f) ? "true" : "false");
@@ -1592,8 +1675,13 @@ void fand_json(const struct fand *f, struct buf *b)
         buf_num(b, run && gr->valid ? gr->max : NAN, 1);
         buf_printf(b, ",\"why\":");
         buf_jstr(b, run ? gr->why : "");
+        if (g == G_GPU)
+        {
+            buf_printf(b, ",\"optional\":true,\"file\":");
+            buf_jstr(b, c->gpu_file);
+        }
         buf_printf(b, ",\"sensors\":[");
-        for (int i = 0; i < gr->n; i++)
+        for (int i = 0; g != G_GPU && i < gr->n; i++)
         {
             const struct sensor *s = &gr->s[i];
             int fresh = run && s->last_ok && f->now - s->last_ok <= c->stale_ms;

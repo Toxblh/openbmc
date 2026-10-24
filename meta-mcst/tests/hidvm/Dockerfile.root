@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus udev openssh-server \
+      python3 python3-usb evtest sg3-utils busybox gcc make libc6-dev libssl-dev libsystemd-dev pkg-config \
+      iproute2 usbutils kmod openssl util-linux procps strace nbd-client \
+      libvncserver-dev g++ && rm -rf /var/lib/apt/lists/*
+COPY id_hidvm.pub /root/.ssh/authorized_keys
+COPY xyz.openbmc_project.Reimu.Kvm.conf /etc/dbus-1/system.d/
+RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && \
+    printf '[Match]\nName=e*\n[Network]\nDHCP=yes\n' > /etc/systemd/network/10-e.network && \
+    systemctl enable systemd-networkd ssh && \
+    echo 'hidvm' > /etc/hostname && passwd -d root && \
+    printf 'hostfs /mnt 9p trans=virtio,version=9p2000.L,nofail 0 0\n' > /etc/fstab && \
+    systemctl mask systemd-resolved systemd-timesyncd apt-daily.timer apt-daily-upgrade.timer 2>/dev/null; \
+    echo 'nameserver 10.0.2.3' > /etc/resolv.conf.vm; true

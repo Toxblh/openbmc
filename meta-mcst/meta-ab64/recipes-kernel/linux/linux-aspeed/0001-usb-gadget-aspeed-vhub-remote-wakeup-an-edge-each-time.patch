@@ -1,0 +1,49 @@
+From: REIMU <reimu@localhost>
+Subject: [PATCH] usb: gadget: aspeed-vhub: remote wakeup: an edge each time
+
+ast_vhub_send_host_wakeup() sets VHUB_CTRL_MANUAL_REMOTE_WAKEUP and nothing
+ever clears it. When the host has suspended the hub (USB autosuspend of the
+hub with nothing on its ports, remote wakeup enabled) and a gadget then
+connects to a port, ast_vhub_device_connect() asks for a wakeup; on the
+REIMU-5564 board the host never woke (its "usb 4-4: usb auto-suspend,
+wakeup 1" stayed, the HID gadget never enumerated). If the hardware acts on
+the bit going from 0 to 1, every wakeup after the first one is lost: clear
+it before setting it, and once the bus has resumed. Harmless if the
+hardware clears it itself. Same code in 5.10.
+
+Not verified on the hardware: on the board, a "devmem 0x1e6a0000" with bit 4
+set while the hub runs (after a gadget connected) shows the bit stuck.
+
+---
+--- a/drivers/usb/gadget/udc/aspeed-vhub/hub.c
++++ b/drivers/usb/gadget/udc/aspeed-vhub/hub.c
+@@ -533,9 +533,15 @@
+ static void ast_vhub_send_host_wakeup(struct ast_vhub *vhub)
+ {
+ 	u32 reg = readl(vhub->regs + AST_VHUB_CTRL);
+-	UDCDBG(vhub, "Waking up host !\n");
+-	reg |= VHUB_CTRL_MANUAL_REMOTE_WAKEUP;
+-	writel(reg, vhub->regs + AST_VHUB_CTRL);
++	UDCDBG(vhub, "Waking up host (ctrl %08x) !\n", reg);
++	/*
++	 * Nothing ever cleared the manual remote wakeup bit: if the
++	 * hardware only acts on it going from 0 to 1, every wakeup after
++	 * the first one was lost. Make it an edge each time (harmless if
++	 * the hardware clears the bit itself).
++	 */
++	writel(reg & ~VHUB_CTRL_MANUAL_REMOTE_WAKEUP, vhub->regs + AST_VHUB_CTRL);
++	writel(reg | VHUB_CTRL_MANUAL_REMOTE_WAKEUP, vhub->regs + AST_VHUB_CTRL);
+ }
+ 
+ void ast_vhub_device_connect(struct ast_vhub *vhub,
+@@ -846,6 +852,10 @@
+ 
+ 	vhub->suspended = false;
+ 
++	/* The wakeup (if it was ours) is done: the bit back to 0 */
++	writel(readl(vhub->regs + AST_VHUB_CTRL) & ~VHUB_CTRL_MANUAL_REMOTE_WAKEUP,
++	       vhub->regs + AST_VHUB_CTRL);
++
+ 	/*
+ 	 * Forward to unsuspended ports without changing
+ 	 * their connection status.

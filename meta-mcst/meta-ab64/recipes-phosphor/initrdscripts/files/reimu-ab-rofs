@@ -8,8 +8,11 @@
 # rewritten while it runs. (This busybox has no head -c or head -N.)
 #
 # A bad rofs falls back to the other slot's; the outcome is in
-# /run/initramfs/reimu-ab (read by reimu-ab status):
-#   kernel=a rofs=a|b state=ok|fallback|ram
+# /run/initramfs/reimu-ab (read by reimu-ab status, boot, install):
+#   kernel=a|b rofs=a|b|ram state=ok|fallback|ram
+# kernel: reimu.slot (the slot U-Boot booted, or the kexec said); rofs: the
+# slot whose rofs runs, ram: the one in the initrd; state: ok (the kernel's
+# own rofs), fallback (rofs-<kernel> is damaged: the other one runs), ram.
 # reimu.ram (reimu-ab ram, a kexec): nothing of the flash is mounted, the
 # rwfs is in RAM. reimu.test (a kexec test from another firmware): the same,
 # with the rofs in the initrd (/image-rofs); the flash isn't even read.

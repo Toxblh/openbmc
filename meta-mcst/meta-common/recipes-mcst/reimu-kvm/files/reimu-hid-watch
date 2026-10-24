@@ -1,0 +1,137 @@
+#!/bin/sh
+# reimu-hid-watch: brings the KVM keyboard and mouse back when the host,
+# powered and running, has not enumerated them: ONE reset of the virtual hub
+# (the aspeed_vhub driver unbound and bound: the host sees the hub unplugged
+# and plugged in again) per host power-on, never more.
+#
+# Why: once the host has suspended the BMC's hub (USB autosuspend while no
+# gadget was on it) a gadget connecting later does not wake it, and the
+# keyboard and mouse stay invisible to the host until it resumes the hub (see
+# reimu-host.sh's udev rule). Nothing in the firmware unbinds obmc_hid in
+# normal operation; this is the way back for when it happened anyway.
+#
+# Whether the host has the gadget, either of:
+#   - the port's UDC state "not attached": the port was (re)made (a boot, a
+#     kexec, a vhub reset) and the host has never configured the gadget since;
+#   - reimu-kvm's Status "usboff", the seconds since the host's configuration
+#     of the keyboard went away (f_hid answers ESHUTDOWN until the host
+#     configures it again): the state stays "configured" across an unbind and
+#     bind of the gadget (only a bus reset changes it).
+#
+# Rules (every POLL seconds):
+#   - the host powered on (chassis CurrentPowerState On) for GRACE seconds and
+#     obmc_hid bound to a vhub port, and the host hasn't had the keyboard for
+#     GRACE seconds: the vhub is reset, once;
+#   - not while a virtual media gadget is bound (a reset drops the disk the
+#     host may be booting from), not again until the host is powered off and
+#     on (no repeated rebinds while the host boots: its firmware may take its
+#     time before it starts USB).
+#
+# The reset (measured on the board): obmc_hid's UDC is bound again right
+# after the vhub driver is back and the host has addressed the hub
+# (AST_VHUB_CONF != 0: the high-speed handshake is over), polled every 20 ms,
+# before the host's hub driver scans the ports (>= 100 ms after it powers
+# them). Bound 2 s later, the host saw an empty hub and suspended it at once;
+# bound within 20 ms of the driver bind, the host took the hub at full speed.
+# The other gadgets are bound after it.
+ROOT=${ROOT:-}                  # tests: a fake /sys
+POLL=${POLL:-5}
+GRACE=${GRACE:-15}
+VHUB=${VHUB:-1e6a0000.usb-vhub}
+G=$ROOT/sys/kernel/config/usb_gadget
+DRV=$ROOT/sys/bus/platform/drivers/${VHUB_DRIVER:-aspeed_vhub}
+HOST_ON=${HOST_ON:-host_on}     # tests: a command saying whether the host is on
+USBOFF=${USBOFF:-usb_off}       # tests: a command printing reimu-kvm's "usboff"
+DEVMEM=${DEVMEM:-devmem}        # tests: a fake register read
+REG_CONF=0x1E6A0004             # AST_VHUB_CONF: the hub's USB address
+REG_USBSTS=0x1E6A0024           # AST_VHUB_USBSTS: bit 27 high speed
+
+log() { echo "reimu-hid-watch: $*"; }
+
+host_on() {
+    busctl get-property xyz.openbmc_project.State.Chassis /xyz/openbmc_project/state/chassis0 \
+        xyz.openbmc_project.State.Chassis CurrentPowerState 2>/dev/null | grep -q 'PowerState\.On"'
+}
+
+uptime_s() { cut -d. -f1 /proc/uptime; }
+
+usb_off() {
+    busctl call xyz.openbmc_project.Reimu.Kvm /xyz/openbmc_project/reimu/kvm \
+        xyz.openbmc_project.Reimu.Kvm Status 2>/dev/null | sed -n 's/.*\\"usboff\\":\([0-9]*\).*/\1/p'
+}
+
+media_bound() {
+    for u in $G/mass-storage*/UDC; do
+        [ -s "$u" ] && [ -n "$(cat "$u")" ] && return 0
+    done
+    return 1
+}
+
+reset_vhub() {
+    saved= hid=
+    for u in $G/*/UDC; do
+        [ -f "$u" ] || continue
+        p=$(cat "$u")
+        [ -n "$p" ] || continue
+        if [ "${u%/UDC}" = $G/obmc_hid ]; then hid=$p; else saved="$saved ${u%/UDC}=$p"; fi
+    done
+    log "the powered host has not had the KVM keyboard ($1): resetting the virtual hub (obmc_hid=$hid$saved)"
+    echo "$VHUB" > $DRV/unbind || { log "unbind failed"; return 1; }
+    sleep 1
+    echo "$VHUB" > $DRV/bind || { log "bind failed"; return 1; }
+    # the port back and the hub addressed by the host, at most 3 s
+    i=0 addr=0
+    while [ $i -lt 150 ]; do
+        if [ -e $ROOT/sys/class/udc/$hid ]; then
+            addr=$(( $($DEVMEM $REG_CONF 2>/dev/null || echo 0) & 0x7f ))
+            [ $addr != 0 ] && break
+        fi
+        usleep 20000
+        i=$((i + 1))
+    done
+    [ $addr = 0 ] && log "the host did not address the hub within 3 s"
+    if [ "$(cat $G/obmc_hid/UDC 2>/dev/null)" != "$hid" ]; then
+        echo "$hid" > $G/obmc_hid/UDC 2>/dev/null || log "obmc_hid: binding to $hid failed"
+    fi
+    if [ $addr != 0 ] && [ $(( ($($DEVMEM $REG_USBSTS 2>/dev/null || echo 0) >> 27) & 1 )) = 0 ]; then
+        log "the host took the hub at full speed (12 Mbit/s), not high speed"
+    fi
+    # (the gadget core binds a gadget again by itself when its UDC comes back;
+    # whatever isn't, is bound here)
+    for s in $saved; do
+        [ "$(cat "${s%%=*}/UDC" 2>/dev/null)" = "${s#*=}" ] && continue
+        echo "${s#*=}" > "${s%%=*}/UDC" 2>/dev/null || log "${s%%=*}: binding to ${s#*=} failed"
+    done
+    log "virtual hub reset, gadgets bound again (hub address $addr)"
+}
+
+on_since= na_since= done_this_power_on=0
+while :; do
+    t=$(uptime_s)
+    if $HOST_ON; then
+        [ -n "$on_since" ] || on_since=$t
+    else
+        on_since= done_this_power_on=0
+    fi
+    udc=$(cat $G/obmc_hid/UDC 2>/dev/null)
+    state=$(cat $ROOT/sys/class/udc/$udc/state 2>/dev/null)
+    if [ -n "$udc" ] && [ "$state" = "not attached" ]; then
+        [ -n "$na_since" ] || na_since=$t
+    else
+        na_since=
+    fi
+    off=$($USBOFF)
+    lost=
+    [ "${off:-0}" -ge $GRACE ] && lost="usboff $off s"
+    [ -n "$na_since" ] && [ $((t - na_since)) -ge $GRACE ] && lost="not attached for $((t - na_since)) s"
+    if [ -n "$on_since" ] && [ -n "$udc" ] && [ $done_this_power_on = 0 ] &&
+       [ $((t - on_since)) -ge $GRACE ] && [ -n "$lost" ]; then
+        if media_bound; then
+            log "the host has not had the KVM keyboard ($lost), but virtual media is in use: no reset"
+        else
+            reset_vhub "$lost"
+        fi
+        done_this_power_on=1
+    fi
+    sleep $POLL
+done

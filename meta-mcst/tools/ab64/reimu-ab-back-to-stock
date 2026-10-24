@@ -26,6 +26,7 @@ w=$(mktemp -d); trap 'rm -rf "$w" ${ap:-}' EXIT
 cp "$d/zImage" "$d/initrd" "$d/fdt" "$w/"
 for n in "ethaddr 1e660000" "eth1addr 1e680000"; do
     mac=$(r "fw_printenv -n ${n% *}" | tr 'A-F:' 'a-f ')
+    [ $(echo $mac | wc -w) = 6 ] || { echo "no ${n% *} in the U-Boot environment" >&2; exit 1; }
     fdtput -t bx "$w/fdt" /ahb/ethernet@${n#* } local-mac-address $mac
 done
 r 'rm -rf /tmp/stock-kx && mkdir -p /tmp/stock-kx'

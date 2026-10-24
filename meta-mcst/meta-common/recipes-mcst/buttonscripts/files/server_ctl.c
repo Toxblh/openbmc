@@ -5,26 +5,57 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <syslog.h>
+#include <unistd.h>
 #include "reimu.h"
 
 /* The PNS flash is switched to the BMC (reimu-pns-flash, under this lock)
  * only while the platform is off. Nothing that can power the platform on
  * runs while a flash job holds the lock; once it is ours (held until we
  * exit, so no job starts meanwhile) the flash goes back to the host, in
- * case a job was killed with it switched to the BMC. */
+ * case a job was killed with it switched to the BMC. A job that is just
+ * ending (or reimu-pns-flash disconnect) holds it for a moment: wait for it
+ * up to PNS_WAIT_MS; a real read or write takes minutes: refused then. */
 #define PNS_LOCK_DIR "/run/reimu-pns"
 #define PNS_LOCK PNS_LOCK_DIR "/lock"
+#define PNS_WAIT_MS 15000
+/* power good after the power button: the lock is kept until then (a job
+ * started meanwhile would see the platform off and take the flash) */
+#define POWER_ON_WAIT_S 10
+
+static int pns_fd = -1;
+
+static int pns_lock(int wait_ms)
+{
+    if (pns_fd >= 0) return 0;
+    mkdir(PNS_LOCK_DIR, 0755);
+    int fd = open(PNS_LOCK, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    for (int ms = 0; flock(fd, LOCK_EX | LOCK_NB); ms += 200)
+    {
+        if (ms >= wait_ms)
+        {
+            close(fd);
+            return 53;
+        }
+        if (ms == 0)
+        {
+            fprintf(stderr, "The PNS flash is busy (reimu-pns-flash): waiting for it up to %d s\n", wait_ms / 1000);
+            syslog(LOG_WARNING, "PNS flash busy (reimu-pns-flash): waiting for it up to %d s", wait_ms / 1000);
+        }
+        reimu_msleep(200, NULL);
+    }
+    pns_fd = fd;
+    return 0;
+}
 
 static int pns_guard(void)
 {
-    static int fd = -1;
-    if (fd >= 0) return 0;
-    mkdir(PNS_LOCK_DIR, 0755);
-    fd = open(PNS_LOCK, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return 0;
-    if (flock(fd, LOCK_EX | LOCK_NB))
+    if (pns_fd >= 0) return 0;
+    if (pns_lock(PNS_WAIT_MS))
     {
         fprintf(stderr, "The PNS flash is being read or written (reimu-pns-flash): the platform can't be powered on or reset now\n");
+        syslog(LOG_ERR, "REFUSED: the PNS flash is being read or written (reimu-pns-flash): the platform can't be powered on or reset now");
         return 53;
     }
     if (system(". /libexec/gpio-funcs && gpiowrite `gpio2num $GPIO_SPI_CONNECT` 0") != 0)
@@ -41,7 +72,17 @@ static int press_button(const char *sym, int delay)
 {
     int rv = pns_guard();
     if (rv) return rv;
-    return reimu_set_gpio_by_name(sym, 0, delay);
+    /* the power button of a platform that is off: it powers up */
+    int powering_on = !strcmp(sym, "GPIO_PWR_BTN") && get_power_state() == 0;
+    rv = reimu_set_gpio_by_name(sym, 0, delay);
+    if (rv || !powering_on) return rv;
+    for (int i = 0; i < POWER_ON_WAIT_S * 5; ++i)
+    {
+        if (get_power_state() == 1) return 0;
+        reimu_msleep(200, NULL);
+    }
+    fprintf(stderr, "No power good %d s after the power button\n", POWER_ON_WAIT_S);
+    return 0;
 }
 
 static int server_pwrbut_s(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
@@ -99,6 +140,10 @@ static int dbus_watchdog_off(void)
 
 static int server_watchdog_reset(int argc, char *argv[])
 {
+    /* (host-poweron, after server_pwr_on) the lock while power good may
+     * still come: no PNS job meanwhile; nothing is pressed here, so it goes
+     * on without it */
+    pns_lock(2000);
     /* 10 seconds should be fair enough for power to became on. */
     for(int sec = 10; sec > 0; --sec)
     {
@@ -336,6 +381,7 @@ struct func_list_t main_cmds[] =
 int main(int argc, char *argv[])
 {
     char *cmd = basename(argv[0]);
+    openlog(cmd, LOG_PID, LOG_DAEMON);
     for (int i = 0; main_cmds[i].basename != NULL; ++i)
     {
         if (strcmp(cmd, main_cmds[i].basename)) continue;

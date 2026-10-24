@@ -67,3 +67,24 @@ for x86 on it:
     STUB_LIBS=<dir with the VM's libsystemd.so.0, libudev.so.1, libpam.so.0> \
         TARGET=x86_64 ../tools/webdev/build.sh /tmp/webdev-x86
     DEVKIT=/tmp/webdev-x86/reimu-webdev-*-x86_64.tar.gz STOCK_BMCWEB=<stock bmcweb> node e2e/webdev.spec.mjs
+
+## Regression rule
+
+Every defect found, in QEMU, on the board or by a user, gets a regression
+test before (or with) its fix, and the test is shown to catch it:
+
+1. write the test (a check in the suite closest to the code, or a static
+   one in `ab64/test_static.py` when it is about the tree or the image);
+2. run it on the buggy version and keep the FAIL line (red): the image or
+   commit before the fix, the old file put back on a running BMC, or a
+   mutant (`test_static.py --red`, `REG_RED=1 ab64/test_regressions_qemu.py`
+   do that for the bugs they cover);
+3. run it on the fixed version: PASS (green);
+4. add a row to `ab64/REGRESSIONS.md`: what broke, the fix, the test, the
+   red and the green evidence. What QEMU can't show gets a read-only line
+   in `ab64/board-check.sh` and says so in the row.
+
+A test that never went red doesn't count as covering the bug.
+
+    docker exec reimu python3 /work/openbmc/meta-mcst/tests/ab64/test_static.py --red   # tree, image, unit tests
+    RQ=/tmp/rq AB_SSH=2422 AB_HTTPS=2443 AB_IPMI=2423 REG_RED=1 ab64/test_regressions_qemu.py WORKDIR

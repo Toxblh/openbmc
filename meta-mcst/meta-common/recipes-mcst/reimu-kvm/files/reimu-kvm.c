@@ -15,7 +15,8 @@
 //
 // Messages, server -> browser (binary):
 //   1  u8 type, u16 width, u16 height, u32 sequence, JPEG bytes   a frame
-// server -> browser (text): {"t":"stat",...} once a second, {"t":"nosignal"}
+// server -> browser (text): {"t":"stat",...} once a second (with "leds": the
+// host's keyboard LEDs, bit 0 Num, 1 Caps, 2 Scroll Lock), {"t":"nosignal"}
 // browser -> server (binary):
 //   2  u8 type, u8 HID usage, u8 down        a key (usages 0xe0..0xe7: modifiers)
 //   3  u8 type, u8 buttons, u16 x, u16 y     the pointer, x/y 0..32767 (LE)
@@ -119,71 +120,285 @@ static int ticket_take(const char *id)
 }
 
 // ------------------------------------------------------------------ HID
-static int kbd_fd = -1, ptr_fd = -1;
-// buttons, x (LE), y (LE), wheel, pan: f_hid cuts a write to the gadget's
-// report_length, so the same 7 bytes suit the stock 5-byte mouse
-static uint8_t keys[8], ptr_rep[7];
+// f_hid has one report in flight per device: a write() while the host hasn't
+// fetched the previous report fails with EAGAIN (the fds are non-blocking, the
+// loop never waits on the host). So every report goes into its device's queue
+// and is written when the device takes it (EPOLLOUT): no press, release or
+// click is lost. Pointer moves with the same buttons are merged into the
+// queued move (the newest position), wheel steps added up. A device that takes
+// nothing for HID_STALL seconds (host off, suspended, gone): its queue is
+// dropped and everything released; that report goes out once it reads again.
+// A write error other than EAGAIN (ESHUTDOWN: unbound/disconnected, ENODEV,
+// ENXIO...) closes the fd: the next report opens the device again (a UDC
+// rebind makes a new function instance behind the same /dev/hidgN).
+#define HID_QLEN 512
+#define HID_STALL 2.0
+#define TAG_KBD 0xfffffff4u
+#define TAG_PTR 0xfffffff5u
+// GADGET_HID_WRITE_GET_REPORT (6.18 f_hid, linux/usb/g_hid.h; older headers
+// lack it): the report a host's GET_REPORT gets at once; without one f_hid
+// waits 2.5 s for userspace and then answers zeros
+struct hidg_get_report { uint8_t report_id, userspace_req; uint16_t length; uint8_t data[64], padding[4]; };
+#define HIDG_WRITE_GET_REPORT _IOW('g', 0x42, struct hidg_get_report)
 
-static void hid_open(void)
+struct hiddev {
+    const char **path;
+    int fd;
+    uint32_t tag;
+    size_t len;              // report bytes (f_hid cuts a write to report_length)
+    uint8_t q[HID_QLEN][8];  // queued reports, oldest at head
+    uint8_t mergeable[HID_QLEN]; // a move/scroll a later one may merge into
+    int head, n;
+    uint8_t last[8];         // the last report the host took
+    double stuck;            // since when the head has waited (0: not waiting)
+    int polling, gaveup;
+    long written, merged, dropped;
+};
+static struct hiddev kbd = { .path = &kbd_path, .fd = -1, .tag = TAG_KBD, .len = 8 };
+// buttons, x (LE), y (LE), wheel, pan: 7 bytes (a 5-byte stock mouse drops the last two)
+static struct hiddev ptr = { .path = &ptr_path, .fd = -1, .tag = TAG_PTR, .len = 7 };
+static uint8_t mods, down[16], ptr_rep[7];
+static int ndown;
+static uint8_t leds; // the host's keyboard LEDs (bit 0 Num, 1 Caps, 2 Scroll Lock)
+// whether the host has the keyboard function enabled (configured it since the
+// gadget was bound): f_hid answers a read with ESHUTDOWN once the host's
+// configuration went (unbind, disconnect) until the host sets it again; the
+// UDC's sysfs "state" can't tell (it stays "configured" across a rebind).
+// Since when it has been off (0: on or unknown): Status "usboff" for
+// reimu-hid-watch
+static double usb_off_since;
+
+static void hid_epoll(struct hiddev *d, int out)
 {
-    if (kbd_fd < 0) kbd_fd = open(kbd_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-    if (ptr_fd < 0) ptr_fd = open(ptr_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    struct epoll_event ev = { .events = EPOLLIN | (out ? EPOLLOUT : 0), .data.u32 = d->tag };
+    epoll_ctl(ep, EPOLL_CTL_MOD, d->fd, &ev);
+    d->polling = out;
 }
 
-static void hid_write(int *fd, const uint8_t *rep, size_t n)
+static void hid_get_report(struct hiddev *d, const uint8_t *rep)
 {
-    hid_open();
-    if (*fd < 0) return;
-    if (write(*fd, rep, n) != (ssize_t)n && errno == ESHUTDOWN) {
-        close(*fd);
-        *fd = -1;
+    struct hidg_get_report r = { .length = d->len };
+    memcpy(r.data, rep, d->len);
+    ioctl(d->fd, HIDG_WRITE_GET_REPORT, &r); // ENOTTY before 6.x: harmless
+}
+
+static void hid_read(struct hiddev *d);
+
+static int hid_open(struct hiddev *d)
+{
+    if (d->fd >= 0) return 0;
+    d->fd = open(*d->path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (d->fd < 0) return -1;
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = d->tag };
+    epoll_ctl(ep, EPOLL_CTL_ADD, d->fd, &ev);
+    d->polling = 0;
+    hid_get_report(d, d->last);
+    if (d == &kbd) hid_read(d); // enabled by the host or not (see usb_off_since)
+    return d->fd >= 0 ? 0 : -1;
+}
+
+static void hid_close(struct hiddev *d)
+{
+    if (d->fd < 0) return;
+    epoll_ctl(ep, EPOLL_CTL_DEL, d->fd, NULL);
+    close(d->fd);
+    d->fd = -1;
+    d->polling = 0;
+}
+
+// write the queue while the device takes it
+static void hid_flush(struct hiddev *d)
+{
+    while (d->n) {
+        if (hid_open(d) < 0) { d->dropped += d->n; d->n = 0; break; } // no device to deliver to
+        uint8_t *r = d->q[d->head];
+        ssize_t w = write(d->fd, r, d->len);
+        if (w == (ssize_t)d->len) {
+            memcpy(d->last, r, d->len);
+            hid_get_report(d, r);
+            d->head = (d->head + 1) % HID_QLEN;
+            d->n--;
+            d->written++;
+            d->stuck = 0;
+            d->gaveup = 0;
+            if (d == &kbd) usb_off_since = 0;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EINTR)) {
+            if (!d->stuck) d->stuck = now();
+            if (!d->polling) hid_epoll(d, 1);
+            return;
+        }
+        DBG("%s: %s, reopened at the next report", *d->path, w < 0 ? strerror(errno) : "short write");
+        hid_close(d);
+        d->dropped += d->n;
+        d->n = 0;
+        break;
+    }
+    d->stuck = 0;
+    if (d->fd >= 0 && d->polling) hid_epoll(d, 0);
+}
+
+// queue a report (mergeable: a pointer move or scroll with unchanged buttons)
+static void hid_push(struct hiddev *d, const uint8_t *rep, int mergeable)
+{
+    int t = (d->head + d->n - 1 + HID_QLEN) % HID_QLEN;
+    uint8_t *tail = d->n ? d->q[t] : d->last;
+    int rel = d == &ptr && (rep[5] || rep[6]);
+    if (!rel && !memcmp(tail, rep, d->len)) return; // nothing new for the host
+    if (d->n && mergeable && d->mergeable[t] && tail[0] == rep[0]) {
+        int w = (int8_t)tail[5] + (int8_t)rep[5], p = (int8_t)tail[6] + (int8_t)rep[6];
+        if (w >= -127 && w <= 127 && p >= -127 && p <= 127) {
+            memcpy(tail + 1, rep + 1, 4);
+            tail[5] = (uint8_t)w, tail[6] = (uint8_t)p;
+            d->merged++;
+            hid_flush(d);
+            return;
+        }
+    }
+    if (d->n == HID_QLEN) {
+        // full (a host that reads slower than the browser sends for long):
+        // the newest state in place of the last queued one
+        memcpy(d->q[t], rep, d->len);
+        d->mergeable[t] = 0;
+        d->dropped++;
+    } else {
+        int i = (d->head + d->n) % HID_QLEN;
+        memcpy(d->q[i], rep, d->len);
+        d->mergeable[i] = mergeable;
+        d->n++;
+    }
+    hid_flush(d);
+}
+
+// the device's OUT reports: the keyboard's LEDs (SET_REPORT, 1 byte)
+static void hid_read(struct hiddev *d)
+{
+    uint8_t b[64];
+    for (;;) {
+        ssize_t n = read(d->fd, b, sizeof b);
+        if (n > 0) {
+            if (d == &kbd) leds = b[0], usb_off_since = 0;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+            if (d == &kbd) usb_off_since = 0;
+            return;
+        }
+        // ESHUTDOWN: the host's configuration is gone (unbound, disconnected)
+        if (d == &kbd && !usb_off_since) usb_off_since = now();
+        hid_close(d);
+        return;
     }
 }
 
-static void key_event(uint8_t usage, int down)
+static void hid_io(struct hiddev *d, uint32_t events)
+{
+    if (d->fd < 0) return;
+    if (events & EPOLLIN) hid_read(d);
+    if (d->fd >= 0 && (events & EPOLLOUT)) hid_flush(d);
+}
+
+// more keys down than the report's 6 slots: ErrorRollOver (usage 1) in every
+// slot, as a real keyboard does; the host keeps its state until fewer are down
+static void kbd_report(uint8_t *r)
+{
+    memset(r, 0, 8);
+    r[0] = mods;
+    if (ndown > 6) memset(r + 2, 0x01, 6);
+    else memcpy(r + 2, down, ndown);
+}
+
+static void key_event(uint8_t usage, int dn)
 {
     if (usage >= 0xe0 && usage <= 0xe7) {
         uint8_t bit = 1 << (usage - 0xe0);
-        keys[0] = down ? keys[0] | bit : keys[0] & ~bit;
+        mods = dn ? mods | bit : mods & ~bit;
     } else if (usage) {
-        int at = 0;
-        for (int i = 2; i < 8; i++)
-            if (keys[i] == usage) at = i;
-        if (down && !at)
-            for (int i = 2; i < 8; i++)
-                if (!keys[i]) { keys[i] = usage; break; }
-        if (!down && at) {
-            memmove(keys + at, keys + at + 1, 7 - at);
-            keys[7] = 0;
+        int at = -1;
+        for (int i = 0; i < ndown; i++)
+            if (down[i] == usage) at = i;
+        if (dn && at < 0 && ndown < (int)sizeof down) down[ndown++] = usage;
+        if (!dn && at >= 0) {
+            memmove(down + at, down + at + 1, ndown - at - 1);
+            ndown--;
         }
     }
-    hid_write(&kbd_fd, keys, 8);
+    uint8_t r[8];
+    kbd_report(r);
+    hid_push(&kbd, r, 0);
 }
 
 static void ptr_event(uint8_t buttons, uint16_t x, uint16_t y)
 {
     // browser: bit0 left, bit1 middle, bit2 right; HID: bit0 left, bit1 right, bit2 middle
-    ptr_rep[0] = (buttons & 1) | ((buttons & 4) >> 1) | ((buttons & 2) << 1);
+    uint8_t b = (buttons & 1) | ((buttons & 4) >> 1) | ((buttons & 2) << 1);
+    int moved_only = b == ptr_rep[0];
+    ptr_rep[0] = b;
     if (x > 32767) x = 32767;
     if (y > 32767) y = 32767;
     ptr_rep[1] = x & 0xff, ptr_rep[2] = x >> 8, ptr_rep[3] = y & 0xff, ptr_rep[4] = y >> 8;
-    hid_write(&ptr_fd, ptr_rep, 7);
+    ptr_rep[5] = ptr_rep[6] = 0;
+    hid_push(&ptr, ptr_rep, moved_only);
 }
 
 static void wheel_event(int8_t wheel, int8_t pan)
 {
-    // relative: one report per scroll, the next ones carry 0 again
-    ptr_rep[5] = (uint8_t)wheel, ptr_rep[6] = (uint8_t)pan;
-    hid_write(&ptr_fd, ptr_rep, 7);
-    ptr_rep[5] = ptr_rep[6] = 0;
+    // relative: in this report only, the next ones carry 0 again
+    uint8_t r[7];
+    memcpy(r, ptr_rep, 5);
+    r[5] = (uint8_t)wheel, r[6] = (uint8_t)pan;
+    hid_push(&ptr, r, 1);
 }
 
 static void release_all(void)
 {
-    memset(keys, 0, sizeof keys);
-    hid_write(&kbd_fd, keys, 8);
-    ptr_rep[0] = 0;
-    hid_write(&ptr_fd, ptr_rep, 7);
+    mods = 0;
+    ndown = 0;
+    uint8_t r[8];
+    kbd_report(r);
+    hid_push(&kbd, r, 0);
+    ptr_rep[0] = ptr_rep[5] = ptr_rep[6] = 0;
+    hid_push(&ptr, ptr_rep, 0);
+}
+
+// a device that took nothing for HID_STALL: its queue dropped, all released
+static void hid_check_stall(struct hiddev *d, double t)
+{
+    if (!d->n || !d->stuck || t - d->stuck < HID_STALL) return;
+    if (!d->gaveup) LOG("%s: the host took no report for %.0f s: %d dropped, all released", *d->path, HID_STALL, d->n);
+    d->gaveup = 1;
+    d->dropped += d->n;
+    d->n = 0;
+    d->stuck = 0;
+    if (d == &kbd) mods = 0, ndown = 0;
+    else ptr_rep[0] = ptr_rep[5] = ptr_rep[6] = 0;
+    uint8_t r[8] = { 0 };
+    if (d == &ptr) memcpy(r, ptr_rep, 7);
+    if (memcmp(r, d->last, d->len)) {
+        memcpy(d->q[d->head], r, d->len);
+        d->mergeable[d->head] = 0;
+        d->n = 1;
+    }
+    hid_flush(d);
+}
+
+// SIGTERM etc.: release everything before going (a stopped reimu-kvm must not
+// leave a key held on the host), up to 0.3 s for the host to take it
+static volatile sig_atomic_t quit;
+static void on_signal(int s) { quit = s; }
+static void hid_goodbye(void)
+{
+    release_all();
+    double end = now() + 0.3;
+    while ((kbd.n || ptr.n) && now() < end) {
+        struct epoll_event evs[4];
+        int n = epoll_wait(ep, evs, 4, 20);
+        for (int i = 0; i < n; i++)
+            if (evs[i].data.u32 == TAG_KBD) hid_io(&kbd, evs[i].events);
+            else if (evs[i].data.u32 == TAG_PTR) hid_io(&ptr, evs[i].events);
+        hid_flush(&kbd), hid_flush(&ptr);
+    }
 }
 
 // ------------------------------------------------------------------ video
@@ -401,7 +616,9 @@ static void client_close(struct client *c)
     free(c->out);
     c->out = NULL;
     bury(c, &c->kind);
-    if (was_ws && !ws_clients()) release_all();
+    // nothing a viewer held stays held: every viewer that goes (not only the
+    // last) lets go of all keys and buttons
+    if (was_ws) release_all();
     if (was_ws && !jpeg_clients() && streaming) {
         video_stop();
         LOG("no JPEG viewer left, capture stopped");
@@ -557,6 +774,8 @@ static void handle_http(struct client *c)
     c->state = C_WS;
     if (flush(c) < 0) { client_close(c); return; }
     LOG("viewer connected (%d)", ws_clients());
+    // a new viewer starts from nothing held (another one's keys included)
+    release_all();
     fresh_viewer = 1;
     if (!streaming) {
         const char *err = NULL;
@@ -935,9 +1154,11 @@ static int method_ticket(sd_bus_message *m, void *ud, sd_bus_error *err)
 static int method_status(sd_bus_message *m, void *ud, sd_bus_error *err)
 {
     (void)ud, (void)err;
-    char json[300];
-    snprintf(json, sizeof json, "{\"port\":%d,\"viewers\":%d,\"streaming\":%d,\"signal\":%d,\"width\":%u,\"height\":%u,\"fps\":%d,\"quality\":%d,\"sub420\":%d}",
-             port, ws_clients(), streaming, signal_ok, vw, vh, want_fps, quality, sub420);
+    char json[512];
+    snprintf(json, sizeof json, "{\"port\":%d,\"viewers\":%d,\"streaming\":%d,\"signal\":%d,\"width\":%u,\"height\":%u,\"fps\":%d,\"quality\":%d,\"sub420\":%d,\"leds\":%d,\"usboff\":%.0f,\"hid\":[%ld,%ld,%ld,%ld,%ld,%ld]}",
+             port, ws_clients(), streaming, signal_ok, vw, vh, want_fps, quality, sub420, leds,
+             usb_off_since ? now() - usb_off_since : 0.0,
+             kbd.written, kbd.merged, kbd.dropped, ptr.written, ptr.merged, ptr.dropped);
     return sd_bus_reply_method_return(m, "s", json);
 }
 
@@ -973,6 +1194,10 @@ int main(int argc, char **argv)
         }
     if (want_fps < 1 || want_fps > 60 || quality < 0 || quality > 11) usage();
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa = { .sa_handler = on_signal };
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
@@ -1017,15 +1242,24 @@ int main(int argc, char **argv)
         struct epoll_event uev = { .events = EPOLLIN, .data.u32 = 0xfffffff3 };
         epoll_ctl(ep, EPOLL_CTL_ADD, ufd, &uev);
     } else LOG("UDP %d: %s (no host announcements)", port, strerror(errno));
+    hid_open(&kbd); // the keyboard's LED reports are read from the start
+    hid_open(&ptr);
     LOG("reimu-kvm on :%d", port);
 
     double stat_t = now();
     for (;;) {
         struct epoll_event evs[16];
         int n = epoll_wait(ep, evs, 16, 250);
+        if (quit) {
+            LOG("signal %d: keys and buttons released, exiting", (int)quit);
+            hid_goodbye();
+            return 0;
+        }
         for (int i = 0; i < n; i++) {
             uint32_t tag = evs[i].data.u32;
-            if (tag == 0xfffffff1) accept_client(lfd);
+            if (tag == TAG_KBD) hid_io(&kbd, evs[i].events);
+            else if (tag == TAG_PTR) hid_io(&ptr, evs[i].events);
+            else if (tag == 0xfffffff1) accept_client(lfd);
             else if (tag == 0xfffffff2) while (sd_bus_process(bus, NULL) > 0) ;
             else if (tag == 0xfffffff3) announce_read(ufd);
             else if (tag == 0xfffffff0) { if (vfd >= 0) video_ready(evs[i].events); }
@@ -1036,6 +1270,11 @@ int main(int argc, char **argv)
         ngrave = 0;
         while (sd_bus_process(bus, NULL) > 0) ;
         double t = now();
+        hid_check_stall(&kbd, t);
+        hid_check_stall(&ptr, t);
+        // the LEDs come in on the keyboard fd: keep one open (closed by an unbind)
+        static double hid_retry;
+        if (kbd.fd < 0 && t > hid_retry) { hid_retry = t + 1; hid_open(&kbd); }
         // the host's sound for JPEG viewers who want it
         for (int i = 0; i < MAX_CLIENTS; i++) {
             struct client *c = clients[i];
@@ -1059,8 +1298,8 @@ int main(int argc, char **argv)
                 struct client *c = clients[i];
                 if (!c || c->state != C_WS) continue;
                 char s[400];
-                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d,\"host\":\"%s\"}",
-                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming, announced_host());
+                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d,\"host\":\"%s\",\"leds\":%d}",
+                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming, announced_host(), leds);
                 c->frames = c->skipped = 0;
                 // stats go out only between frames, never into the middle of one
                 if (c->outlen == c->outoff) ws_text(c, "%s", s);

@@ -79,11 +79,22 @@ start)
     mkdir -p configs/c.1/strings/0x409
     echo "config 1" > configs/c.1/strings/0x409/configuration
     mkdir -p functions/mass_storage.usb0
+    # no endpoint halts for "phase errors" (stall=0, set before the function
+    # is linked): some firmware and Windows' early boot drivers don't clear a
+    # halted bulk endpoint and hang (PiKVM sets the same); Linux doesn't mind
+    echo 0 > functions/mass_storage.usb0/stall
     ln -s functions/mass_storage.usb0 configs/c.1
-    echo 1 > functions/mass_storage.usb0/lun.0/removable
-    echo $ro > functions/mass_storage.usb0/lun.0/ro
-    echo $cdrom > functions/mass_storage.usb0/lun.0/cdrom
-    echo /dev/$nbd > functions/mass_storage.usb0/lun.0/file
+    lun=functions/mass_storage.usb0/lun.0
+    echo 1 > $lun/removable
+    echo $ro > $lun/ro
+    echo $cdrom > $lun/cdrom
+    # FUA (force unit access) writes ignored: each one would be a flush of the
+    # whole NBD path to the browser
+    echo 1 > $lun/nofua
+    # SCSI INQUIRY: vendor (8), product (16), revision (4), what the host's
+    # OS and its installers show for the drive
+    printf '%-8s%-16s%-4s' REIMU "$product" 1.00 > $lun/inquiry_string
+    echo /dev/$nbd > $lun/file
     echo "$udc" > UDC
     echo "virtual media $config: /dev/$nbd on $udc, ro=$ro cdrom=$cdrom" >&2
     ;;

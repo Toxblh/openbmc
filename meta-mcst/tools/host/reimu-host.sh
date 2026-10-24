@@ -11,7 +11,12 @@
 #     Mbit/s: reimu-h264 takes the buffer on screen (KMS) without a copy through
 #     the CPU, with the sound of the logged-in user (Opus); the BMC relays it
 #     to the browser (Источник: «H.264 с хоста», button «Звук»).
-# Also: an EDID for the ASPEED VGA, so it runs 1920x1080 without a monitor.
+# Also: an EDID for the ASPEED VGA, so it runs 1920x1080 without a monitor;
+# no USB autosuspend for the BMC's virtual hub (1d6b:0107, the KVM keyboard
+# and mouse and the virtual media are its ports): with nothing on it (the
+# KVM gadget unbound for a moment, e.g. a BMC kexec) the host suspends it,
+# and a gadget connecting later doesn't wake it (the hub's remote wakeup
+# didn't reach the host on the board): no keyboard, no mouse until resumed.
 #
 #   sudo ./reimu-host.sh install [--bmc IP] [--fps N] [--bitrate MBIT]
 #                    IP: the BMC (only it may take the H.264 stream; default
@@ -31,6 +36,7 @@ EDID_NAME=reimu-1920x1200.bin
 FW=/lib/firmware/edid/$EDID_NAME
 EDID_B64='AP///////wBJtSAZAQAAAAEkAQMONCB4Cu6Ro1RMmSYPUFQhCADRwLMAqUCBgJUAgQCBwHFAKDyAoHCwI0AwIDYACEUhAAAaAAAA/QAySx5QEQAKICAgICAgAAAA/ABSRUlNVSBLVk0KICAgAAAA/wBCTUMtVkdBCiAgICAgANo='
 EDID_MD5=f2b7fecf2caa9adbf3b2952c0fc26818
+HUB_RULE=/etc/udev/rules.d/60-reimu-bmc-hub.rules
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 say() { printf '%s\n' "$*"; }
@@ -94,6 +100,20 @@ install_edid() {
     say "EDID: ASPEED $out up to 1920x1080 without a monitor"
 }
 
+# the BMC's virtual hub (1d6b:0107) always on (power/control "on"): now and
+# whenever it is plugged in
+install_hub_rule() {
+    printf '%s\n' '# REIMU: the BMC USB virtual hub (KVM keyboard/mouse, virtual media) never' \
+        '# autosuspended: the gadgets connecting later do not wake it (reimu-host.sh)' \
+        'ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1d6b", ATTR{idProduct}=="0107", TEST=="power/control", ATTR{power/control}="on"' \
+        > $HUB_RULE
+    udevadm control --reload 2>/dev/null
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)" = 1d6b:0107 ] || continue
+        echo on > $d/power/control && say "USB: BMC hub ${d##*/} autosuspend off"
+    done
+}
+
 do_install() {
     need_root
     bmc=192.168.10.79 fps=60 bitrate=8
@@ -109,6 +129,7 @@ do_install() {
     for f in reimu-fbmirror.c reimu-h264.py; do [ -f "$HERE/$f" ] || die "$f must be next to $0"; done
 
     install_edid
+    install_hub_rule
 
     # X leaves the ASPEED card alone (it can't share buffers with the real card)
     mkdir -p "${XCONF%/*}"
@@ -179,7 +200,7 @@ do_uninstall() {
     out=${conn##*/card[0-9]-}
     [ -n "$out" ] && cmdline_param del "drm.edid_firmware=$out:edid/$EDID_NAME"
     echo > /sys/module/drm/parameters/edid_firmware 2>/dev/null
-    rm -f "$FW"
+    rm -f "$FW" $HUB_RULE
     say "removed (X picks up the ASPEED card again after the next login)"
 }
 
@@ -204,6 +225,10 @@ do_status() {
     done
     conn=$(aspeed_conn)
     [ -n "$conn" ] && say "ASPEED VGA modes: $(head -3 "$conn/modes" 2>/dev/null | tr '\n' ' ')"
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)" = 1d6b:0107 ] &&
+            say "BMC USB hub ${d##*/}: power/control $(cat $d/power/control), $(cat $d/power/runtime_status)"
+    done
     other=$(pgrep -af "f fbdev /dev/fb" | head -1)
     [ -n "$other" ] && say "another mirror (ffmpeg) writes the framebuffer too: $other"
 }

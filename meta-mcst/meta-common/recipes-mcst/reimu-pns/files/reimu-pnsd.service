@@ -1,6 +1,7 @@
 [Unit]
 Description=REIMU host boot firmware (PNS) information service
 After=mcst-fruid.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=dbus
@@ -9,7 +10,10 @@ BusName=xyz.openbmc_project.Reimu.Pns
 # reimu-fru-power.service) only: no EEPROM here, its XML and cached copy
 Environment=REIMU_FRU_EEPROM=/run/reimu-fru/no-eeprom-here
 ExecStart=/usr/sbin/reimu-pnsd
+# its whole restart policy here (not in reimu-restart-policy): back 5 s
+# after any exit, no start limit
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

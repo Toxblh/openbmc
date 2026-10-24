@@ -1,0 +1,234 @@
+From: REIMU <reimu@localhost>
+Subject: [PATCH] HID: never block on the keyboard, release on client exit, no stray Shift
+
+- The keyboard was opened blocking: while the host does not take a report
+  (off, suspended, its driver unbound) the next write() waits forever and
+  with it the whole loop, video included. Both fds are non-blocking now; a
+  report waits up to 50 ms for the host to take the previous one (f_hid has
+  one in flight), then it is dropped (logged once).
+- A write error other than EAGAIN closes the fd; the next report opens the
+  device again (a gadget unbound and bound again).
+- A VNC client going releases every key and button it held.
+- The wakeup packet (a Shift press) went out on every video open, mode
+  changes included, with or without a client: now only with a client.
+
+---
+--- a/ikvm_input.cpp
++++ b/ikvm_input.cpp
+@@ -5,6 +5,7 @@
+ #include <err.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <rfb/keysym.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -29,7 +30,9 @@
+ {
+     if (!keyboardPath.empty())
+     {
+-        keyboardFd = open(keyboardPath.c_str(), O_RDWR | O_CLOEXEC);
++        // non-blocking like the pointer: a host that doesn't take a report
++        // (off, suspended) must not stop the video
++        keyboardFd = open(keyboardPath.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+         if (keyboardFd < 0)
+         {
+             log<level::ERR>("Failed to open input device",
+@@ -173,7 +176,7 @@
+ {
+     if (!keyboardPath.empty() && keyboardFd < 0)
+     {
+-        keyboardFd = open(keyboardPath.c_str(), O_RDWR | O_CLOEXEC);
++        keyboardFd = open(keyboardPath.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+         if (keyboardFd < 0)
+         {
+             log<level::ERR>("Failed to open input device",
+@@ -203,6 +206,13 @@
+ {
+     uint8_t wakeupReport[KEY_REPORT_LENGTH] = {0};
+ 
++    // only for a client looking at the screen: the video is opened again on
++    // every mode change too, and a Shift press then reaches the host's OS
++    if (!clients)
++    {
++        return;
++    }
++
+     if (pointerFd >= 0)
+     {
+         uint16_t xy = SHRT_MAX / 2;
+@@ -232,14 +242,14 @@
+ 
+ void Input::sendReport()
+ {
+-    if (sendKeyboard && keyboardFd >= 0)
++    if (sendKeyboard)
+     {
+         writeKeyboard(keyboardReport);
+ 
+         sendKeyboard = false;
+     }
+ 
+-    if (sendPointer && pointerFd >= 0)
++    if (sendPointer)
+     {
+         writePointer(pointerReport);
+ 
+@@ -469,46 +479,71 @@
+     return scancode;
+ }
+ 
+-bool Input::writeKeyboard(const uint8_t *report)
++void Input::releaseAll()
+ {
+-    if (write(keyboardFd, report, KEY_REPORT_LENGTH) != KEY_REPORT_LENGTH)
+-    {
+-        log<level::ERR>("Failed to write keyboard report",
+-                        entry("ERROR=%s", strerror(errno)));
++    memset(keyboardReport, 0, KEY_REPORT_LENGTH);
++    keysDown.clear();
++    pointerReport[0] = pointerReport[5] = pointerReport[6] = 0;
++    lastButtonMask = 0;
++    writeKeyboard(keyboardReport);
++    writePointer(pointerReport);
++    sendKeyboard = sendPointer = false;
++}
+ 
+-        if (errno == ESHUTDOWN)
++bool Input::writeReport(int& fd, const std::string& path,
++                        const uint8_t* report, size_t len, bool& error,
++                        const char* what)
++{
++    if (fd < 0 && !path.empty())
++    {
++        // closed after an error (the gadget unbound and bound again: a new
++        // f_hid instance behind the same /dev/hidgN)
++        fd = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
++    }
++    if (fd < 0)
++    {
++        return false;
++    }
++    ssize_t n = write(fd, report, len);
++    if (n < 0 && errno == EAGAIN)
++    {
++        // f_hid holds one report until the host polls: give it a moment
++        struct pollfd p = {fd, POLLOUT, 0};
++        if (poll(&p, 1, WRITE_WAIT_MS) > 0)
+         {
+-            close(keyboardFd);
+-            keyboardFd = -1;
++            n = write(fd, report, len);
+         }
+-
+-        return false;
+     }
+-
+-    return true;
+-}
+-
+-void Input::writePointer(const uint8_t *report)
+-{
+-    if (write(pointerFd, report, PTR_REPORT_LENGTH) != PTR_REPORT_LENGTH)
++    if (n != (ssize_t)len)
+     {
+-        if (!pointerError)
++        if (!error)
+         {
+-            log<level::ERR>("Failed to write pointer report",
+-                            entry("ERROR=%s", strerror(errno)));
+-            pointerError = true;
++            log<level::ERR>(what, entry("ERROR=%s", strerror(errno)));
++            error = true;
+         }
+-
+-        if (errno == ESHUTDOWN)
++        if (errno != EAGAIN && errno != EINTR)
+         {
+-            close(pointerFd);
+-            pointerFd = -1;
++            // ESHUTDOWN (unbound, host gone), ENODEV...: opened again with
++            // the next report
++            close(fd);
++            fd = -1;
+         }
++        return false;
+     }
+-    else
+-    {
+-        pointerError = false;
+-    }
++    error = false;
++    return true;
++}
++
++bool Input::writeKeyboard(const uint8_t *report)
++{
++    return writeReport(keyboardFd, keyboardPath, report, KEY_REPORT_LENGTH,
++                       keyboardError, "Failed to write keyboard report");
++}
++
++void Input::writePointer(const uint8_t *report)
++{
++    writeReport(pointerFd, pointerPath, report, PTR_REPORT_LENGTH,
++                pointerError, "Failed to write pointer report");
+ }
+ 
+ } // namespace ikvm
+--- a/ikvm_input.hpp
++++ b/ikvm_input.hpp
+@@ -54,6 +54,13 @@
+     void sendWakeupPacket();
+     /* @brief Sends an HID report to the USB input device */
+     void sendReport();
++    /* @brief Releases every key and button (a VNC client went away) */
++    void releaseAll();
++    /* @brief The number of VNC clients (no wakeup packet without one) */
++    void setClients(int n)
++    {
++        clients = n;
++    }
+ 
+   private:
+     static constexpr int NUM_MODIFIER_BITS = 4;
+@@ -90,9 +97,19 @@
+ 
+     bool writeKeyboard(const uint8_t *report);
+     void writePointer(const uint8_t *report);
++    /* @brief Writes a report to a non-blocking hidg fd, waiting a bounded
++     *        time for the host to take the previous one */
++    bool writeReport(int& fd, const std::string& path, const uint8_t* report,
++                     size_t len, bool& error, const char* what);
++    /* @brief How long a report waits for the host (f_hid: one in flight) */
++    static constexpr int WRITE_WAIT_MS = 50;
++    /* @brief VNC clients connected */
++    int clients = 0;
+ 
+     /* @brief Indicates whether or not a pointer report error has occurred */
+     bool pointerError;
++    /* @brief Indicates whether or not a keyboard report error has occurred */
++    bool keyboardError = false;
+     /* @brief Indicates whether or not to send a keyboard report */
+     bool sendKeyboard;
+     /* @brief Indicates whether or not to send a pointer report */
+--- a/ikvm_server.cpp
++++ b/ikvm_server.cpp
+@@ -190,6 +190,10 @@
+     delete (ClientData*)cl->clientData;
+     cl->clientData = nullptr;
+ 
++    // nothing the client held stays held on the host
++    server->input.releaseAll();
++    server->input.setClients(server->numClients - 1);
++
+     if (server->numClients-- == 1)
+     {
+         rfbMarkRectAsModified(server->server, 0, 0, server->video.getWidth(),
+@@ -210,6 +214,7 @@
+         server->pendingResize = false;
+         server->frameCounter = 0;
+     }
++    server->input.setClients(server->numClients);
+ 
+     return RFB_CLIENT_ACCEPT;
+ }

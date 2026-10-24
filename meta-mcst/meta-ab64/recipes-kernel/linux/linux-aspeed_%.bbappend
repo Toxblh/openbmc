@@ -10,6 +10,12 @@ SRC_URI = "git://github.com/openbmc/linux;protocol=https;branch=${KBRANCH} \
            file://aspeed-bmc-mcst-reimu-5564.dts \
            file://reimu-ab64.dtsi \
           "
+# a gadget connecting while the host has suspended the virtual hub: the
+# remote wakeup as an edge each time (only the first one reached the host?)
+SRC_URI += "file://0001-usb-gadget-aspeed-vhub-remote-wakeup-an-edge-each-time.patch"
+# virtual media: DVD-sized ISOs (Windows, Linux installers) as a CD-ROM, not
+# cut at 2.2 GiB
+SRC_URI += "file://0002-usb-gadget-f_mass_storage-CD-ROM-images-bigger-than-2.2-GiB.patch"
 LIC_FILES_CHKSUM = "file://COPYING;md5=6bc538ed5bd9a7fc9398086aedcd7e46"
 
 do_add_mcst_files () {

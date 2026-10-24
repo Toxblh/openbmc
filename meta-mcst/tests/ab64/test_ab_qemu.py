@@ -26,12 +26,30 @@ starts from a fresh copy of ab.mtd. Tests (all by default):
   badrofs     rofs-a damaged: the initramfs runs rofs-b, slot B next
   hang        the boot hangs (no init): WDT1 resets, after 3 boots U-Boot
               switches to the other slot
+  fallback    rofs-a damaged (kernel=a rofs=b state=fallback): "install b"
+              refused (rofs-b is the only intact rofs); the web update
+              (Redfish -> reimu-abd -> "reimu-ab install", no slot) writes slot
+              A, slot B byte for byte as it was
+  fallcut     the same, the power cut (QEMU killed) while "reimu-ab install"
+              writes rofs-a: the environment pointed at slot B during the
+              write, slot B boots, untouched; then "install b" refused (the
+              only intact slot), "install both" writes the damaged A first
+  flashfail   reimu-flash fails (REIMU_FLASH): "kernel write failed", no rofs
+              write, the environment as it was; the same for the rofs
+  restorecut  "reimu-ab ram" with an install pending: the environment stays
+              as it was (reimu-ab boot leaves it alone); restore-stock stopped
+              (as if the power went) before each write and halfway through the
+              rofs over slot B: the flash at each point checked (slot B
+              untouched until the window), each state booted: what comes up
+  restorecut-a  slot B damaged: restore-stock writes slot B's region first,
+              slot A boots with the stock firmware half written
   stock       "reimu-ab ram", restore-stock from the dump, the stock
               firmware boots; then the first install from the stock firmware
               (kexec into the new image from RAM, write both slots, the A/B
               environment, the settings), the new firmware boots
 """
-import os, re, shutil, socket, subprocess, sys, tempfile, time
+import base64, hashlib, json, os, re, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # reimu-ab-from-stock, reimu-ab-back-to-stock: meta-mcst/tools/ab64 (or next to this file)
@@ -82,6 +100,16 @@ def set_env(img, **kv):
             e[k] = v
     ubenv.write(b, e)
     open(img, "r+b").write(b)
+
+
+def region(img, off, n):
+    with open(img, "rb") as f:
+        f.seek(off)
+        return hashlib.sha256(f.read(n)).hexdigest()
+
+
+def part_sha(img, part):
+    return region(img, *LAYOUT[part])
 
 
 def damage(img, part, at=0x40000, n=4096):
@@ -235,6 +263,35 @@ def fresh(name, src="ab.mtd"):
     img = os.path.join(W, name + ".mtd")
     shutil.copyfile(os.path.join(W, src), img)
     return img
+
+
+def ssh_bg(cmd):
+    """a command over ssh in the background: (Popen, its output lines so far)"""
+    c, env = ssh_cmd(cmd)
+    p = subprocess.Popen(c, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True)
+    lines = []
+    threading.Thread(target=lambda: [lines.append(l.rstrip("\n")) for l in p.stdout], daemon=True).start()
+    return p, lines
+
+
+def redfish(method, path, body=None, ctype="application/json", timeout=180):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
+    rq = urllib.request.Request("https://127.0.0.1:%d%s" % (HTTPS, path), data=data, method=method,
+                                headers={"Authorization": "Basic " + base64.b64encode(b"root:0penBmc").decode(),
+                                         "Content-Type": ctype})
+    try:
+        with urllib.request.urlopen(rq, context=ctx, timeout=timeout) as r:
+            t = r.read()
+            return r.status, json.loads(t) if t else None
+    except urllib.error.HTTPError as e:
+        t = e.read()
+        try:
+            return e.code, json.loads(t)
+        except ValueError:
+            return e.code, t.decode(errors="replace")
 
 
 def ab_state(b):
@@ -507,8 +564,355 @@ def t_stock():
         b.stop()
 
 
+def wait_env(b, want, timeout=90):
+    """until the environment has these values (reimu-ab.service ran)"""
+    end = time.time() + timeout
+    while True:
+        e = benv(b, *want)
+        if all(e.get(k) == v for k, v in want.items()) or time.time() > end:
+            return e
+        time.sleep(3)
+
+
+def fallback_boot(name):
+    img = fresh(name)
+    damage(img, "rofs-a", at=0x200000)
+    b = Bmc(name, img).start()
+    check(b.wait_ssh(), "up")
+    check(ab_state(b) == "kernel=a rofs=b state=fallback", "fallback: kernel A on rofs-b (%s)" % ab_state(b))
+    e = wait_env(b, {"reimu_slot": "b", "reimu_tries": "0"})
+    check(e == {"reimu_slot": "b", "reimu_tries": "0"}, "slot B next (reimu-ab boot) (%s)" % e)
+    return img, b
+
+
+def t_fallback():
+    img, b = fallback_boot("fallback")
+    old = {p: part_sha(img, p) for p in ("kernel-b", "rofs-b")}
+    try:
+        check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
+        r = b.ssh("reimu-ab install /tmp/reimu-ab.tar b", timeout=900)
+        print("    " + (r.stdout + r.stderr).strip().replace("\n", "\n    "))
+        check(r.returncode != 0 and "rofs-b is the only intact rofs" in r.stderr,
+              "install b refused: rofs-b is the only intact rofs")
+        e = benv(b, "reimu_slot", "reimu_pending")
+        check(e.get("reimu_slot") == "b" and e.get("reimu_pending") != "1", "environment as it was (%s)" % e)
+        b.ssh("rm -f /tmp/reimu-ab.tar")
+        # the web update: reimu-abd runs "reimu-ab install IMAGE" (no slot)
+        t0 = b.out("date +%s").strip()
+        st, r = redfish("POST", "/redfish/v1/UpdateService", open(os.path.join(W, "reimu-ab.tar"), "rb").read(),
+                        "application/octet-stream", timeout=600)
+        check(st in (200, 202), "upload through Redfish UpdateService: HTTP %d" % st)
+        end = time.time() + 1200
+        j = {}
+        while time.time() < end:
+            try:
+                j = json.loads(redfish("GET", "/xyz/openbmc_project/reimu/ab")[1]["data"]["Json"])
+            except Exception:
+                j = {}
+            if (j.get("job") or {}).get("state") in ("ok", "failed"):
+                break
+            time.sleep(5)
+        job = j.get("job") or {}
+        check(job.get("state") == "ok", "reimu-abd install: %s" % job.get("message"))
+        # what reimu-ab said to reimu-abd ("reimu-abd: install: LINE" in its journal)
+        jl = b.out("journalctl -o cat --since @%s -u reimu-abd | sed -n 's/^reimu-abd: install: reimu-ab: \\(slot [ab]: [a-z]*\\)$/\\1/p'"
+                   % t0).split("\n")
+        print("    reimu-ab: " + " | ".join(jl))
+        check([l for l in jl if l] == ["slot a: kernel", "slot a: rofs"], "it wrote slot A (the damaged one), not B")
+        e = benv(b, "reimu_slot", "reimu_pending", "reimu_tries")
+        check(e == {"reimu_slot": "a", "reimu_pending": "1", "reimu_tries": "0"}, "slot A next, pending (%s)" % e)
+        check(b.ssh("reimu-ab verify a").returncode == 0, "slot A intact again")
+    finally:
+        b.stop()
+    check({p: part_sha(img, p) for p in old} == old, "slot B byte for byte as it was")
+    check(part_sha(img, "rofs-a") == part_sha(os.path.join(W, "ab.mtd"), "rofs-a"), "rofs-a is the update's")
+
+
+def t_fallcut():
+    img, b = fallback_boot("fallcut")
+    old = {p: part_sha(img, p) for p in ("kernel-b", "rofs-b")}
+    try:
+        # all of rofs-a to write (a long write to cut)
+        b.ssh("flash_eraseall /dev/mtd/rofs-a >/dev/null 2>&1", timeout=300)
+        check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
+        p, lines = ssh_bg("reimu-ab install /tmp/reimu-ab.tar")
+        end = time.time() + 600
+        while time.time() < end and not any("slot a: rofs" in l for l in lines) and p.poll() is None:
+            time.sleep(1)
+        check(any("slot a: rofs" in l for l in lines), "install writes slot A (%s)" % " | ".join(lines))
+        time.sleep(1)
+        check(p.poll() is None, "rofs-a still being written")
+        b.stop()  # the power goes
+        p.kill()
+        print("    cut after: " + " | ".join(lines))
+        check(not any("slot b" in l for l in lines), "slot B not touched")
+    finally:
+        b.stop()
+    check({q: part_sha(img, q) for q in old} == old, "slot B byte for byte as it was")
+    check(ubenv.read(bytearray(open(img, "rb").read())).get("reimu_slot") == "b",
+          "the environment at the cut: slot B")
+    b = Bmc("fallcut2", img).start()
+    try:
+        check(b.wait_ssh(), "up after the power cut")
+        check("reimu.slot=b" in b.console() and ab_state(b) == "kernel=b rofs=b state=ok",
+              "slot B boots (%s)" % ab_state(b))
+        check(b.ssh("reimu-ab verify a").returncode != 0, "slot A: half written")
+        check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
+        r = b.ssh("reimu-ab install /tmp/reimu-ab.tar b", timeout=900)
+        check(r.returncode != 0 and "only intact" in r.stderr, "install b refused: %s" % r.stderr.strip()[-120:])
+        r = b.ssh("reimu-ab install /tmp/reimu-ab.tar both", timeout=1800)
+        o = r.stdout + r.stderr
+        print("    " + o.strip().replace("\n", "\n    "))
+        order = re.findall(r"slot ([ab]): kernel$", o, re.M)
+        check(r.returncode == 0 and order == ["a", "b"], "install both: the damaged slot A first (%s)" % order)
+        e = benv(b, "reimu_slot", "reimu_pending")
+        check(e == {"reimu_slot": "b", "reimu_pending": "1"}, "the last written (B) next, pending (%s)" % e)
+        check(b.ssh("reimu-ab verify").returncode == 0, "both slots intact")
+    finally:
+        b.stop()
+
+
+FLASH_FAIL = """#!/bin/sh
+# the test's reimu-flash: fails the write number $FAIL_AT (exit 1, no "ok")
+n=$(( $(cat /tmp/ff.n 2>/dev/null || echo 0) + 1 )); echo $n > /tmp/ff.n
+echo "$n $*" >> /tmp/ff.log
+if [ $n = "$FAIL_AT" ]; then echo "write 10%"; echo "reimu-flash: simulated failure" >&2; exit 1; fi
+exec reimu-flash "$@"
+"""
+
+
+def t_flashfail():
+    b = Bmc("flashfail", fresh("flashfail")).start()
+    try:
+        check(b.wait_ssh(), "up")
+        wait_env(b, {"reimu_slot": "a", "reimu_tries": "0"})
+        check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
+        open(os.path.join(W, "flash-fail"), "w").write(FLASH_FAIL)
+        b.scp(os.path.join(W, "flash-fail"), "/tmp/flash-fail")
+        before = b.out("fw_printenv")
+        for at, part in ((1, "kernel"), (2, "rofs")):
+            b.ssh("rm -f /tmp/ff.n /tmp/ff.log; chmod +x /tmp/flash-fail")
+            r = b.ssh("FAIL_AT=%d REIMU_FLASH=/tmp/flash-fail reimu-ab install /tmp/reimu-ab.tar" % at, timeout=900)
+            o = r.stdout + r.stderr
+            print("    " + o.strip().replace("\n", "\n    "))
+            calls = b.out("cat /tmp/ff.log").strip().split("\n")
+            check(r.returncode != 0 and "slot b: %s write failed" % part in r.stderr,
+                  "reimu-flash fails on the %s: \"slot b: %s write failed\"" % (part, part))
+            check(len(calls) == at, "nothing written after it (%s)" % calls)
+            check(at == 2 or "slot b: rofs" not in o, "no rofs write after the kernel failed")
+            check(b.out("fw_printenv") == before, "the environment as it was")
+    finally:
+        b.stop()
+
+
+# the test's reimu-flash for restore-stock: before each write (and halfway
+# through the one at $CUT_HALF) it waits for the test to copy the flash image
+# (= the power going at that moment)
+FLASH_CUT = """#!/bin/sh
+mkdir -p /tmp/cut
+n=$(( $(cat /tmp/cut/n 2>/dev/null || echo 0) + 1 )); echo $n > /tmp/cut/n
+if [ "$1" = write ]; then
+    echo "$n $3" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n ]; do sleep 1; done
+    case " ${CUT_HALF:-} " in *" $3 "*)
+        sz=$(stat -c %s $4)
+        dd if=$4 of=/tmp/cut/half bs=65536 count=$((sz / 65536 / 2)) 2>/dev/null
+        reimu-flash write $2 $3 /tmp/cut/half 5 >/dev/null || exit 1
+        rm -f /tmp/cut/half
+        echo "$n.5 $3" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n.5 ]; do sleep 1; done ;;
+    esac
+fi
+exec reimu-flash "$@"
+"""
+STOCK_FILES = ["u-boot-env.bin", "kernel.bin", "rofs.bin", "rwfs.bin", "SHA256SUMS"]
+
+
+def stock_data():
+    return {f: open(os.path.join(STOCK, f + ".bin"), "rb").read() for f in ("u-boot-env", "kernel", "rofs", "rwfs")}
+
+
+def to_ram(b, pending=False):
+    """reimu-ab ram (a kexec), the stock dump copied into RAM"""
+    b.ssh("nohup reimu-ab ram >/dev/null 2>&1 &", timeout=30)
+    time.sleep(20)
+    check(b.wait_ssh(), "up again after reimu-ab ram (kexec)")
+    check("reimu.ram" in b.out("cat /proc/cmdline"), "RAM mode")
+    b.ssh("mkdir -p /tmp/stock")
+    ok = all(b.scp(os.path.join(STOCK, f), "/tmp/stock/" + f) for f in STOCK_FILES)
+    check(ok, "the stock dump copied")
+    open(os.path.join(W, "flash-cut"), "w").write(FLASH_CUT)
+    b.scp(os.path.join(W, "flash-cut"), "/tmp/flash-cut")
+    b.ssh("chmod +x /tmp/flash-cut; rm -rf /tmp/cut")
+
+
+def restore_cut(b, img, name, half=None, stop_at=None):
+    """restore-stock with FLASH_CUT: a copy of the flash at each stop
+    {offset or offset.5: image}; stop_at: kill QEMU there"""
+    p, lines = ssh_bg("CUT_HALF='%s' REIMU_FLASH=/tmp/flash-cut reimu-ab restore-stock /tmp/stock" % (half or ""))
+    snaps, seen = [], set()
+    end = time.time() + 3600
+    while time.time() < end and p.poll() is None:
+        at = b.out("cat /tmp/cut/at 2>/dev/null", timeout=60).split()
+        if len(at) == 2 and at[0] not in seen:
+            seen.add(at[0])
+            time.sleep(2)
+            label = ("mid-" if at[0].endswith(".5") else "before-") + at[1]
+            while label in [l for l, _ in snaps]:  # the same place again (the rwfs: erased, then written)
+                label += "#2"
+            snap = os.path.join(W, "%s-%s.mtd" % (name, label))
+            shutil.copyfile(img, snap)
+            snaps.append((label, snap))
+            print("    stop %s: %s" % (at[0], label), flush=True)
+            if label == stop_at:
+                return snaps, lines, p
+            b.ssh("touch /tmp/cut/go%s" % at[0])
+        time.sleep(2)
+    p.wait(timeout=60)
+    print("    " + "\n    ".join(lines[-12:]))
+    return snaps, lines, p
+
+
+def boot_outcome(name, img, timeout=480, watch_wdt=False):
+    """boot a flash image: what comes up ("A/B kernel=.. rofs=..", "stock",
+    or "nothing" with the console's last words)"""
+    b = Bmc(name, img).start()
+    try:
+        if not b.wait_ssh(timeout):
+            c = [l for l in b.console().splitlines() if l.strip()]
+            return "nothing (%d boots; %s)" % (b.boots(), " / ".join(c[-3:])[-240:])
+        ab = b.out("cat /run/initramfs/reimu-ab 2>/dev/null").strip()
+        ver = b.out(". /etc/os-release; echo $VERSION_ID; uname -r").split()
+        r = ("A/B " + ab) if ab else "stock %s" % " ".join(ver)
+        if watch_wdt:  # still up past WDT1's 300 s (U-Boot's A/B bootcmd armed it)?
+            n = b.boots()
+            while float(b.out("cut -d' ' -f1 /proc/uptime").strip() or 0) < 340 and b.boots() == n:
+                time.sleep(10)
+            r += ", WDT1: %s" % ("reset" if b.boots() != n else "up after %s s" % b.out("cut -d. -f1 /proc/uptime").strip())
+        return r
+    finally:
+        b.stop()
+
+
+def t_restorecut():
+    if not all(os.path.exists(os.path.join(STOCK, f)) for f in STOCK_FILES):
+        check(False, "stock dump in %s" % STOCK)
+        return
+    img = fresh("restorecut")
+    orig = open(img, "rb").read()
+    b = Bmc("restorecut", img).start()
+    try:
+        check(b.wait_ssh(), "up")
+        wait_env(b, {"reimu_slot": "a", "reimu_tries": "0"})
+        # an install pending (slot B next, not yet healthy): "reimu-ab ram" must not confirm or cancel it
+        b.ssh("fw_setenv reimu_slot b; fw_setenv reimu_pending 1")
+        before = b.out("fw_printenv")
+        to_ram(b)
+        for i in range(30):
+            if b.out("systemctl is-active reimu-ab").strip() in ("active", "failed"):
+                break
+            time.sleep(3)
+        time.sleep(20)
+        check(b.out("fw_printenv") == before, "reimu-ab ram: the environment as it was (pending=1, slot b)")
+        check("started by kexec" in b.out("journalctl -o cat -t reimu-ab"), "reimu-ab boot: started by kexec, nothing to confirm")
+        b.ssh("fw_setenv reimu_slot a; fw_setenv reimu_pending")
+        snaps, lines, p = restore_cut(b, img, "restorecut", half="0x1c00000 0x3000000")
+        check(p.returncode == 0, "restore-stock completed (%s)" % (lines[-1:] or "?"))
+        check(any("slot b boots until the stock firmware is complete" in l for l in lines), "slot B kept bootable")
+    finally:
+        b.stop()
+    st = stock_data()
+    labels = [l for l, s in snaps]
+    want = ["before-0x100000", "before-0x680000", "before-0x1c00000", "mid-0x1c00000", "before-0xe0000",
+            "before-0xf0000", "before-0x3000000", "mid-0x3000000", "before-0x3000000#2", "mid-0x3000000#2"]
+    check(labels == want, "the writes in order: kernel, rofs to 0x1c00000, the rest of it, env, env, "
+          "the rwfs's place erased, rwfs (%s)" % labels)
+    ab_b = orig[0x1c00000:0x3700000]
+    # the rwfs as "reimu-ab ram" left it (the system wrote it before)
+    first = open(snaps[0][1], "rb").read() if snaps else b""
+    for label, snap in snaps:
+        f = open(snap, "rb").read()
+        if label in ("before-0x100000", "before-0x680000", "before-0x1c00000"):
+            check(f[0x1c00000:0x3700000] == ab_b and f[0xe0000:0x100000] != st["u-boot-env"][:0x20000],
+                  "%s: slot B untouched, the A/B environment" % label)
+        if label == "before-0x1c00000":
+            check(f[0x100000:0x680000] == st["kernel"] and f[0x680000:0x1c00000] == st["rofs"][:0x1580000],
+                  "%s: the stock kernel and rofs over slot A are in" % label)
+        if label in ("before-0xe0000", "before-0xf0000", "before-0x3000000", "mid-0x3000000"):
+            check(f[0x100000:0x680000] == st["kernel"] and f[0x680000:0x3000000] == st["rofs"],
+                  "%s: the stock kernel and rofs complete" % label)
+        if label == "before-0xe0000":
+            check(f[0x3000000:0x3700000] == orig[0x3000000:0x3700000] and f[0x3700000:] == first[0x3700000:],
+                  "%s: the A/B rwfs (and rofs-b's end) untouched yet" % label)
+        if label == "before-0xf0000":
+            check(f[0xe0000:0xf0000] == st["u-boot-env"][:0x10000], "%s: the first copy of the env is stock" % label)
+        if label.startswith("before-0x3") or label.startswith("mid-0x3"):
+            check(f[0xe0000:0x100000] == st["u-boot-env"], "%s: the stock environment in, both copies" % label)
+        if label == "mid-0x3000000":
+            check(f[0x3000000:0x3800000] == b"\xff" * 0x800000 and f[0x3800000:] == first[0x3800000:],
+                  "%s: half of the rwfs's place erased" % label)
+        if label == "before-0x3000000#2":
+            check(f[0x3000000:] == b"\xff" * 0x1000000, "%s: the rwfs's place erased" % label)
+        if label == "mid-0x3000000#2":
+            check(f[0x3000000:0x3800000] == st["rwfs"][:0x800000] and f[0x3800000:] == b"\xff" * 0x800000,
+                  "%s: half the stock rwfs, the rest erased" % label)
+    final = open(img, "rb").read()
+    check(final[0xe0000:0x100000] == st["u-boot-env"] and final[0x100000:] == st["kernel"] + st["rofs"] + st["rwfs"],
+          "complete: the stock firmware byte for byte")
+    # what each state boots (as if the power went there); the stock ones
+    # watched past 300 s (WDT1, armed by the A/B bootcmd)
+    outcomes = {}
+    boot = ["before-0x680000", "before-0x1c00000", "mid-0x1c00000", "before-0xe0000", "before-0xf0000",
+            "before-0x3000000", "mid-0x3000000", "before-0x3000000#2", "mid-0x3000000#2"]
+    for label, snap in snaps:
+        if label in boot:
+            outcomes[label] = boot_outcome("rc-" + label.replace("#", "-"), snap, watch_wdt=label not in boot[:3])
+            print("    power cut %s: %s" % (label, outcomes[label]), flush=True)
+    outcomes["complete"] = boot_outcome("rc-complete", img, watch_wdt=True)
+    print("    power cut complete: %s" % outcomes["complete"])
+    for k in ("before-0x680000", "before-0x1c00000"):
+        check(outcomes.get(k, "").startswith("A/B kernel=b rofs=b"), "%s: slot B boots" % k)
+    check(outcomes.get("mid-0x1c00000", "").startswith("nothing"), "mid-0x1c00000: the window, nothing boots (recorded)")
+    for k in ("before-0xe0000", "before-0xf0000"):
+        check(outcomes.get(k, "").startswith("stock reimu-1.0.2"), "%s (stock kernel and rofs complete): the stock firmware boots" % k)
+    for k in ("before-0x3000000", "mid-0x3000000", "before-0x3000000#2", "mid-0x3000000#2", "complete"):
+        check(outcomes.get(k, "").startswith("stock reimu-1.0.2") and "up after" in outcomes.get(k, ""),
+              "%s (the stock environment): the stock firmware boots and stays up" % k)
+
+
+def t_restorecut_a():
+    if not all(os.path.exists(os.path.join(STOCK, f)) for f in STOCK_FILES):
+        check(False, "stock dump in %s" % STOCK)
+        return
+    img = fresh("restorecut-a")
+    damage(img, "rofs-b", at=0x200000)
+    orig = open(img, "rb").read()
+    b = Bmc("restorecut-a", img).start()
+    try:
+        check(b.wait_ssh(), "up")
+        to_ram(b)
+        snaps, lines, p = restore_cut(b, img, "restorecut-a", stop_at="before-0x100000")
+        print("    " + "\n    ".join(lines[-6:]))
+        check(any("slot a boots until the stock firmware is complete" in l for l in lines), "slot A kept bootable")
+    finally:
+        b.stop()
+    st = stock_data()
+    labels = [l for l, s in snaps]
+    check(labels == ["before-0x1c00000", "before-0x100000"],
+          "slot B's region first: the rofs from 0x1c00000, then the kernel (%s)" % labels)
+    f = open(snaps[-1][1], "rb").read()
+    first = open(snaps[0][1], "rb").read()
+    check(f[0x100000:0x1c00000] == orig[0x100000:0x1c00000] and f[0x3000000:0x3700000] == orig[0x3000000:0x3700000]
+          and f[0xe0000:0x100000] == first[0xe0000:0x100000] and f[0x3700000:] == first[0x3700000:],
+          "slot A, the end of rofs-b, the environment, the rwfs untouched before the kernel")
+    check(f[0x1c00000:0x3000000] == st["rofs"][0x1580000:], "the stock rofs over slot B is in")
+    o = boot_outcome("rca-before-kernel", snaps[-1][1])
+    print("    power cut before the kernel: %s" % o)
+    check(o.startswith("A/B kernel=a rofs=a"), "slot A boots")
+
+
 TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update),
-         ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("stock", t_stock)]
+         ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("fallback", t_fallback),
+         ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("restorecut", t_restorecut),
+         ("restorecut-a", t_restorecut_a), ("stock", t_stock)]
 
 if __name__ == "__main__":
     for name, fn in TESTS:

@@ -102,6 +102,9 @@ class Gpio(threading.Thread):
     def __init__(self, qmp):
         super().__init__(daemon=True)
         self.q, self.samples, self.stop_ = qmp, [], False
+        # auto_on = S: the platform comes up (POWER_IN = 1) S seconds after
+        # a press of its power button (N5) while off; None: it never does
+        self.auto_on, self.on_at, self.is_on = None, None, False
 
     def read(self):
         m = re.search(r":\s*0x([0-9a-f]+)\s+0x([0-9a-f]+)", self.q.hmp("xp /2wx 0x1e780078"))
@@ -120,6 +123,11 @@ class Gpio(threading.Thread):
                 return
             if s:
                 self.samples.append(s)
+                if self.auto_on is not None and not self.is_on:
+                    if s[2] and self.on_at is None:
+                        self.on_at = s[0] + self.auto_on
+                    if self.on_at is not None and time.time() >= self.on_at:
+                        self.power_in(True)
             time.sleep(0.02)
 
     def mark(self):
@@ -133,6 +141,7 @@ class Gpio(threading.Thread):
         return self.samples[-1][1]
 
     def power_in(self, on):
+        self.is_on, self.on_at = bool(on), None
         self.q.cmd("qom-set", path="/machine/soc/gpio", property="gpioO2", value=bool(on))
 
 
@@ -538,11 +547,13 @@ def t_power(b):
         time.sleep(1)
     time.sleep(3)
     check(running and b.state().get("state") == "running", "write running (the lock held)")
-    rc, o = b.sh("server_pwr_on; echo rc=$?")
-    check("rc=53" in o and "can't be powered on" in o, "server_pwr_on refused during the write (%s)" % o.splitlines()[0])
+    rc, o = b.sh("t=$(date +%s); server_pwr_on; echo rc=$? $(( $(date +%s) - t ))s")
+    m = re.search(r"rc=(\d+) (\d+)s", o)
+    check(m and m.group(1) == "53" and 10 <= int(m.group(2)) <= 30 and "can't be powered on" in o,
+          "server_pwr_on during the write: waits for the lock (bounded), then refused (%s)" % o.replace("\n", " ")[-200:])
     n0 = b.out("journalctl -u host-poweron --no-pager | grep -c \"can't be powered on\"").strip()
     s, r = redfish("POST", "/redfish/v1/Systems/system/Actions/ComputerSystem.Reset", {"ResetType": "On"})
-    time.sleep(4)
+    time.sleep(25)
     n1 = b.out("journalctl -u host-poweron --no-pager | grep -c \"can't be powered on\"").strip()
     check(n1.isdigit() and n0.isdigit() and int(n1) > int(n0), "Redfish power on (HTTP %s): host-poweron refused by server_ctl" % s)
     rc, o = b.sh("busctl set-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 "
@@ -563,8 +574,6 @@ def t_power(b):
           "the platform came up during the write: write finished, reported (%s)" % st.get("warning"))
     check(b.chip()[:len(new)] == new and not b.gpio.o0_now(), "chip written, O0 = 0")
     b.power(False)
-    # (the job's guard keeps the lock up to a second after it ended)
-    b.ssh("for i in 1 2 3 4 5; do flock -n /run/reimu-pns/lock true && break; sleep 1; done")
     t0 = b.gpio.mark()
     rc, o = b.sh("server_pwr_on; echo rc=$?")
     s = b.gpio.since(t0)
@@ -728,9 +737,292 @@ def t_bmcupdate(b):
         time.sleep(5)
     check(ok and e.get("reimu_slot") == "b", "update confirmed (%s)" % e)
 
+# ------------------------------------------------------------------ restores
+SC = "/tmp/sc"
 
-GROUPS = [("pnsflash", [("tool", t_tool), ("faults", t_faults), ("power", t_power)]),
-          ("pnsweb", [("web", t_web), ("bmcupdate", t_bmcupdate)])]
+
+def chip_to(b, kind, orig, bad):
+    """the chip: orig (the dump), blank (erased from 0x0 past the device
+    tree), half (the boot area erased, the device tree there: a write cut
+    short), other (another board's image: its device tree)"""
+    if kind == "orig" and b.chip() == orig:
+        return True
+    if kind == "half" and b.chip()[DTB_OFF:] != orig[DTB_OFF:] and not chip_to(b, "orig", orig, bad):
+        return False
+    if kind in ("blank", "half"):
+        n = 8 if kind == "blank" else 1
+        rc, o = b.sh("[ -f %s/ff%d ] || dd if=/dev/zero bs=1M count=%d 2>/dev/null | tr '\\000' '\\377' > %s/ff%d; "
+                     "reimu-pns-flash with-chip sh -c 'reimu-flash write $PNS_DEV 0 %s/ff%d 3 >/dev/null'"
+                     % (SC, n, n, SC, n, SC, n))
+        c = b.chip()
+        ok = rc == 0 and c[:n * MiB] == b"\xff" * (n * MiB) and (kind == "blank" or c[DTB_OFF:] == orig[DTB_OFF:])
+    else:
+        rc, o = b.sh("reimu-pns-flash write %s/%s.bin%s --any-board --blank-ok" % (SC, kind, ".gz" if kind == "orig" else ""))
+        c = b.chip()
+        ok = rc == 0 and (c == orig if kind == "orig" else c[:len(bad["other-board"])] == bad["other-board"])
+    if not ok:
+        print("    chip -> %s: rc %d %s" % (kind, rc, o[-300:]))
+    return ok
+
+
+def wr(b, path, *opts):
+    rc, o = b.sh("reimu-pns-flash write %s %s" % (path, " ".join(opts)))
+    return rc, o.replace("\n", " ")[-220:]
+
+
+def t_sidecar(b):
+    """a restore (the image's sha256 in its .sha256) proves the file intact,
+    not whose it is: the board is checked all the same; a chip without a
+    device tree takes only a backup this BMC made of this chip"""
+    orig, new, bad = images()
+    b.ssh("rm -rf %s; mkdir -p %s" % (SC, SC))
+    for name, data in (("orig", orig), ("new", new), ("other", bad["other-board"])):
+        put(b, data, "%s/%s.bin" % (SC, name))
+    # a release of another board as shipped: pns.bin + pns.bin.sha256
+    b.sh("cd %s && cp other.bin foreign.bin && sha256sum foreign.bin > foreign.bin.sha256 && gzip orig.bin" % SC)
+    # (/tmp is RAM: the chip-sized ones gzipped)
+
+    # --- not a restore
+    check(chip_to(b, "blank", orig, bad), "chip erased")
+    rc, o = wr(b, SC + "/new.bin")
+    check(rc != 0 and "читается пустым" in o and b.chip()[:MiB] == b"\xff" * MiB,
+          "an image onto an erased chip: refused without --blank-ok (%s)" % o)
+    check(chip_to(b, "half", orig, bad), "chip half-written (boot area erased, device tree there)")
+    rc, o = wr(b, SC + "/new.bin")
+    check(rc != 0 and ("нет образа Lintel" in o or "читается пустым" in o) and b.chip()[:MiB] == b"\xff" * MiB,
+          "an image onto a half-written chip: refused without --blank-ok (%s)" % o)
+    rc, o = wr(b, SC + "/new.bin", "--blank-ok")
+    check(rc == 0 and b.chip()[:len(new)] == new, "--blank-ok: this board's image onto it (%s)" % o)
+
+    # --- a foreign image with a matching .sha256
+    check(chip_to(b, "orig", orig, bad), "chip: the dump (this board's device tree)")
+    rc, o = wr(b, SC + "/foreign.bin")
+    check(rc != 0 and "другой платы" in o and b.chip() == orig,
+          "another board's image + its .sha256 onto this board's chip: refused (%s)" % o)
+    check(chip_to(b, "blank", orig, bad), "chip erased")
+    rc, o = wr(b, SC + "/foreign.bin")
+    check(rc != 0 and "Плата неизвестна" in o and b.chip()[:MiB] == b"\xff" * MiB,
+          "another board's image + its .sha256 onto an erased chip: refused without --any-board (%s)" % o)
+    rc, o = wr(b, SC + "/foreign.bin", "--any-board")
+    check(rc == 0 and b.chip()[:len(bad["other-board"])] == bad["other-board"],
+          "... with --any-board: written (%s)" % o)
+
+    # --- this board's own backup (made here: the .sha256 says so)
+    check(chip_to(b, "orig", orig, bad), "chip: the dump")
+    rc, o = b.sh("reimu-pns-flash read")
+    bk = o.strip().splitlines()[-1] if o.strip() else "?"
+    side = bk[:-3] + ".sha256" if bk.endswith(".gz") else bk + ".sha256"
+    rc2, sc = b.sh("cat %s" % side)
+    lines = sc.splitlines()
+    # (a copy: the backups in RAM are pruned to the newest 4)
+    b.sh("cp %s %s/own.bin.gz && cp %s %s/own.bin.sha256" % (bk, SC, side, SC))
+    bk, side = SC + "/own.bin.gz", SC + "/own.bin.sha256"
+    check(rc == 0 and len(lines) == 2 and lines[0].startswith(sha(orig))
+          and re.match(r"# reimu-pns-flash: bmc=98:a7:b0:00:00:01 jedec=20ba20 size=67108864 date=\S+ "
+                       r"board=mcst,e8c2_1e8sv-uatx_445$", lines[1]),
+          "a backup's .sha256 records who made it, of what: %s" % " | ".join(lines))
+    for kind in ("blank", "half"):
+        check(chip_to(b, kind, orig, bad), "chip -> %s" % kind)
+        rc, o = wr(b, bk)
+        check(rc == 0 and b.chip() == orig, "own backup onto a %s chip: restored (%s)" % (kind, o))
+    rc, o = b.sh("reimu-pns-flash write %s/new.bin" % SC)
+    check(rc == 0 and b.chip()[:len(new)] == new, "chip: this board's other image")
+    rc, o = wr(b, bk)
+    check(rc == 0 and b.chip() == orig, "own backup onto a chip with this board's device tree: restored (%s)" % o)
+    check(chip_to(b, "other", orig, bad), "chip: another board's image")
+    rc, o = wr(b, bk)
+    check(rc != 0 and "другой платы" in o, "own backup onto a chip with another board's device tree: refused (%s)" % o)
+    rc, o = wr(b, bk, "--any-board")
+    check(rc == 0 and b.chip() == orig, "... with --any-board: restored (%s)" % o)
+
+    # --- a backup made by another BMC (copied here with its .sha256)
+    b.sh("cd %s && cp %s from-other-bmc.bin.gz && sed '1s#  .*#  from-other-bmc.bin#; 2s#bmc=[^ ]*#bmc=02:00:00:00:00:99#' "
+         "%s > from-other-bmc.bin.sha256" % (SC, bk, side))
+    check(chip_to(b, "blank", orig, bad), "chip erased")
+    rc, o = wr(b, SC + "/from-other-bmc.bin.gz")
+    check(rc != 0 and "Плата неизвестна" in o, "another BMC's backup onto an erased chip: refused (%s)" % o)
+    rc, o = wr(b, SC + "/from-other-bmc.bin.gz --any-board")
+    check(rc == 0 and b.chip() == orig, "... with --any-board: written")
+    # an old .sha256 (the sum only): restorable where the board can be checked
+    b.sh("cd %s && rm -f from-other-bmc.* && cp %s plain.bin.gz && head -1 %s > plain.bin.sha256" % (SC, bk, side))
+    check(chip_to(b, "half", orig, bad), "chip half-written")
+    rc, o = wr(b, SC + "/plain.bin.gz")
+    check(rc == 0 and b.chip() == orig, "a .sha256 without the provenance line, chip with this board's device tree: restored (%s)" % o)
+
+    # --- reimu-pns-flash read FILE: restorable
+    b.ssh("rm -f %s/plain.* %s/own.*" % (SC, SC))
+    rc, o = b.sh("reimu-pns-flash read %s/mine.bin" % SC)
+    check(rc == 0 and chip_to(b, "blank", orig, bad), "read FILE, chip erased")
+    rc, o = wr(b, SC + "/mine.bin")
+    check(rc == 0 and b.chip() == orig, "read FILE backup onto an erased chip: restored (%s)" % o)
+    b.ssh("rm -f %s/mine.*" % SC)
+    # "last" (the copy on the BMC flash)
+    rc, o = b.sh("grep -c '^# reimu-pns-flash: bmc=' /var/lib/reimu-pns/backup-last.bin.sha256")
+    check(o.strip() == "1", "backup-last.bin.sha256 keeps the provenance line")
+    check(chip_to(b, "orig", orig, bad), "the dump again")
+    b.ssh("rm -rf %s" % SC)
+
+
+# ------------------------------------------------------------------ power-on vs jobs
+def journal_refusals(b, since):
+    return b.out("journalctl --no-pager -o cat --since '%s' | grep -ciE \"can't be powered on|rc 53|refused\"" % since).strip()
+
+
+def t_afterjob(b):
+    """power-on right after a PNS job ended (CLI and web): not refused"""
+    b.power(False)
+    b.gpio.auto_on = 1
+    try:
+        for i in range(2):
+            t0 = b.gpio.mark()
+            rc, o = b.sh("reimu-pns-flash version --read >/dev/null; t=$(date +%s); server_pwr_on; echo rc=$? $(( $(date +%s) - t ))s")
+            s = b.gpio.since(t0)
+            check("rc=0" in o and any(x[2] for x in s), "server_pwr_on right after version --read: %s" % o.replace("\n", " "))
+            check(b.power(False), "off again")
+        # the web job: power-on as soon as its state says ok
+        before = pf_job()
+        r = pf_call("Run", "read", "")
+        check(r.get("ok"), "web read started (%s)" % r.get("message"))
+        t0 = b.gpio.mark()
+        rc, o = b.sh("i=0; until grep -q '\"state\":\"ok\"' /run/reimu-pns/state.json && [ \"$(sed -n 's/.*\"started\":\\([0-9]*\\).*/\\1/p' /run/reimu-pns/state.json)\" != '%s' ]; "
+                     "do i=$((i+1)); [ $i -gt 3000 ] && break; sleep 0.1; done; t=$(date +%%s); server_pwr_on; echo rc=$? $(( $(date +%%s) - t ))s"
+                     % (before[1] or ""), timeout=600)
+        s = b.gpio.since(t0)
+        check("rc=0" in o and any(x[2] for x in s), "server_pwr_on right after the web job: %s" % o.replace("\n", " "))
+        check(b.power(False), "off again")
+    finally:
+        b.gpio.auto_on = None
+        b.gpio.power_in(False)
+
+
+def t_press(b):
+    """a PNS job started right after the power button was pressed (power
+    good not there yet) is refused: the host would boot without its flash"""
+    orig, new, bad = images()
+    b.power(False)
+    b.gpio.auto_on = 3
+    try:
+        t0 = b.gpio.mark()
+        rc, o = b.sh("(server_pwr_on >/tmp/pwr.log 2>&1 &); sleep 0.5; reimu-pns-flash read /tmp/x.bin; echo rc=$?; rm -f /tmp/x.bin*")
+        s = b.gpio.since(t0)
+        check("rc=0" not in o and not any(x[1] for x in s),
+              "server_pwr_on, a read 0.5 s later: refused, O0 never 1 (%s)" % o.replace("\n", " ")[-160:])
+        check(b.power(True), "the platform came up (3 s after the button)")
+    finally:
+        b.gpio.auto_on = None
+    check(b.power(False), "off")
+    # host-poweron (Redfish On) and a platform that doesn't come up: the
+    # whole power-on attempt (server_pwr_on 10 s + server_watchdog_reset 10 s)
+    for delay in (1, 12):
+        b.ssh("systemctl reset-failed host-poweron 2>/dev/null")
+        t0 = b.gpio.mark()
+        st, r = redfish("POST", "/redfish/v1/Systems/system/Actions/ComputerSystem.Reset", {"ResetType": "On"})
+        pressed = None
+        for i in range(100):
+            p = [x for x in b.gpio.since(t0) if x[2]]
+            if p:
+                pressed = p[0][0]
+                break
+            time.sleep(0.1)
+        time.sleep(max(0, pressed + delay - time.time()) if pressed else 0)
+        t1 = b.gpio.mark()
+        rc, o = b.sh("reimu-pns-flash read /tmp/x.bin; echo rc=$?; rm -f /tmp/x.bin*")
+        check(pressed and "rc=0" not in o and not any(x[1] for x in b.gpio.since(t1)),
+              "Redfish On (HTTP %s), a read %d s after the button: refused (%s)" % (st, delay, o.replace("\n", " ")[-160:]))
+        for i in range(60):
+            if b.out("systemctl show -p ActiveState --value host-poweron").strip() != "activating":
+                break
+            time.sleep(1)
+    rc, o = b.sh("reimu-pns-flash read /tmp/x.bin >/dev/null; echo rc=$?; rm -f /tmp/x.bin*")
+    check("rc=0" in o, "the power-on over (the platform never came up): a read works again (%s)" % o.replace("\n", " ")[-120:])
+    check(b.chip() == orig, "chip unchanged")
+
+
+def t_autopower(b):
+    """AUTO_POWER_ON=on, the BMC boots with the platform off: the versions
+    are read (reimu-pns-version), then allow_host_boot powers the platform on,
+    no refusal"""
+    b.power(False)
+    chip0 = json.loads(b.out("cat /var/lib/reimu-pns/chip.json") or "{}")
+    b.ssh("cp /etc/auto_power_on /tmp/apo.save 2>/dev/null; sed -i 's/^AUTO_POWER_ON=.*/AUTO_POWER_ON=on/' /etc/auto_power_on; sync")
+    b.gpio.auto_on = 2
+    try:
+        # allow_host_boot while a PNS job holds the lock (25 s): refused,
+        # said so, powered on once the job is over
+        t0 = b.gpio.mark()
+        since = b.out("date '+%Y-%m-%d %H:%M:%S'").strip()
+        b.ssh("(reimu-pns-flash with-chip sleep 25 >/dev/null 2>&1 &); sleep 2; systemctl restart --no-block allow_host_boot",
+              timeout=30)
+        for i in range(90):
+            if b.gpio.is_on:
+                break
+            time.sleep(1)
+        t_on = time.time() - t0
+        time.sleep(2)
+        o = b.out("journalctl --no-pager -o cat -u allow_host_boot --since '%s'" % since)
+        print("    " + o.strip().replace("\n", "\n    "))
+        check(b.gpio.is_on and t_on > 20 and "REFUSED" in o, "allow_host_boot during a PNS job: refused (logged), "
+              "powered on after it (%.0f s)" % t_on)
+        check(b.power(True) and b.power(False), "off again")
+        b.gpio.auto_on = 2
+        n = len(b.console())
+        b.ssh("(sleep 1; reboot) >/dev/null 2>&1 &", timeout=30)
+        check(b.wait_console(r"reimu\.slot=", 400, n) is not None, "BMC reboots")
+        t0 = b.gpio.mark()
+        check(b.wait_ssh(600), "up again")
+        for i in range(60):
+            if b.ssh("systemctl is-active -q allow_host_boot").returncode == 0:
+                break
+            time.sleep(2)
+        j = b.out("journalctl -b --no-pager -o cat -u reimu-pns-version -u allow_host_boot -u host-poweron")
+        print("    " + "\n    ".join(j.strip().splitlines()[-12:]))
+        chip1 = json.loads(b.out("cat /var/lib/reimu-pns/chip.json") or "{}")
+        check(chip1.get("source") == "boot" and chip1.get("time") != chip0.get("time"),
+              "reimu-pns-version read the versions at boot (%s, %s)" % (chip1.get("source"), chip1.get("time")))
+        check("Powering on the platform" in j and "can't be powered on" not in j and "REFUSED" not in j,
+              "allow_host_boot powered on, no refusal")
+        b.power(True)
+        check(any(x[2] for x in b.gpio.samples if x[0] >= t0 - 120) and b.host_state().endswith('Running"'),
+              "the power button was pressed, the platform runs (%s)" % b.host_state().strip())
+        n53 = b.out("journalctl -b --no-pager -o cat | grep -ciE \"can't be powered on|rc 53\"").strip()
+        check(n53 == "0", "no refusal (53) in the journal (%s)" % n53)
+    finally:
+        b.gpio.auto_on = None
+        b.ssh("cp /tmp/apo.save /etc/auto_power_on 2>/dev/null || sed -i 's/^AUTO_POWER_ON=.*/AUTO_POWER_ON=off/' /etc/auto_power_on; sync")
+        b.power(False)
+
+
+# ------------------------------------------------------------------ restart policy
+# (unit, RestartUSec as its own file declares it) for the units that set
+# their own; the rest: reimu-restart-policy's 5 s
+OWN_RESTART = {"reimupwr": "2s", "reimu-kvm": "10s", "reimu-pnsd": "5s", "reimu-serial": "2s",
+               "xyz.openbmc_project.Chassis.Buttons": "3s", "xyz.openbmc_project.ObjectMapper": "5s"}
+
+
+def t_restart(b):
+    """reimu-restart-policy's drop-ins don't override a unit's own policy"""
+    for u, want in OWN_RESTART.items():
+        o = b.out("systemctl show -p Restart -p RestartUSec -p StartLimitIntervalUSec %s.service" % u)
+        p = dict(l.split("=", 1) for l in o.split())
+        check(p.get("RestartUSec") == want and p.get("Restart") == "always" and p.get("StartLimitIntervalUSec") == "0",
+              "%s: RestartSec %s as declared, Restart=always, no start limit (%s)" % (u, want, " ".join(o.split())))
+    # every drop-in: sets nothing the unit's own file declares
+    # (systemd-networkd: its RestartSec=0 without a start limit would spin)
+    o = b.out(r"""for d in /lib/systemd/system/*.d/reimu-restart.conf; do u=${d%.d/reimu-restart.conf}; u=${u##*/}
+f=/lib/systemd/system/$u; echo $u $(grep -c '^RestartSec=' $f) $(grep -c '^StartLimit' $f) \
+$(grep -c '^RestartSec=' $d) $(grep -c '^StartLimit' $d) $(sed -n 's/^Restart=//p' $f) $(sed -n 's/^Restart=//p' $d); done""")
+    rows = [l.split() for l in o.strip().splitlines()]
+    bad = [r for r in rows if len(r) >= 5 and r[0] != "systemd-networkd.service" and
+           ((r[1] != "0" and r[3] != "0") or (r[2] != "0" and r[4] != "0") or (len(r) == 7 and r[5] != r[6]))]
+    check(rows and not bad, "%d drop-ins, none overrides what its unit declares (%s)" % (len(rows), bad))
+    check(not [r for r in rows if r[0].replace(".service", "") in OWN_RESTART and r[3] != "0"],
+          "no drop-in RestartSec on %s" % ", ".join(OWN_RESTART))
+
+
+GROUPS = [("pnsflash", [("tool", t_tool), ("sidecar", t_sidecar), ("faults", t_faults), ("power", t_power),
+                        ("press", t_press), ("restart", t_restart)]),
+          ("pnsweb", [("web", t_web), ("afterjob", t_afterjob), ("autopower", t_autopower),
+                      ("bmcupdate", t_bmcupdate)])]
 
 if __name__ == "__main__":
     for f in (ORIG, NEW):

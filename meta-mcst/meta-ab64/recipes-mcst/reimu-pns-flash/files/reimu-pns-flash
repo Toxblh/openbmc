@@ -33,9 +33,14 @@
 #                                        check), the chip must hold a Lintel
 #                                        image (--blank-ok: or be erased).
 #                                        FILE may be gzipped (.gz).
-#                                        A backup made here (its .sha256
-#                                        next to it) is a restore: onto any
-#                                        chip contents.
+#                                        A restore (FILE's sha256 in its
+#                                        .sha256 next to it): also onto an
+#                                        erased or half-written chip; the
+#                                        board is checked against the chip's
+#                                        device tree all the same. Only a
+#                                        backup made here (the .sha256 names
+#                                        this BMC and this chip) goes onto a
+#                                        chip without a device tree unchecked.
 #   reimu-pns-flash with-chip CMD [ARG...]
 #                                        run CMD with the flash switched to
 #                                        the BMC (its device in PNS_DEV), the
@@ -55,6 +60,8 @@
 # /tmp/reimu-pns/backup-*.bin.gz + .sha256 (RAM, ~1 MiB each: the chip is
 # mostly erased), /var/lib/reimu-pns/backup-last.bin.gz
 # (the chip before the last write, kept on the BMC flash when small).
+# A backup's .sha256: "SHA256  NAME", then "# reimu-pns-flash: bmc=MAC
+# jedec=ID size=BYTES date=... board=COMPATIBLE" (who read it, from what).
 set -u
 me=reimu-pns-flash
 RUN=${REIMU_PNS_RUN:-/run/reimu-pns}
@@ -170,9 +177,19 @@ host_off() {
     esac
     s=$(host_state)
     case "$s" in
-        ""|*.Off) return 0 ;;
+        ""|*.Off) ;;
         *) REASON="Платформа не выключена (${s##*.}): выключите её и повторите"; return 1 ;;
     esac
+    # a power-on in progress: the button pressed, power good not there yet
+    # (server_ctl keeps the lock until it is, at most 10 s)
+    case " $(transitions) " in
+        *" activating "*) REASON="Платформа включается (host-poweron, host-reset или allow_host_boot): подождите и повторите"; return 1 ;;
+    esac
+}
+
+# ActiveState of the units that power the platform on or reset it
+transitions() {
+    systemctl show -p ActiveState --value host-poweron.service host-reset.service allow_host_boot.service 2>/dev/null | tr '\n' ' '
 }
 
 # ------------------------------------------------------------ lock, switch
@@ -180,7 +197,8 @@ locked=
 lock() {
     mkdir -p $RUN $WORK
     exec 9>>$LOCK
-    # (the guard of the job before holds it for up to a second after it ended)
+    # (a power-on holds it until power good, at most 10 s; the web job's
+    # ExecStopPost disconnect for a moment)
     i=0
     until flock -n 9; do
         i=$((i + 1))
@@ -222,14 +240,28 @@ cleanup() {
     [ "$rc" = 0 ] || finish failed "${S_MSG:-прервано} (прервано)"
     state
     rm -f $WORK/.tmp.$$.*
+    # the job ends here, its guard with it (before this process exits: the
+    # lock is free when it has, a power-on right after the job isn't refused)
+    if [ -n "$guard_pid" ]; then
+        kill -9 $guard_pid 2>/dev/null
+        wait $guard_pid 2>/dev/null
+        guard_pid=
+    fi
 }
 
 # the job may be killed by anything (kill -9 too): a guard process switches
-# the flash back to the host when it is gone; it holds the lock (fd 9) until
-# then, so nothing else starts meanwhile
+# the flash back to the host when it is gone. It doesn't keep the job's lock
+# (fd 9): a normal exit ends it (cleanup) and the lock is free at once.
+# After a kill the lock stays held by what the job started (a reimu-flash
+# still writing) until the guard has stopped that; the guard then takes the
+# lock itself to switch the flash back. If something else got it first,
+# that switches the flash back: a power-on (server_ctl), the next job
+# (recover)
+guard_pid=
 guard() {
     me_pid=$$
-    ( trap '' INT TERM HUP
+    ( exec 9>&-
+      trap '' INT TERM HUP
       while kill -0 $me_pid 2>/dev/null; do sleep 1; done
       # a reimu-flash it started goes on writing: stop it first
       d=$(cat $RUN/dev 2>/dev/null)
@@ -239,11 +271,19 @@ guard() {
               sleep 1
           done
       fi
+      exec 8>>$LOCK
+      i=0
+      until flock -n 8; do
+          i=$((i + 1))
+          [ $i -lt 15 ] || exit 0
+          sleep 1
+      done
       switch 0
       if [ -f $STATE ] && grep -q "\"state\":\"running\",.*\"pid\":$me_pid," $STATE; then
           sed -i 's/"state":"running"/"state":"interrupted"/; s/"message":"[^"]*"/"message":"Прервано: процесс записи завершился аварийно"/' $STATE
           logger -t $me "job $me_pid killed: PNS flash switched back to the host" 2>/dev/null
       fi ) </dev/null >/dev/null 2>&1 &
+    guard_pid=$!
 }
 
 # kill SIG PATTERN: signal the processes whose command line has PATTERN
@@ -257,7 +297,7 @@ killcmd() {
     return $found
 }
 
-DEV= CHIPSIZE= ES=
+DEV= CHIPSIZE= ES= JEDEC=
 find_dev() {
     if [ -n "${REIMU_PNS_DEV:-}" ]; then
         DEV=$REIMU_PNS_DEV
@@ -292,6 +332,7 @@ connect() {
     if [ -c "$DEV" ]; then
         n=${DEV##*/}
         CHIPSIZE=$(cat /sys/class/mtd/$n/size) ES=$(cat /sys/class/mtd/$n/erasesize)
+        JEDEC=$(cat /sys/class/mtd/$n/device/spi-nor/jedec_id 2>/dev/null)
     else
         CHIPSIZE=$(stat -c %s "$DEV") ES=4096
     fi
@@ -367,8 +408,25 @@ room() {
 # the chip read RAW (and RAW.sha256) as a backup NAME.gz + NAME.sha256 in WORK
 pack() {
     gzip -c $1 > $WORK/$2.gz.tmp && mv $WORK/$2.gz.tmp $WORK/$2.gz &&
-        sed "s#  .*#  $2#" $1.sha256 > $WORK/$2.sha256 ||
+        sed "1s#  .*#  $2#" $1.sha256 > $WORK/$2.sha256 ||
         { rm -f $WORK/$2.gz.tmp; die "Не удалось сохранить резервную копию в $WORK"; }
+}
+
+# who made a backup: this BMC (its MAC), of this chip (JEDEC ID, size)
+bmc_id() { cat /sys/class/net/eth0/address 2>/dev/null; }
+made_here() { printf 'bmc=%s jedec=%s size=%s' "$(bmc_id)" "${JEDEC:--}" "$CHIPSIZE"; }
+# SIDECAR (I_* of the chip read): the line after the sha256
+mark() {
+    printf '# %s: %s date=%s board=%s\n' $me "$(made_here)" "$(date +%Y-%m-%dT%H:%M:%S)" \
+        "$(printf '%s' "${I_COMPAT:--}" | tr -cd ' -~')" >> "$1"
+}
+# SIDECAR: of a backup this tool made on this BMC, of this chip
+own_backup() {
+    local l
+    [ -n "$(bmc_id)" ] || return 1
+    l=$(grep -m1 "^# $me: " "$1" 2>/dev/null) || return 1
+    case "$l" in "# $me: $(made_here) date="*) return 0 ;; esac
+    return 1
 }
 
 # ------------------------------------------------------------ image info
@@ -583,6 +641,7 @@ do_read() {
     raw=${f:-$(tmp chip)}
     backup $raw 2 98 || die "Два чтения флеша ПНС не совпадают: чип или его подключение ненадёжны"
     switch 0 && connected=
+    info $raw; mark $raw.sha256
     if [ -z "$f" ]; then
         name=backup-$(date +%Y%m%d-%H%M%S).bin
         pack $raw $name
@@ -590,8 +649,8 @@ do_read() {
         f=$WORK/$name.gz
     fi
     S_BACKUP=$f
-    info $raw; save_chip read $(cut -d' ' -f1 $raw.sha256)
-    finish ok "Флеш ПНС прочитан ($CHIPSIZE байт, sha256 $(cut -c1-16 $raw.sha256)…): $f"
+    save_chip read $(head -1 $raw.sha256 | cut -d' ' -f1)
+    finish ok "Флеш ПНС прочитан ($CHIPSIZE байт, sha256 $(head -1 $raw.sha256 | cut -c1-16)…): $f"
     say "$f"
 }
 
@@ -617,30 +676,39 @@ do_write() {
     # the image as such (the board once the chip is read)
     R_COMPAT=; check_image "$img" 1 || die "$(printf '%s' "$C_ERR" | tr '\n' ' ' | sed 's/ *$//')"
     sz=$(fsize "$img") isum=$(filesum "$img")
-    # a backup of this chip made by us (its sha256 recorded): a restore. It
-    # may go onto a chip a failed write left erased or half-written, and
-    # it is this board's by definition
-    restore=
+    # a restore: FILE's sha256 recorded next to it (or the last backup's).
+    # It may go onto a chip a failed write left erased or half-written. A
+    # matching sha256 proves the file intact, not whose it is (a release
+    # ships as pns.bin + pns.bin.sha256 too, a backup may come from another
+    # board): the board is checked against the chip's device tree as for
+    # any image, and a chip without one takes only a backup made here
+    restore= rside=
     for s in "$sidecar" $KEEP/backup-last.bin.sha256; do
-        [ -f "$s" ] && grep -q "^$isum " "$s" && restore=1
+        [ -z "$restore" ] && [ -f "$s" ] && grep -q "^$isum " "$s" && restore=1 rside=$s
     done
-    [ -n "$restore" ] && { blank=1 any=1; log "$f: a backup of this chip, restoring"; }
+    [ -n "$restore" ] && { blank=1; log "$f: its sha256 is in $rside: a restore"; }
     connect
     # the chip read into RAM for this job (bk), kept as backup-DATE.bin.gz
     room 1
     bk=$(tmp chip)
     backup $bk 2 40 || die "Два чтения флеша ПНС не совпадают: запись отменена, флеш не изменён"
+    info $bk; mark $bk.sha256
     name=backup-$(date +%Y%m%d-%H%M%S).bin
     pack $bk $name
     prune 4 "$f"
     S_BACKUP=$WORK/$name.gz
-    info $bk
     [ -n "$I_EMPTY" ] && [ -z "$I_MAGIC" ] && [ $blank = 0 ] &&
         die "Флеш ПНС читается пустым: он не подключился к BMC или пуст. Запись отменена (--blank-ok: писать в пустой)"
     [ -z "$I_MAGIC" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
         die "На флеше ПНС нет образа Lintel: он не подключился к BMC или повреждён. Запись отменена (--blank-ok: писать всё равно)"
-    save_chip backup $(cut -d' ' -f1 $bk.sha256)
+    save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
     ref_from_info "флеш"
+    # no device tree on the chip to check the board against: only a backup
+    # this BMC made of this chip is taken as this board's
+    if [ -n "$restore" ] && [ -z "$R_COMPAT" ] && [ $any = 0 ] && own_backup "$rside"; then
+        any=1
+        log "$f: a backup made here of this chip, the chip has no device tree: board not checked"
+    fi
     check_image "$img" $any strict || die "$(printf '%s' "$C_ERR" | tr '\n' ' ' | sed 's/ *$//')"
     S_WARN=$(printf '%s' "$C_WARN" | tr '\n' ' ' | sed 's/ *$//')
     [ "$sz" -le "$CHIPSIZE" ] || die "Образ больше флеша"
@@ -656,7 +724,7 @@ do_write() {
     tsum=$(filesum $t)
     if [ "$(filesum $bk 0 $len)" = "$tsum" ]; then
         S_CHANGED=0
-        info $t; save_chip write $(cut -d' ' -f1 $bk.sha256)
+        info $t; save_chip write $(head -1 $bk.sha256 | cut -d' ' -f1)
         switch 0 && connected=
         [ "$f" = $WORK/upload.bin ] && rm -f "$f"
         finish ok "Флеш ПНС уже содержит этот образ: ничего не записано"

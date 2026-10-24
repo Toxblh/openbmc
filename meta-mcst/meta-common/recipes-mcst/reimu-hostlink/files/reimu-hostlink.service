@@ -1,0 +1,27 @@
+[Unit]
+Description=REIMU host link (the host agent's inventory, health, GPU fan policy)
+After=dbus.service network.target
+# a link to the host: always back, whatever stopped it
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/reimu-hostlink
+# re-reads /etc/reimu-hostlink.conf (PORT and IFACE: a restart)
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+# pinged by the poll loop (at least once a second)
+WatchdogSec=30
+TimeoutStopSec=10
+# a side service: below the BMC's own daemons when the CPU is busy
+Nice=5
+# the key, the certificate, the policy (rwfs: kept across A/B updates)
+StateDirectory=reimu-hostlink
+StateDirectoryMode=0700
+RuntimeDirectory=reimu-hostlink
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target
