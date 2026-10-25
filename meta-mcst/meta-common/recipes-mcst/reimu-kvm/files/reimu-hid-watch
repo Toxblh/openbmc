@@ -60,8 +60,10 @@ usb_off() {
         xyz.openbmc_project.Reimu.Kvm Status 2>/dev/null | sed -n 's/.*\\"usboff\\":\([0-9]*\).*/\1/p'
 }
 
+# a disk the host may be using: the virtual media (jsnbd's mass-storage0/1)
+# and the agent installer's disk (reimu-agent-disk: reimu_agent)
 media_bound() {
-    for u in $G/mass-storage*/UDC; do
+    for u in $G/mass-storage*/UDC $G/reimu_agent/UDC; do
         [ -s "$u" ] && [ -n "$(cat "$u")" ] && return 0
     done
     return 1
@@ -105,7 +107,7 @@ reset_vhub() {
     log "virtual hub reset, gadgets bound again (hub address $addr)"
 }
 
-on_since= na_since= done_this_power_on=0
+on_since= na_since= done_this_power_on=0 media_said=
 while :; do
     t=$(uptime_s)
     if $HOST_ON; then
@@ -126,12 +128,15 @@ while :; do
     [ -n "$na_since" ] && [ $((t - na_since)) -ge $GRACE ] && lost="not attached for $((t - na_since)) s"
     if [ -n "$on_since" ] && [ -n "$udc" ] && [ $done_this_power_on = 0 ] &&
        [ $((t - on_since)) -ge $GRACE ] && [ -n "$lost" ]; then
+        # the one reset of this power-on is used when it is attempted, not when
+        # a disk in use holds it back: then it waits until the disk is gone
         if media_bound; then
-            log "the host has not had the KVM keyboard ($lost), but virtual media is in use: no reset"
+            [ -n "$media_said" ] || log "the host has not had the KVM keyboard ($lost), but virtual media is in use: no reset while it is"
+            media_said=1
         else
             reset_vhub "$lost"
+            done_this_power_on=1 media_said=
         fi
-        done_this_power_on=1
     fi
     sleep $POLL
 done

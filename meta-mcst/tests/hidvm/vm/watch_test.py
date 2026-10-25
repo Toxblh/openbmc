@@ -37,7 +37,7 @@ def check(cond, what):
 
 
 class Fake:
-    def __init__(self, off=99, state="configured", host=True, media=False, hs=True, addr=True):
+    def __init__(self, off=99, state="configured", host=True, media=False, hs=True, addr=True, agent=False):
         self.w = tempfile.mkdtemp(prefix="hidwatch-")
         self.hs, self.addr_comes = hs, addr
         self.g = self.w + "/sys/kernel/config/usb_gadget"
@@ -46,6 +46,9 @@ class Fake:
         open(self.udc_file, "w").write(PORT + "\n")
         os.makedirs(self.g + "/mass-storage0")
         open(self.g + "/mass-storage0/UDC", "w").write("1e6a0000.usb-vhub:p4\n" if media else "")
+        # the agent installer's disk (reimu-agent-disk: vhub p3, else p2)
+        os.makedirs(self.g + "/reimu_agent")
+        open(self.g + "/reimu_agent/UDC", "w").write("1e6a0000.usb-vhub:p3\n" if agent else "")
         self.ports(True, state)
         os.makedirs(self.w + "/regs")
         self.reg("0x1E6A0004", 5)
@@ -218,6 +221,23 @@ def main():
     f = Fake(off=0, state="not attached", media=True)
     time.sleep(5)
     check(f.resets() == 0 and "virtual media is in use" in f.text(), "no reset while the media gadget is bound")
+    f.stop()
+
+    print("== media bound when the keyboard is lost, then removed (host still on): one reset then")
+    f = Fake(off=0, state="not attached", media=True)
+    time.sleep(4)
+    check(f.resets() == 0, "no reset while the media gadget is bound (%d)" % f.resets())
+    open(f.g + "/mass-storage0/UDC", "w").write("")
+    time.sleep(4)
+    check(f.resets() == 1, "the media removed: exactly one reset (%d)" % f.resets())
+    time.sleep(3)
+    check(f.resets() == 1, "and only one (%d)" % f.resets())
+    f.stop()
+
+    print("== not attached, the agent installer's disk bound (reimu_agent): nothing")
+    f = Fake(off=0, state="not attached", agent=True)
+    time.sleep(5)
+    check(f.resets() == 0 and "virtual media is in use" in f.text(), "no reset under the agent disk (%d)" % f.resets())
     f.stop()
 
     print("== the host takes the hub at full speed: said so")

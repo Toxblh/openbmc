@@ -19,8 +19,11 @@
 #                                given), then boot it next (pending until
 #                                healthy); no reboot. Running on the other
 #                                slot's rofs (fallback): the damaged slot.
-#                                Never a slot whose kernel or rofs is the only
-#                                intact one; both: the damaged slot first
+#                                Never a kernel or rofs that may be the only
+#                                bootable one (the parts ordered so that one
+#                                of each is known to boot all the time);
+#                                both: the damaged slot first
+#   reimu-ab plan [a|b|both]     what install would write, in which order
 #   reimu-ab verify [a|b]        re-read the slots, check them against their
 #                                digests
 #   reimu-ab set-slot a|b        boot this slot next
@@ -68,6 +71,7 @@ env_set() { # NAME VALUE: set (if it differs) and read back
 booted() { sed -n "s/.*$1=\([a-z]*\).*/\1/p" $STATE 2>/dev/null; }
 other() { [ "$1" = a ] && echo b || echo a; }
 flash_mounted() { grep -qE '^/dev/mtdblock|jffs2' /proc/mounts; }
+kexec_started() { grep -qwE 'reimu\.(ram|test)' /proc/cmdline; }
 
 # the last 4 KiB of rofs-X: "reimu-rofs BYTES SHA256", "reimu-kernel BYTES
 # SHA256", "reimu-version VERSION"; both images padded with 0xff to 4 KiB
@@ -129,9 +133,61 @@ flash_write() {
     [ "$fw_st" = 0 ]
 }
 
-do_install() {
-    tar=${1:-}; slots=${2:-}
-    [ -f "$tar" ] || die "$tar: no such file"
+# What is known to boot. A rofs boots only if it matches its digest (the
+# initramfs checks it): no digest, no boot. A kernel boots if U-Boot finds
+# its FIT intact, which a digest proves, and so does U-Boot having booted it
+# (unless it was written since): a kernel without a matching digest may
+# still be the one that boots, so it is never taken for damaged.
+# Sets $good ("kernel-a rofs-b ...", the parts known to be intact).
+known_good() {
+    good=
+    for s in a b; do for p in kernel rofs; do part_ok $s $p && good="$good $p-$s"; done; done
+    kg=$(booted kernel)
+    if [ -n "$kg" ] && [ "$(booted state)" != ram ] && ! kexec_started &&
+        [ ! -e /run/reimu-ab-wrote-kernel-$kg ]; then
+        in_list "$good" kernel-$kg || good="$good kernel-$kg"
+    fi
+}
+in_list() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
+
+# PART-SLOT GOOD: 0 if writing it (erasing it first) leaves a kernel and a
+# rofs known to boot: the other slot's is known to be intact, or (a rofs)
+# this one isn't. While no rofs is intact nothing boots anyway (the first
+# install from the stock firmware): anything may be written.
+write_ok() {
+    wp=${1%-*} ws=${1##*-}; wo=$(other $ws)
+    in_list "$2" rofs-a || in_list "$2" rofs-b || return 0
+    in_list "$2" $wp-$wo && return 0
+    [ $wp = rofs ] && ! in_list "$2" rofs-$ws
+}
+
+# SLOT...: the order to write their parts in (with $good), each write
+# leaving something bootable; or 1 and why the first part that can't be
+# written can't
+plan_writes() {
+    pl_good=$good pl_todo= pl_out=
+    for s in "$@"; do pl_todo="$pl_todo kernel-$s rofs-$s"; done
+    while [ -n "$pl_todo" ]; do
+        pl_next=
+        for x in $pl_todo; do write_ok $x "$pl_good" && { pl_next=$x; break; }; done
+        if [ -z "$pl_next" ]; then
+            set -- $pl_todo; wp=${1%-*} ws=${1##*-}; wo=$(other $ws)
+            if [ $wp = kernel ]; then
+                echo "kernel-$ws may be the only bootable kernel: kernel-$wo isn't known to be intact (no matching digest, not the one U-Boot booted)"
+            else
+                echo "rofs-$ws is the only intact rofs: rofs-$wo doesn't match its digest"
+            fi
+            return 1
+        fi
+        pl_out="$pl_out $pl_next"; pl_good="$pl_good $pl_next"
+        pl_todo=$(for x in $pl_todo; do [ $x = $pl_next ] || echo $x; done)
+    done
+    echo $pl_out
+}
+
+# [a|b|both] -> $slots (in order), $plan (the parts in order), or die
+choose() {
+    slots=${1:-}
     case $slots in ""|a|b|both) ;; *) die "slot: a, b or both" ;; esac
     cur=$(booted kernel)
     if [ -z "$slots" ]; then
@@ -141,52 +197,62 @@ do_install() {
         # slot's rofs is the only intact one); else the slot not running
         [ "$(booted state)" = fallback ] && slots=$cur || slots=$(other $cur)
     fi
-    # What is intact now (each part against the digests in its slot). U-Boot
-    # boots any intact kernel (a bad FIT falls through to the other slot), the
-    # initramfs any intact rofs: the board stays bootable while a slot is
-    # written as long as the other slot has an intact kernel and rofs, or the
-    # written slot's part was no good anyway.
-    good=
-    for s in a b; do for p in kernel rofs; do part_ok $s $p && good="$good $p-$s"; done; done
-    has() { case "$good " in *" $1 "*) return 0 ;; esac; return 1; }
-    # both (the first install, a repair): the damaged slot first, then make it
-    # the slot that boots, then the other: whenever the power goes, one slot
-    # is complete and U-Boot finds it. Neither damaged (or neither intact,
-    # the first install from the stock firmware): B first
+    known_good
+    # both (the first install, a repair): the damaged slot first. Neither
+    # or both intact (the first install from the stock firmware): B first
     if [ "$slots" = both ]; then
-        has kernel-b && has rofs-b && ! { has kernel-a && has rofs-a; } && slots="a b" || slots="b a"
+        in_list "$good" kernel-b && in_list "$good" rofs-b &&
+            ! { in_list "$good" kernel-a && in_list "$good" rofs-a; } && slots="a b" || slots="b a"
     fi
+    if ! plan=$(plan_writes $slots); then
+        why=$plan
+        case $slots in a|b) plan_writes a b >/dev/null &&
+            why="$why; reimu-ab install IMAGE both can write both slots in a safe order" ;;
+        esac
+        die "not writing slot(s) $slots: $why"
+    fi
+}
+
+do_plan() {
+    choose "$@"
+    say "known intact:${good:- nothing}"
+    say "would write: $plan"
+}
+
+do_install() {
+    tar=${1:-}
+    [ -f "$tar" ] || die "$tar: no such file"
+    choose "${2:-}"
     w=$(mktemp -d /tmp/reimu-ab.XXXXXX) || die "no /tmp"
     trap 'rm -rf "$w"' EXIT
     tar -xf "$tar" -C "$w" image-kernel image-rofs SHA256SUMS || die "$tar: needs image-kernel, image-rofs, SHA256SUMS"
     (cd "$w" && sha256sum -c SHA256SUMS >/dev/null) || die "$tar: damaged (SHA256SUMS)"
     for s in $slots; do
-        o=$(other $s)
-        k=$(mtd kernel-$s) r=$(mtd rofs-$s)
-        [ $(stat -c %s $w/image-kernel) -le $(size_of $k) ] || die "kernel bigger than kernel-$s"
-        [ $(stat -c %s $w/image-rofs) -eq $(size_of $r) ] || die "image-rofs is not the size of rofs-$s"
-        for p in kernel rofs; do
-            if has $p-$s && ! has $p-$o; then
-                die "slot $s: $p-$s is the only intact $p ($p-$o is damaged): not writing slot $s (write slot $o first)"
-            fi
-        done
-        # the slot is not bootable while it's being written: U-Boot boots the other
-        [ "$(env_get reimu_slot)" = $s ] && { env_set reimu_slot $o; env_set reimu_tries 0; }
-        good=$(echo "$good" | sed "s/ kernel-$s//; s/ rofs-$s//")
-        log "slot $s: kernel"
-        flash_write $k 0 $w/image-kernel kernel || die "slot $s: kernel write failed"
-        log "slot $s: rofs"
-        flash_write $r 0 $w/image-rofs rofs || die "slot $s: rofs write failed"
-        verify_slot $s || die "slot $s: digests don't match after writing"
-        env_set reimu_slot $s
-        good="$good kernel-$s rofs-$s"
+        [ $(stat -c %s $w/image-kernel) -le $(size_of $(mtd kernel-$s)) ] || die "kernel bigger than kernel-$s"
+        [ $(stat -c %s $w/image-rofs) -eq $(size_of $(mtd rofs-$s)) ] || die "image-rofs is not the size of rofs-$s"
+    done
+    done_parts= last=
+    for x in $plan; do
+        p=${x%-*} s=${x##*-} o=$(other $s)
+        # U-Boot boots the other slot meanwhile (its kernel is known intact)
+        if [ "$(env_get reimu_slot)" = $s ] && in_list "$good" kernel-$o; then
+            env_set reimu_slot $o; env_set reimu_tries 0
+        fi
+        [ $p = kernel ] && : > /run/reimu-ab-wrote-kernel-$s
+        good=$(for y in $good; do [ $y = $x ] || printf ' %s' $y; done)
+        log "slot $s: $p"
+        flash_write $(mtd $x) 0 $w/image-$p $p || die "slot $s: $p write failed"
+        good="$good $x" done_parts="$done_parts $x"
+        if in_list "$done_parts" kernel-$s && in_list "$done_parts" rofs-$s; then
+            verify_slot $s || die "slot $s: digests don't match after writing"
+            env_set reimu_slot $s; last=$s
+        fi
     done
     rm -rf "$w"; trap - EXIT
-    set -- $slots; s=${2:-$1}
     env_set reimu_tries 0
     env_set reimu_pending 1
-    env_set reimu_slot $s
-    say "slot $s boots next (pending until healthy; reimu-ab set-slot $(other $s) to go back)"
+    env_set reimu_slot $last
+    say "slot $last boots next (pending until healthy; reimu-ab set-slot $(other $last) to go back)"
 }
 
 healthy() {
@@ -201,15 +267,22 @@ do_boot() {
     # FIT's, still says state=ok or fallback) or a test from another firmware
     # (state=ram): not a boot to confirm, and the environment stays as it is
     # (a pending install stays pending, restore-stock owns it)
-    if [ "$st" = ram ] || grep -qwE 'reimu\.(ram|test)' /proc/cmdline; then
+    if [ "$st" = ram ] || kexec_started; then
         log "started by kexec (reimu.ram/reimu.test): nothing to confirm, the U-Boot environment is left alone"
         return 0
     fi
     [ "$(env_get reimu_slot)" = "$k" ] || log "U-Boot booted slot $k, not slot $(env_get reimu_slot): slot $(env_get reimu_slot) didn't start"
     if [ "$st" = fallback ]; then
-        # kernel of one slot, rofs of the other: next time boot the slot the rofs is from
-        log "rofs-$k is damaged, running rofs-$r: slot $r boots next"
-        env_set reimu_slot $r; env_set reimu_tries 0
+        # kernel of one slot, rofs of the other: next time boot the slot the
+        # rofs is from, if its kernel is known to be intact (else this one)
+        if part_ok $r kernel; then
+            log "rofs-$k is damaged, running rofs-$r: slot $r boots next"
+            env_set reimu_slot $r
+        else
+            log "rofs-$k is damaged, running rofs-$r; kernel-$r isn't intact: slot $k stays"
+            env_set reimu_slot $k
+        fi
+        env_set reimu_tries 0
         return 0
     fi
     if [ "$(env_get reimu_pending)" = 1 ]; then
@@ -388,9 +461,12 @@ do_restore_stock() {
     say "stock firmware written and read back twice; reboot to start it"
 }
 
+# sourced by a test (REIMU_AB_LIB=1): the functions only
+[ -z "${REIMU_AB_LIB:-}" ] || return 0
 case ${1:-} in
     status) do_status ;;
     install) shift; do_install "$@" ;;
+    plan) shift; do_plan "$@" ;;
     verify) shift; do_verify "$@" ;;
     set-slot) shift; do_set_slot "$@" ;;
     boot) do_boot ;;

@@ -56,7 +56,7 @@ for s in $SUITES; do
     echo "##### $s"
     case $s in
         unit)  V "cd /tmp && gcc -O1 -w -DREIMU_KVM_C='\"/mnt/src/reimu-kvm.c\"' -o t-kvm /mnt/test_reimu_kvm_hid.c -lssl -lcrypto -lsystemd && ./t-kvm" ;;
-        kvm)   V "cd /mnt && python3 kvmscen.py /mnt/src kbdpin burst release rebind leds iface getreport watch watch-kexec" ;;
+        kvm)   V "cd /mnt && python3 kvmscen.py /mnt/src kbdpin burst release rebind leds iface getreport watch watch-kexec crash" ;;
         ikvm)  b=; grep -q setClients "$S/ikvm/ikvm_input.hpp" || b=base
                V "cd /mnt && python3 ikvmscen.py /mnt/src/ikvm /mnt/src $b" ;;
         msd)   V "cd /mnt && python3 msdscen.py /mnt/src/reimu_state_hook" ;;

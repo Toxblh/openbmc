@@ -30,6 +30,11 @@ static sd_bus *s_bus;
 static struct hl *H;
 static char s_spath[NSENS][96];
 static double s_pub[NSENS];
+/* a sensor's Value, thresholds and chassis association are on D-Bus only
+ * while it has a value (the host agent reports it): without one it isn't a
+ * reading (Redfish would list it with none, IPMI read NaN). Its
+ * Availability (false) and OperationalStatus objects stay. */
+static sd_bus_slot *s_vslot[NSENS][4];
 static int s_alarm[NSENS][2];
 static unsigned s_gen = ~0u, s_sgen = ~0u;
 static int64_t s_last_emit, s_last_fand;
@@ -208,6 +213,44 @@ static const sd_bus_vtable crit_vt[] = { SD_BUS_VTABLE_START(0), P("CriticalHigh
 static const sd_bus_vtable assoc_vt[] = { SD_BUS_VTABLE_START(0), P("Associations", "a(sss)"), SD_BUS_VTABLE_END };
 #undef P
 
+static int sens_add(int i)
+{
+    int r = sd_bus_add_object_vtable(s_bus, &s_vslot[i][0], s_spath[i], "xyz.openbmc_project.Sensor.Value", value_vt, NULL);
+    if (r >= 0 && hl_sensors[i].temp >= 0)
+        r = sd_bus_add_object_vtable(s_bus, &s_vslot[i][1], s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Warning", warn_vt,
+                                     NULL);
+    if (r >= 0 && hl_sensors[i].temp >= 0)
+        r = sd_bus_add_object_vtable(s_bus, &s_vslot[i][2], s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Critical",
+                                     crit_vt, NULL);
+    if (r >= 0)
+        r = sd_bus_add_object_vtable(s_bus, &s_vslot[i][3], s_spath[i], "xyz.openbmc_project.Association.Definitions",
+                                     assoc_vt, NULL);
+    if (r >= 0)
+        r = hl_sensors[i].temp >= 0
+                ? sd_bus_emit_interfaces_added(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value",
+                                               "xyz.openbmc_project.Sensor.Threshold.Warning",
+                                               "xyz.openbmc_project.Sensor.Threshold.Critical",
+                                               "xyz.openbmc_project.Association.Definitions", NULL)
+                : sd_bus_emit_interfaces_added(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value",
+                                               "xyz.openbmc_project.Association.Definitions", NULL);
+    if (r < 0) hl_log(3, "D-Bus: sensor %s: %s", s_spath[i], strerror(-r));
+    return r;
+}
+
+static void sens_del(int i)
+{
+    if (!s_vslot[i][0]) return;
+    if (hl_sensors[i].temp >= 0)
+        sd_bus_emit_interfaces_removed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value",
+                                       "xyz.openbmc_project.Sensor.Threshold.Warning",
+                                       "xyz.openbmc_project.Sensor.Threshold.Critical",
+                                       "xyz.openbmc_project.Association.Definitions", NULL);
+    else
+        sd_bus_emit_interfaces_removed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value",
+                                       "xyz.openbmc_project.Association.Definitions", NULL);
+    for (int k = 0; k < 4; k++) s_vslot[i][k] = sd_bus_slot_unref(s_vslot[i][k]);
+}
+
 /* ------------------------------------------------------------------ logging */
 static void on_event(struct hl *h, const struct hl_event *e)
 {
@@ -269,18 +312,10 @@ int dbus_init(struct hl *h)
     for (int i = 0; r >= 0 && i < NSENS; i++)
     {
         snprintf(s_spath[i], sizeof(s_spath[i]), "/xyz/openbmc_project/sensors/%s/%s", hl_sensors[i].type, hl_sensors[i].name);
-        r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.Sensor.Value", value_vt, NULL);
-        if (r >= 0)
-            r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.State.Decorator.Availability", avail_vt, NULL);
+        r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.State.Decorator.Availability", avail_vt, NULL);
         if (r >= 0)
             r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.State.Decorator.OperationalStatus", func_vt,
                                          NULL);
-        if (r >= 0 && hl_sensors[i].temp >= 0)
-            r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Warning", warn_vt, NULL);
-        if (r >= 0 && hl_sensors[i].temp >= 0)
-            r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Critical", crit_vt, NULL);
-        if (r >= 0)
-            r = sd_bus_add_object_vtable(s_bus, NULL, s_spath[i], "xyz.openbmc_project.Association.Definitions", assoc_vt, NULL);
     }
     /* the sensors are found by the mapper, read by GetManagedObjects */
     if (r >= 0) r = sd_bus_add_object_manager(s_bus, NULL, "/");
@@ -347,14 +382,17 @@ void dbus_publish(struct hl *h)
             int same = (isnan(v) && isnan(s_pub[i])) || v == s_pub[i];
             int avail = isnan(s_pub[i]) != isnan(v);
             s_pub[i] = v;
-            if (!same) sd_bus_emit_properties_changed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value", "Value", NULL);
+            if (avail && !isnan(v)) sens_add(i);
+            if (avail && isnan(v)) sens_del(i);
+            if (!same && !avail && !isnan(v))
+                sd_bus_emit_properties_changed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Value", "Value", NULL);
             if (avail)
                 sd_bus_emit_properties_changed(s_bus, s_spath[i], "xyz.openbmc_project.State.Decorator.Availability", "Available",
                                                NULL);
-            if (t >= 0 && wa != s_alarm[i][0])
+            if (t >= 0 && wa != s_alarm[i][0] && s_vslot[i][1])
                 sd_bus_emit_properties_changed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Warning", "WarningAlarmHigh",
                                                NULL);
-            if (t >= 0 && ca != s_alarm[i][1])
+            if (t >= 0 && ca != s_alarm[i][1] && s_vslot[i][2])
                 sd_bus_emit_properties_changed(s_bus, s_spath[i], "xyz.openbmc_project.Sensor.Threshold.Critical",
                                                "CriticalAlarmHigh", NULL);
             s_alarm[i][0] = wa;

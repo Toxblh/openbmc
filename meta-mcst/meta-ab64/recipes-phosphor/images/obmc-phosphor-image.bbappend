@@ -15,6 +15,9 @@ OBMC_IMAGE_EXTRA_INSTALL_append = " phosphor-nslcd-authority-cert-config"
 # the BMC's daemons restarted after any crash, without the start limit
 # (reimu-restart-policy: which ones and why)
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-restart-policy"
+# systemd-networkd keeps the DHCP address over the restarts phosphor-networkd
+# does (networkd 247 aborted in address_is_ready() otherwise)
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-networkd-keep-dhcp"
 # the board's FRU ID as the inventory board: Redfish Chassis (+ sensors), IPMI FRU
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-inventory"
 # legacy web UI (reimu-webui replaces it), debug and console tools, NFS

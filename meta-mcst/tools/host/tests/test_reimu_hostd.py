@@ -6,7 +6,7 @@
 Nothing of the machine it runs on is read or written: every path goes through
 the agent's Fs(root) and every command through a recording fake runner.
 """
-import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
+import time, importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT = os.path.join(HERE, "..", "reimu-hostd.py")
@@ -534,6 +534,24 @@ class TestGpuFan(Base):
         f.tick(70, False)
         self.assertEqual(self.hw("pwm1_enable"), "2")
 
+    def test_link_lost_restore_retried_after_a_failed_write(self):
+        """review: pwm1_enable=2 failing once on link loss was never retried"""
+        f = self.fan()
+        f.set_policy("manual", 40)
+        f.tick(0, True)
+        real, fails = f.fs.write, [1]
+
+        def flaky(path, value):
+            if path.endswith("pwm1_enable") and fails[0]:
+                fails[0] -= 1
+                raise OSError(5, "EIO")
+            return real(path, value)
+        f.fs.write = flaky
+        f.tick(61, False)
+        self.assertEqual(self.hw("pwm1_enable"), "1")  # the write failed
+        f.tick(63, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")  # retried
+
     def test_link_back_policy_again(self):
         f = self.fan()
         f.set_policy("manual", 40)
@@ -719,6 +737,18 @@ class TestControl(Base):
         c.policy({"t": "policy", "gpu_fan": {"mode": "manual", "duty": 35}, "turbo_left": 120}, 10)
         self.assertEqual(self.fan.state(10)["turbo_left"], 120)
 
+    def test_policy_respects_allow(self):
+        """review: welcome/policy messages bypassed ALLOW"""
+        c = self.ctl("ALLOW=os_power edac_load")
+        c.policy({"t": "policy", "gpu_fan": {"mode": "manual", "duty": 60}, "turbo_left": 300}, 0)
+        self.fan.tick(1, True)
+        self.assertEqual(self.t.get(GPU_DEV + "/hwmon/hwmon2/pwm1_enable"), "2")
+        self.assertEqual(self.fan.state(1)["mode"], "auto")
+        c2 = self.ctl("ALLOW=gpu_fan")  # the duty yes, the turbo no
+        c2.policy({"t": "policy", "gpu_fan": {"mode": "manual", "duty": 60}, "turbo_left": 300}, 0)
+        self.fan.tick(1, True)
+        self.assertEqual(self.t.get(GPU_DEV + "/hwmon/hwmon2/pwm1"), "153")
+
     def test_edac_autoload(self):
         self.t.rm("/sys/devices/system/edac")
         self.run.table["modprobe"] = (0, "")
@@ -731,6 +761,30 @@ class TestControl(Base):
 
 
 # ------------------------------------------------------------------ transport
+class TestCredentials(Base):
+    def test_pair_while_running_new_key_used(self):
+        """review: a re-pair while the service runs left it on the revoked key"""
+        d = tempfile.mkdtemp()
+        try:
+            sp, cp = os.path.join(d, "secret"), os.path.join(d, "conf")
+            hd.save_secret(sp, {"KEY": "aa" * 32, "FINGERPRINT": "bb" * 32, "AGENT_ID": "x"})
+            open(cp, "w").write("BMC_IPV4=192.168.10.79\n")
+            ag = hd.Agent(hd.load_config(cp), hd.load_secret(sp), self.fs, self.run, secret_path=sp, conf_path=cp)
+            ag.revoked = True
+            time.sleep(0.01)
+            hd.save_secret(sp, {"KEY": "cc" * 32, "FINGERPRINT": "dd" * 32, "AGENT_ID": "x"})
+            open(cp, "w").write("BMC_IPV4=10.0.0.9\n")
+            os.utime(sp, (time.time() + 2, time.time() + 2))
+            self.assertTrue(ag.credentials_changed())
+            ag.refresh_credentials()
+            self.assertEqual((ag.secret["KEY"], ag.secret["FINGERPRINT"]), ("cc" * 32, "dd" * 32))
+            self.assertEqual(ag.cfg["BMC_IPV4"], "10.0.0.9")
+            self.assertFalse(ag.revoked)
+            self.assertFalse(ag.credentials_changed())
+        finally:
+            shutil.rmtree(d)
+
+
 class TestTransport(Base):
     def test_link_local_from_mac(self):
         self.assertEqual(hd.ll_from_mac("98:a7:b0:06:0f:7e"), "fe80::9aa7:b0ff:fe06:f7e")

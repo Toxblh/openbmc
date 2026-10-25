@@ -42,6 +42,7 @@ struct client
     int fd;
     SSL *ssl;
     int hs_done, shut;
+    int hs_want_write; /* the handshake waits to write (else: to read) */
     struct hl_conn c;
 };
 
@@ -283,7 +284,13 @@ static void client_io(struct hl_net *nt, struct client *cl, int64_t now)
         if (r != 1)
         {
             int e = SSL_get_error(cl->ssl, r);
-            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return;
+            /* polled for what OpenSSL waits for: POLLOUT on a writable socket
+             * while it waits to read would spin the loop */
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+            {
+                cl->hs_want_write = e == SSL_ERROR_WANT_WRITE;
+                return;
+            }
             snprintf(cl->c.close_why, sizeof(cl->c.close_why), "TLS handshake failed");
             ERR_clear_error();
             return;
@@ -396,7 +403,8 @@ int net_pollfds(struct hl_net *nt, struct pollfd *p, int max)
         struct client *cl = &nt->cl[i];
         if (cl->fd < 0) continue;
         short ev = POLLIN;
-        if (!cl->hs_done || cl->c.out.len) ev |= POLLOUT;
+        if (!cl->hs_done) ev = cl->hs_want_write ? POLLOUT : POLLIN; /* app data waits for the handshake */
+        else if (cl->c.out.len) ev |= POLLOUT;
         p[n++] = (struct pollfd){ cl->fd, ev, 0 };
     }
     return n;

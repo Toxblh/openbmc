@@ -403,6 +403,46 @@ class Host:
         self.t.cleanup()
 
 
+def cpu_s(pid):
+    f = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
+    return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def t_idle_cpu(d):
+    """review: idle TCP connections (no TLS bytes) made the poll loop spin
+    (POLLOUT asked during the handshake while OpenSSL wants to read)"""
+    raw = [socket.create_connection(("127.0.0.1", d.port), timeout=5) for _ in range(3)]
+    time.sleep(0.3)
+    c0 = cpu_s(d.p.pid)
+    time.sleep(2)
+    used = cpu_s(d.p.pid) - c0
+    for s in raw:
+        s.close()
+    check(used < 0.3, "3 idle TCP connections: the daemon used %.2f s of CPU in 2 s" % used)
+
+
+def t_gpu_temp_fresh(d, key):
+    """review: an unchanged GPU temperature left run/gpu-temp's mtime still,
+    reimu-fand drops a file older than 30 s: every sample must refresh it"""
+    c = Client(d.port)
+    c.auth(key)
+    c.read_type("welcome")
+    m = {"v": 1, "t": "metrics", "data": {"gpu": {"temp_edge": 80, "temp_junction": 96}, "disks": []}}
+    gt = os.path.join(d.d, "run", "gpu-temp")
+    c.send(m)
+    ok = wait(lambda: os.path.exists(gt) and open(gt).read().strip() == "96000", 3)
+    t0 = os.stat(gt).st_mtime if ok else 0
+    times = []
+    for _ in range(3):
+        time.sleep(1.1)
+        c.send(m)  # the same values
+        time.sleep(0.4)
+        times.append(os.stat(gt).st_mtime if os.path.exists(gt) else 0)
+    check(ok and all(t > t0 for t in times) and times == sorted(times) and len(set(times)) == 3,
+          "the same 96 °C every sample: gpu-temp refreshed each time (mtimes %s)" % [round(t - t0, 1) for t in times])
+    c.close()
+
+
 def t_agent():
     d = Daemon().start()
     h = Host(d.port)
@@ -473,12 +513,17 @@ def t_agent():
         check(wait(lambda: "refused the key" in open(h.log).read(), 15), "unpaired: the agent is refused")
         check(not d.state()["agent"]["connected"], "and not connected")
         check(h.p.poll() is None, "the agent keeps running (re-pair possible)")
+        # review: pair again while the service runs: it picks the new key up
+        s2, _ = pair_string(d)
+        r = h.run("pair", "--pair", s2, "--config", h.conf, "--secret", h.secret)
+        check(r.returncode == 0, "paired again while the agent runs")
+        check(wait(lambda: d.state()["agent"]["connected"], 20), "the running agent reconnects with the new key")
     finally:
         h.cleanup()
         d.cleanup()
 
 
-TESTS = ["tls", "pair", "auth_fail", "replay", "limits", "ipv6", "no_ipv4", "data", "agent"]
+TESTS = ["tls", "pair", "auth_fail", "replay", "limits", "ipv6", "no_ipv4", "data", "idle_cpu", "gpu_temp_fresh", "agent"]
 
 if __name__ == "__main__":
     d = Daemon().start()
@@ -506,6 +551,10 @@ if __name__ == "__main__":
                     t_no_ipv4()
                 elif name == "data":
                     t_data_control(d, key)
+                elif name == "idle_cpu":
+                    t_idle_cpu(d)
+                elif name == "gpu_temp_fresh":
+                    t_gpu_temp_fresh(d, key)
                 elif name == "agent":
                     t_agent()
             except Exception as e:

@@ -192,7 +192,19 @@ static int hid_open(struct hiddev *d)
     struct epoll_event ev = { .events = EPOLLIN, .data.u32 = d->tag };
     epoll_ctl(ep, EPOLL_CTL_ADD, d->fd, &ev);
     d->polling = 0;
-    hid_get_report(d, d->last);
+    // what the host holds is unknown here (reimu-kvm started again after a
+    // crash, the device opened again after an error): a release goes first,
+    // whatever `last` says, so a key or button held before can't stay held.
+    // The pointer is released where it last was (0,0 at start-up)
+    uint8_t r[8] = { 0 };
+    if (d == &ptr) memcpy(r + 1, ptr_rep + 1, 4);
+    if (d->n == HID_QLEN) d->n--;
+    d->head = (d->head - 1 + HID_QLEN) % HID_QLEN;
+    memcpy(d->q[d->head], r, d->len);
+    d->mergeable[d->head] = 0;
+    d->n++;
+    memset(d->last, 0xff, sizeof d->last); // matches no report: nothing deduplicated against it
+    hid_get_report(d, r);
     if (d == &kbd) hid_read(d); // enabled by the host or not (see usb_off_since)
     return d->fd >= 0 ? 0 : -1;
 }
@@ -1244,6 +1256,7 @@ int main(int argc, char **argv)
     } else LOG("UDP %d: %s (no host announcements)", port, strerror(errno));
     hid_open(&kbd); // the keyboard's LED reports are read from the start
     hid_open(&ptr);
+    hid_flush(&kbd), hid_flush(&ptr); // the release hid_open queued
     LOG("reimu-kvm on :%d", port);
 
     double stat_t = now();
@@ -1274,7 +1287,7 @@ int main(int argc, char **argv)
         hid_check_stall(&ptr, t);
         // the LEDs come in on the keyboard fd: keep one open (closed by an unbind)
         static double hid_retry;
-        if (kbd.fd < 0 && t > hid_retry) { hid_retry = t + 1; hid_open(&kbd); }
+        if (kbd.fd < 0 && t > hid_retry) { hid_retry = t + 1; if (!hid_open(&kbd)) hid_flush(&kbd); }
         // the host's sound for JPEG viewers who want it
         for (int i = 0; i < MAX_CLIENTS; i++) {
             struct client *c = clients[i];

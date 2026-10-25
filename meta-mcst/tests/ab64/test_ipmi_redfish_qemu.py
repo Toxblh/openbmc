@@ -16,7 +16,9 @@ the new firmware whatever the stock one does (MUST: no crash, no leak, a
 firmware upload that can't brick the BMC).
 
 Groups (all by default): redfish, accounts, crawl, ipmi, sol, power, stress,
-update, host, restart (kill -9 of every daemon the BMC needs, 3 times in a
+update, host, networkd (systemd-networkd restarted 25 times: no abort),
+crashcheck (the crash check catches a SEGV/abort/stray kill, not a stop
+job), restart (kill -9 of every daemon the BMC needs, 3 times in a
 row: back, and the BMC answers), reset (the BMC reboots: last).
 
 IPMI over LAN goes through UDP 127.0.0.1:AB_IPMI (default 2423) -> 623 of
@@ -64,7 +66,8 @@ MUST = {"redfish.root", "redfish.auth.basic", "redfish.auth.bad_password", "redf
         "stress.concurrent", "stress.ipmi.alive", "stress.ipmi.mem", "update.junk.rejected",
         "update.static.not_staged", "update.flash_unchanged", "update.alive", "host.bt.dev",
         "host.ipmid.active", "host.dbus", "restart.redfish", "restart.ipmi", "restart.login",
-        "restart.ipmi_chassis", "restart.sol", "reset.back", "reset.redfish", "reset.ipmi", "crashes"}
+        "restart.ipmi_chassis", "restart.sol", "crashcheck.stop_job_ignored", "crashcheck.segv",
+        "crashcheck.abrt", "crashcheck.stray_kill", "networkd.no_abort", "networkd.address", "reset.back", "reset.redfish", "reset.ipmi", "crashes"}
 
 R = {}       # image -> key -> (ok, detail)   ok: True / False / None (information)
 CUR = None   # image being tested
@@ -783,6 +786,7 @@ def g_restart(b):
         if u + ".service" not in present:
             rec("restart." + u, None, "not running here")
             continue
+        TEST_KILLED.add(u + ".service")
         o = b.out("sh /tmp/kill3.sh '%s.service'" % u, timeout=200).split()
         rec("restart." + u, o[:1] == ["active"], "after 3 x kill -9: %s, NRestarts %s" % (
             o[0] if o else "?", o[1] if len(o) > 1 else "?"))
@@ -824,12 +828,15 @@ def g_reset(b):
 
 GROUP_FUNCS = [("redfish", g_redfish), ("accounts", g_accounts), ("crawl", g_crawl), ("ipmi", g_ipmi),
                ("sol", g_sol), ("power", g_power), ("stress", g_stress), ("update", g_update),
-               ("host", g_host), ("restart", g_restart), ("reset", g_reset)]
+               ("host", g_host), ("crashcheck", lambda b: g_crashcheck(b)), ("networkd", lambda b: g_networkd(b)), ("restart", g_restart), ("reset", g_reset)]
 
 
 def run_image(name):
     global CUR
     CUR = name
+    # per BMC: what the test killed or injected on the other image is not this one's
+    TEST_KILLED.clear()
+    INJECTED.clear()
     R.setdefault(name, {})
     print("== " + name, flush=True)
     if ATTACH:
@@ -848,7 +855,7 @@ def run_image(name):
                 continue
             # the journal is in RAM: look before the reboot, and before the
             # restart group kills daemons on purpose
-            if g in ("restart", "reset") and "crashes" not in R[CUR]:
+            if g in ("networkd", "crashcheck", "restart", "reset") and "crashes" not in R[CUR]:
                 health(b, "crashes")
             print(" -- " + g, flush=True)
             t = time.time()
@@ -863,13 +870,121 @@ def run_image(name):
         b.stop()
 
 
+TEST_KILLED = set()   # units this test kill -9s on purpose (the restart group): their KILLs
+INJECTED = set()      # crashcheck's own transient units: ignored altogether
+CRASH_SIGNALS = {"SEGV", "ABRT", "BUS", "FPE", "ILL", "SYS", "TRAP", "XCPU", "XFSZ"}
+
+
+def crashes(b):
+    """[(unit, why)] of real crashes since the boot: a core dump, a fatal
+    signal, an OOM kill, or a TERM/KILL nobody asked for. A TERM/KILL after
+    systemd's own "Stopping" of the unit (a stop job: Conflicts=, systemctl
+    stop, shutdown) or of a unit the test killed itself is not a crash."""
+    out = []
+    j = b.out("journalctl --no-pager -b -o cat _PID=1 | grep -E '^[^ ]+: (Main process exited, code=(killed|dumped)|Failed with result .oom-kill.)'")
+    for line in j.splitlines():
+        unit, _, rest = line.partition(": ")
+        m = re.search(r"code=(killed|dumped), status=\d+/(\w+)", rest)
+        if unit in INJECTED or (unit in TEST_KILLED and m and m.group(1) == "killed" and m.group(2) == "KILL"):
+            continue
+        if "oom-kill" in rest:
+            out.append((unit, "OOM kill"))
+        elif m and (m.group(1) == "dumped" or m.group(2) in CRASH_SIGNALS):
+            out.append((unit, "%s %s" % (m.group(1), m.group(2))))
+        elif m:
+            # this kill: legitimate if systemd was stopping the unit just then:
+            # "Stopping X..." before it, or (a start job cancelled by a stop,
+            # e.g. Conflicts=) "Stopped X." after it before the next start;
+            # a crash ends in "Failed with result" and nothing of the kind
+            ev = b.out("journalctl --no-pager -b -o cat _PID=1 UNIT=%s" % unit).splitlines()
+            legit = True
+            for i, l in enumerate(ev):
+                if "Main process exited, code=killed" not in l:
+                    continue
+                before = False
+                for p in reversed(ev[:i]):
+                    if p.startswith(("Starting ", "Started ")):
+                        break
+                    if p.startswith("Stopping "):
+                        before = True
+                        break
+                after = False
+                for q in ev[i + 1:]:
+                    if q.startswith(("Starting ", "Started ")):
+                        break
+                    if q.startswith("Stopped "):
+                        after = True
+                        break
+                if not (before or after):
+                    legit = False
+            if not legit:
+                out.append((unit, "killed (%s) without a stop job" % m.group(2)))
+    # the units' own record too (the journal may have suppressed PID 1's
+    # messages after a burst): a failed unit whose result is a core dump,
+    # an OOM kill, a watchdog timeout or a fatal signal
+    f = b.out("for u in $(systemctl --failed --no-legend --plain | cut -d' ' -f1); do "
+              "echo $u $(systemctl show -p Result --value $u) $(systemctl show -p ExecMainStatus --value $u); done")
+    sig = {"4": "ILL", "5": "TRAP", "6": "ABRT", "7": "BUS", "8": "FPE", "11": "SEGV", "31": "SYS"}
+    for l in f.splitlines():
+        p = l.split()
+        if len(p) < 2 or p[0] in INJECTED or p[0] in [u for u, _ in out]:
+            continue
+        if p[1] in ("core-dump", "oom-kill", "watchdog") or (p[1] == "signal" and len(p) > 2 and p[2] in sig):
+            out.append((p[0], "failed: %s%s" % (p[1], " " + sig.get(p[2], p[2]) if len(p) > 2 and p[1] == "signal" else "")))
+    k = b.out("dmesg | grep -iE 'out of memory|oom-kill|segfault|page allocation failure' | head -3").strip()
+    if k:
+        out.append(("kernel", k.replace("\n", " | ")))
+    return sorted(set(out))
+
+
 def health(b, key):
     f = b.out("systemctl --failed --no-legend --plain | cut -d' ' -f1").split()
-    rec("units.failed" + key[7:], None, " ".join(f))
-    k = b.out("dmesg | grep -ciE 'out of memory|oom-kill|segfault|page allocation failure'").strip()
-    c = b.out("journalctl --no-pager -b | grep -E 'dumped core|Main process exited, code=(killed|dumped)' | cut -c17-")
-    rec(key, k == "0" and not c.strip(), "dmesg OOM/segfault %s; %s" % (
-        k, c.strip().replace("\n", " | ") or "no unit killed/dumped"))
+    rec("units.failed" + (key[len("crashes"):] if key.startswith("crashes") else "." + key), None, " ".join(f))
+    c = crashes(b)
+    rec(key, not c, "; ".join("%s: %s" % x for x in c) or "no crash (stop jobs and the test's own kills aside)")
+
+
+def g_networkd(b):
+    """phosphor-networkd restarts systemd-networkd on every network rewrite:
+    15 networkd restarts and 10 phosphor-networkd restarts in a row, no
+    networkd abort (247: Assertion 'a' failed in address_is_ready()), the
+    DHCP address kept, the BMC reachable"""
+    count = "journalctl --no-pager -b -o cat _PID=1 UNIT=systemd-networkd.service | grep -c 'code=dumped'"
+    n0 = int(b.out(count).strip() or 0)
+    b.ssh("for i in $(seq 15); do systemctl restart systemd-networkd; sleep 4; done; "
+          "for i in $(seq 10); do systemctl restart xyz.openbmc_project.Network; sleep 8; done", timeout=600)
+    time.sleep(10)
+    n1 = int(b.out(count).strip() or 0)
+    a = b.out("journalctl --no-pager -b -o cat | grep -m1 'Assertion' ; true").strip()
+    rec("networkd.no_abort", n1 == n0, "networkd core dumps during 25 restarts: %d %s" % (n1 - n0, a[:90]))
+    ip = b.out("ip -4 -o addr show eth0 | grep -o 'inet [0-9.]*'").strip()
+    rec("networkd.address", "10.0.2." in ip and b.ssh("true").returncode == 0 and wait_redfish(60), "eth0 %s, ssh and Redfish answer" % ip)
+
+
+def g_crashcheck(b):
+    """the crash check itself: a stop job's TERM is not a crash, a SEGV, an
+    abort and a stray KILL are (red on a real crash)"""
+    def unit(name):
+        b.ssh("systemctl reset-failed %s 2>/dev/null; systemd-run --unit=%s sleep 600" % (name, name))
+        time.sleep(2)
+        return b.out("systemctl show -p MainPID --value %s" % name).strip()
+    unit("ir-stop")
+    b.ssh("systemctl stop ir-stop")
+    pid = unit("ir-segv")
+    b.ssh("kill -SEGV %s" % pid)
+    pid = unit("ir-abrt")
+    b.ssh("kill -ABRT %s" % pid)
+    pid = unit("ir-stray")
+    b.ssh("kill -9 %s" % pid)
+    time.sleep(10)
+    c = dict(crashes(b))
+    rec("crashcheck.stop_job_ignored", "ir-stop.service" not in c, "systemctl stop (TERM): %s" % c.get("ir-stop.service", "not a crash"))
+    rec("crashcheck.segv", "ir-segv.service" in c, "SIGSEGV: %s" % c.get("ir-segv.service", "MISSED"))
+    rec("crashcheck.abrt", "ir-abrt.service" in c, "SIGABRT: %s" % c.get("ir-abrt.service", "MISSED"))
+    rec("crashcheck.stray_kill", "ir-stray.service" in c, "kill -9 by nobody's stop job: %s" % c.get("ir-stray.service", "MISSED"))
+    INJECTED.update(("ir-stop.service", "ir-segv.service", "ir-abrt.service", "ir-stray.service"))
+    b.ssh("systemctl reset-failed ir-stop ir-segv ir-abrt ir-stray 2>/dev/null; true")
+    rec("crashcheck.rest", None, "other crashes now: %s" % ({k: v for k, v in c.items() if not k.startswith("ir-")} or "none"))
 
 
 # ------------------------------------------------------------------ platform
@@ -909,6 +1024,31 @@ def platform_run():
         def dbus_sensors():
             return len(b.sensors())
 
+        def dbus_all():
+            """every Sensor.Value object on D-Bus: {type/name: Value}"""
+            o = b.out("for p in $(busctl call xyz.openbmc_project.ObjectMapper /xyz/openbmc_project/object_mapper "
+                      "xyz.openbmc_project.ObjectMapper GetSubTreePaths sias /xyz/openbmc_project/sensors 0 1 "
+                      "xyz.openbmc_project.Sensor.Value 2>/dev/null | grep -o '/xyz/openbmc_project/sensors/[^\"]*'); do "
+                      "s=$(busctl call xyz.openbmc_project.ObjectMapper /xyz/openbmc_project/object_mapper "
+                      "xyz.openbmc_project.ObjectMapper GetObject sas $p 1 xyz.openbmc_project.Sensor.Value | cut -d'\"' -f2); "
+                      "echo ${p#/xyz/openbmc_project/sensors/} $(busctl get-property $s $p xyz.openbmc_project.Sensor.Value Value | cut -d' ' -f2); done")
+            return {l.split()[0]: l.split()[1] if len(l.split()) > 1 else "?" for l in o.splitlines() if l.strip()}
+
+        def thermal_names():
+            s, j = get("/redfish/v1/Chassis/motherboard/Thermal")
+            return {t.get("Name", "").replace(" ", "_") for t in j.get("Temperatures", [])} if s == 200 else None
+
+        def pin_sets(tag):
+            """Redfish Thermal = exactly the D-Bus temperatures, and every
+            sensor object on D-Bus has a value (none published without one)"""
+            d = dbus_all()
+            nan = sorted(k for k, v in d.items() if v.lower() in ("nan", "-nan", "?"))
+            want = {k.split("/", 1)[1] for k in d if k.startswith("temperature/") and k not in nan}
+            got = thermal_names()
+            rec("platform.%s.thermal_names" % tag, got == want,
+                "Redfish Thermal %s, D-Bus temperatures %s" % (sorted(got or []), sorted(want)))
+            rec("platform.%s.no_valueless_sensors" % tag, not nan, "D-Bus sensors without a value: %s" % (nan or "none"))
+
         def settled():
             """sensors up and hwmon-instantiator done with them"""
             return dbus_sensors() >= 4 and b.out("systemctl show -p ActiveState --value hwmon-instantiator").strip() != "activating"
@@ -935,6 +1075,7 @@ def platform_run():
         # Power; Sensors only power, current, utilization)
         rec("platform.on.redfish_sensors", rs["Sensors"][0] == 200 and rs["Thermal"] == (200, n),
             "D-Bus %d temperatures, Redfish %s" % (n, rs))
+        pin_sets("on")
         rc, o = fru()
         rec("platform.on.fru_print", rc == 0 and "Пантес" in o and "0079-07.22" in o,
             " | ".join(l.strip() for l in o.splitlines() if "Board" in l)[:150])
@@ -951,6 +1092,7 @@ def platform_run():
         rec("platform.off.redfish_sensors", rs["Sensors"] == (200, 0) and rs["Thermal"] == (200, 0), "%s" % rs)
         s, j = get("/redfish/v1/Chassis/motherboard/Power")
         rec("platform.off.redfish_power", s == 200, "Power %s" % s)
+        pin_sets("off")
         rc, o = sdr()
         rec("platform.off.sdr", rc == 0, "rc %d, temperatures without reading: %d" % (
             rc, sum(1 for l in o.splitlines() if "/xyz" not in l and ("ns" in l.split("|")[-1] or "no reading" in l))))

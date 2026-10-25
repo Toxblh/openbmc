@@ -381,7 +381,33 @@ def s_watch_kexec():
     K.kvm_stop()
 
 
-SCEN = {"watch": s_watch, "watch-kexec": s_watch_kexec, "kbdpin": s_kbdpin, "burst": s_burst, "release": s_release, "rebind": s_rebind, "leds": s_leds, "iface": s_iface,
+# ------------------------------------------------------------------ crash while a key is held
+KEY_LEFTSHIFT, HID_LSHIFT = 42, 0xe1
+
+
+def s_crash():
+    print("== crash: Shift held, reimu-kvm killed -9 and started again: the next viewer releases it")
+    devs = fresh_gadget()
+    K.kvm_start(os.path.join(SRC, "reimu-kvm"))
+    kb = K.Events(devs["kbd"])
+    w = K.Ws()
+    w.send(K.key(HID_LSHIFT, 1))
+    kb.read(quiet=0.4)
+    check(held(kb, KEY_LEFTSHIFT), "Shift held on the host")
+    K.kvm_stop("KILL")
+    w.close(clean=False)
+    kb.read(quiet=0.6)
+    check(held(kb, KEY_LEFTSHIFT), "killed -9: Shift still held (nothing could release it)")
+    K.kvm_start(os.path.join(SRC, "reimu-kvm"))
+    w = K.Ws()
+    kb.read(quiet=0.8)
+    check(not held(kb, KEY_LEFTSHIFT), "started again, a viewer connected: Shift released on the host")
+    w.close()
+    kb.close()
+    K.kvm_stop()
+
+
+SCEN = {"crash": s_crash, "watch": s_watch, "watch-kexec": s_watch_kexec, "kbdpin": s_kbdpin, "burst": s_burst, "release": s_release, "rebind": s_rebind, "leds": s_leds, "iface": s_iface,
         "getreport": s_getreport}
 
 if __name__ == "__main__":

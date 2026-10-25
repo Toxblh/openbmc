@@ -5,7 +5,8 @@ U-Boot dumped from the real BMC, as on the board.
     test_ab_qemu.py WORKDIR [TEST...]
 
 WORKDIR holds ab.mtd (the build's .ab.mtd with the real U-Boot spliced in,
-see fetch.sh), reimu-ab.tar (the update) and, for the stock tests, the dump of
+see fetch.sh), reimu-ab.tar (the update), kernel-other.fit (optional, for
+solcut: the kernel-a partition of another build) and, for the stock tests, the dump of
 the real BMC flash (STOCK=dir with u-boot.bin u-boot-env.bin kernel.bin
 rofs.bin rwfs.bin SHA256SUMS; default ~/git/new-reimu/backup) and
 stock-kexec/ (zImage, initrd, fdt of the stock kernel, for the way back by
@@ -34,6 +35,10 @@ starts from a fresh copy of ab.mtd. Tests (all by default):
               writes rofs-a: the environment pointed at slot B during the
               write, slot B boots, untouched; then "install b" refused (the
               only intact slot), "install both" writes the damaged A first
+  solcut      kernel-a intact but without digests (rofs-a's trailer gone),
+              kernel-b damaged: "install" (no slot) refused, "install both"
+              writes kernel-b, rofs-a before rofs-b; the flash before and
+              halfway through each write booted: always an A/B slot
   flashfail   reimu-flash fails (REIMU_FLASH): "kernel write failed", no rofs
               write, the environment as it was; the same for the rofs
   restorecut  "reimu-ab ram" with an install pending: the environment stays
@@ -659,7 +664,8 @@ def t_fallcut():
         check(b.ssh("reimu-ab verify a").returncode != 0, "slot A: half written")
         check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
         r = b.ssh("reimu-ab install /tmp/reimu-ab.tar b", timeout=900)
-        check(r.returncode != 0 and "only intact" in r.stderr, "install b refused: %s" % r.stderr.strip()[-120:])
+        check(r.returncode != 0 and "kernel-b may be the only bootable kernel" in r.stderr,
+              "install b refused: %s" % r.stderr.strip()[:140])
         r = b.ssh("reimu-ab install /tmp/reimu-ab.tar both", timeout=1800)
         o = r.stdout + r.stderr
         print("    " + o.strip().replace("\n", "\n    "))
@@ -705,20 +711,22 @@ def t_flashfail():
         b.stop()
 
 
-# the test's reimu-flash for restore-stock: before each write (and halfway
-# through the one at $CUT_HALF) it waits for the test to copy the flash image
-# (= the power going at that moment)
+# the test's reimu-flash: before each write (and halfway through the ones
+# $CUT_HALF names) it waits for the test to copy the flash image (= the power
+# going at that moment). A write is named by its offset, or by its device
+# (mtd3) at offset 0
 FLASH_CUT = """#!/bin/sh
 mkdir -p /tmp/cut
 n=$(( $(cat /tmp/cut/n 2>/dev/null || echo 0) + 1 )); echo $n > /tmp/cut/n
 if [ "$1" = write ]; then
-    echo "$n $3" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n ]; do sleep 1; done
-    case " ${CUT_HALF:-} " in *" $3 "*)
+    at=$3; [ "$3" = 0 ] && at=${2##*/}
+    echo "$n $at" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n ]; do sleep 1; done
+    case " ${CUT_HALF:-} " in *" $at "*)
         sz=$(stat -c %s $4)
         dd if=$4 of=/tmp/cut/half bs=65536 count=$((sz / 65536 / 2)) 2>/dev/null
         reimu-flash write $2 $3 /tmp/cut/half 5 >/dev/null || exit 1
         rm -f /tmp/cut/half
-        echo "$n.5 $3" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n.5 ]; do sleep 1; done ;;
+        echo "$n.5 $at" > /tmp/cut/at; while [ ! -e /tmp/cut/go$n.5 ]; do sleep 1; done ;;
     esac
 fi
 exec reimu-flash "$@"
@@ -745,9 +753,14 @@ def to_ram(b, pending=False):
 
 
 def restore_cut(b, img, name, half=None, stop_at=None):
-    """restore-stock with FLASH_CUT: a copy of the flash at each stop
-    {offset or offset.5: image}; stop_at: kill QEMU there"""
-    p, lines = ssh_bg("CUT_HALF='%s' REIMU_FLASH=/tmp/flash-cut reimu-ab restore-stock /tmp/stock" % (half or ""))
+    return run_cut(b, img, name, "reimu-ab restore-stock /tmp/stock", half, stop_at)
+
+
+def run_cut(b, img, name, cmd, half=None, stop_at=None):
+    """CMD with FLASH_CUT as reimu-flash: a copy of the flash at each stop
+    [(label, image)]; stop_at: return there (the caller kills QEMU)"""
+    b.ssh("rm -rf /tmp/cut")
+    p, lines = ssh_bg("CUT_HALF='%s' REIMU_FLASH=/tmp/flash-cut %s 2>&1" % (half or "", cmd))
     snaps, seen = [], set()
     end = time.time() + 3600
     while time.time() < end and p.poll() is None:
@@ -909,9 +922,69 @@ def t_restorecut_a():
     check(o.startswith("A/B kernel=a rofs=a"), "slot A boots")
 
 
+def sol_image(name):
+    """kernel-a intact but rofs-a's digests gone (so is its kernel's), kernel-b
+    damaged, rofs-b intact: U-Boot boots kernel-a, the initramfs falls back to
+    rofs-b; kernel-a is the only bootable kernel, though no digest says so.
+    kernel-a from WORKDIR/kernel-other.fit if there (another build's FIT: an
+    install then changes every block of it, as a real update does)"""
+    img = fresh(name)
+    other_fit = os.path.join(W, "kernel-other.fit")
+    with open(img, "r+b") as f:
+        if os.path.exists(other_fit):
+            f.seek(LAYOUT["kernel-a"][0])
+            f.write(open(other_fit, "rb").read()[:LAYOUT["kernel-a"][1]])
+        f.seek(LAYOUT["rofs-a"][0] + LAYOUT["rofs-a"][1] - 4096)
+        f.write(b"\xff" * 4096)
+    damage(img, "kernel-b", at=0x100000)
+    return img
+
+
+def t_solcut():
+    img = sol_image("solcut")
+    b = Bmc("solcut", img).start()
+    snaps = []
+    try:
+        check(b.wait_ssh(), "up")
+        check(ab_state(b) == "kernel=a rofs=b state=fallback", "kernel A on rofs-b (%s)" % ab_state(b))
+        wait_env(b, {"reimu_tries": "0"})
+        time.sleep(5)
+        e = benv(b, "reimu_slot")
+        check(e.get("reimu_slot") == "a", "slot A stays the one to boot: kernel-b isn't intact (%s)" % e)
+        check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied")
+        open(os.path.join(W, "flash-cut"), "w").write(FLASH_CUT)
+        b.scp(os.path.join(W, "flash-cut"), "/tmp/flash-cut")
+        b.ssh("chmod +x /tmp/flash-cut")
+        before = b.out("fw_printenv")
+        halves = "mtd3 mtd4 mtd5 mtd6"
+        # the web update's command (no slot): slot A would be the fallback's target
+        s1, lines, p = run_cut(b, img, "solcut-default", "reimu-ab install /tmp/reimu-ab.tar", halves)
+        print("    " + "\n    ".join(l for l in lines if not re.match(r"(write|verify) ", l)))
+        check(p.returncode != 0 and not s1 and any("install IMAGE both" in l for l in lines),
+              "install (no slot): refused, nothing written, \"both\" suggested (%d writes)" % len(s1))
+        check(not any("is damaged" in l for l in lines), "the refusal doesn't call an unverifiable part damaged")
+        check(b.out("fw_printenv") == before, "the environment as it was")
+        snaps += s1
+        # both: the parts in an order that always leaves a bootable kernel and rofs
+        s2, lines, p = run_cut(b, img, "solcut-both", "reimu-ab install /tmp/reimu-ab.tar both", halves)
+        order = [m.group(1) for m in (re.match(r"reimu-ab: slot ([ab]: (kernel|rofs))$", l) for l in lines) if m]
+        print("    both: " + ", ".join(order))
+        check(p.returncode == 0, "install both: done (%s)" % (lines[-1:] or "?"))
+        check(order[:1] == ["b: kernel"] and order.index("a: rofs") < order.index("b: rofs"),
+              "kernel-b (damaged) first, rofs-a (damaged) before rofs-b (the only intact one)")
+        check(b.ssh("reimu-ab verify").returncode == 0, "both slots intact")
+        snaps += s2
+    finally:
+        b.stop()
+    for label, snap in snaps:
+        o = boot_outcome("sc-" + label, snap, timeout=420)
+        print("    power cut %s: %s" % (label, o), flush=True)
+        check(o.startswith("A/B"), "power cut %s: an A/B slot boots" % label)
+
+
 TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update),
          ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("fallback", t_fallback),
-         ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("restorecut", t_restorecut),
+         ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("solcut", t_solcut), ("restorecut", t_restorecut),
          ("restorecut-a", t_restorecut_a), ("stock", t_stock)]
 
 if __name__ == "__main__":

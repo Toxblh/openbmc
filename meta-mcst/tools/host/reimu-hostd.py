@@ -657,11 +657,12 @@ class GpuFan:
 
     def tick(self, now, link_ok):
         events = []
-        if not link_ok and not self.link_lost:
+        if not link_ok:
             self.link_lost = True
+            # until the driver has it back: a failed write is tried again
             if self.touched and self._to_auto():
                 events.append({"kind": "gpu_fan_auto_link_lost", "text": "no word from the BMC: the GPU fan back to the driver"})
-        elif link_ok:
+        else:
             self.link_lost = False
         h = self.hwmon()
         self.present = h is not None
@@ -768,14 +769,15 @@ class Controller:
         return edac_modprobe(self.run)
 
     def policy(self, msg, now):
-        """the BMC's standing policy (sent at every connection and change)"""
+        """the BMC's standing policy (sent at every connection and change);
+        each part only when ALLOW has it, like the control requests"""
         g = msg.get("gpu_fan")
-        if isinstance(g, dict):
+        if isinstance(g, dict) and "gpu_fan" in self.cfg["ALLOW"]:
             ok, text = self.fan.set_policy(g.get("mode"), g.get("duty"))
             if not ok:
                 log("policy: %s" % text)
         tl = msg.get("turbo_left")
-        if isinstance(tl, (int, float)) and not isinstance(tl, bool):
+        if isinstance(tl, (int, float)) and not isinstance(tl, bool) and "gpu_turbo" in self.cfg["ALLOW"]:
             if tl > 0:
                 self.fan.turbo_until = now + min(tl, 43200)  # reimu-fand's Турбо: up to 12 h
             else:
@@ -1034,9 +1036,21 @@ class Link:
             pass
 
 
+CRED_KEYS = ("BMC", "BMC_MAC", "BMC_IPV4", "BMC_PORT", "IFACES")
+
+
+def _mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except (OSError, TypeError):
+        return None
+
+
 class Agent:
-    def __init__(self, cfg, secret, fs, run):
+    def __init__(self, cfg, secret, fs, run, secret_path=None, conf_path=None):
         self.cfg, self.secret, self.fs, self.run = cfg, secret, fs, run
+        self.secret_path, self.conf_path = secret_path, conf_path
+        self.cred_mtimes = (_mtime(secret_path), _mtime(conf_path))
         self.col = Collector(fs, run, cfg)
         self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"])
         self.ctl = Controller(cfg, self.fan, run)
@@ -1082,6 +1096,24 @@ class Agent:
                 if m and m["t"] in types:
                     return m
         raise ValueError("no %s from the BMC" % "/".join(types))
+
+    def credentials_changed(self):
+        """a pairing (pair --pair, install.sh) wrote a new key or address"""
+        return self.secret_path is not None and (_mtime(self.secret_path), _mtime(self.conf_path)) != self.cred_mtimes
+
+    def refresh_credentials(self):
+        self.cred_mtimes = (_mtime(self.secret_path), _mtime(self.conf_path))
+        s = load_secret(self.secret_path)
+        if s.get("KEY") and s.get("FINGERPRINT"):
+            self.secret = s
+        if self.conf_path:
+            c = load_config(self.conf_path)
+            for k in CRED_KEYS:
+                self.cfg[k] = c[k]
+        self.revoked = False
+        self.last_cand = None
+        self.backoff.reset()
+        log("paired again: the new key and BMC address in use")
 
     def connect(self):
         fp = self.secret["FINGERPRINT"]
@@ -1171,6 +1203,8 @@ class Agent:
         edac_autoload(self.fs, self.run, self.cfg)
         while not self.stop:
             link = None
+            if self.credentials_changed():
+                self.refresh_credentials()
             try:
                 sock, cand = self.connect()
                 if sock:
@@ -1190,7 +1224,7 @@ class Agent:
             if self.revoked:
                 log("the BMC refused the key (unpaired?): pair again; next try in %d s" % delay)
             end = time.monotonic() + delay
-            while not self.stop and time.monotonic() < end:
+            while not self.stop and time.monotonic() < end and not self.credentials_changed():
                 self.fan.tick(time.monotonic(), time.monotonic() - self.last_rx <= self.cfg["LINK_LOST_SEC"])
                 time.sleep(min(GPU_TICK_SEC, max(0.05, end - time.monotonic())))
         self.fan.restore_auto("agent stopped")
@@ -1329,7 +1363,7 @@ def main(argv):
         s = load_secret(secret)
         if not s.get("KEY") or not s.get("FINGERPRINT"):
             raise SystemExit("not paired: reimu-hostd.py pair --pair 'reimu1:...' (the BMC's web page Хост)")
-        ag = Agent(cfg, s, fs, run)
+        ag = Agent(cfg, s, fs, run, secret_path=secret, conf_path=conf)
 
         def stop(sig, frm):
             ag.stop = True

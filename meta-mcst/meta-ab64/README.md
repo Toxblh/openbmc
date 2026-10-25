@@ -49,15 +49,23 @@ Which slot `install` writes (`/run/initramfs/reimu-ab`: `kernel=a|b
 rofs=a|b|ram state=ok|fallback|ram`): no slot given, the one not running
 (`state=ok`, `ram`), or, on a fallback (rofs-K damaged, kernel K running on
 the other slot's rofs), slot K itself: the other slot's rofs is the only
-intact one. It never writes a slot whose kernel or rofs is the only intact
-one (each part checked against the digests in its slot: U-Boot boots any
-intact kernel, the initramfs any intact rofs, so the board stays bootable
-while the other slot's parts are intact); `both` writes the damaged slot
-first (B when neither or both are intact). While a slot is written
-`reimu_slot` points at the other one; it is switched to the written slot only
+intact one. What is known to boot: a rofs that matches its digest (the
+initramfs boots no other); a kernel that matches its digest, or the one
+U-Boot booted (it checked the FIT's hash; not after a kexec, not once
+written). A kernel without a matching digest may still be the only one that
+boots: it is never taken for damaged. Each part is written only while the
+other slot's part of that kind is known to boot (a rofs also when it doesn't
+boot itself; anything while no rofs boots at all: the first install from the
+stock firmware), the parts in an order that keeps it so (`reimu-ab plan
+[a|b|both]` shows it); if there is none, nothing is written and the reason
+is given (`both` may still have an order: it is suggested). `both` writes the
+damaged slot first (B when neither or both are intact). A kernel being
+written is never the one `reimu_slot` points at; a slot is switched to only
 once its digests match. `reimu-ab boot` (reimu-ab.service) leaves the
 environment alone when the system was started by kexec (`reimu.ram`,
-`reimu.test`): `reimu-ab ram` doesn't confirm or cancel a pending install.
+`reimu.test`): `reimu-ab ram` doesn't confirm or cancel a pending install;
+on a fallback it points U-Boot at the rofs's slot only if that slot's kernel
+matches its digest.
 
 ### restore-stock: the order of the writes
 
@@ -141,6 +149,10 @@ whole flash, for QEMU) and `reimu-ab-kexec.tar` (to start it from RAM).
 ## Tests (meta-mcst/tests/ab64)
 
 * `test_reimu_flash.py`: reimu-flash with lost writes (LD_PRELOAD flaky-pwrite).
+* `test_ab_plan.py`: what `reimu-ab install` writes and in which order, over
+  every state of the slots (digests, booted kernel, state, slot asked for),
+  against a model of what boots: every plan safe, a refusal only when no
+  order is.
 * `test_pns_qemu.py`: the PNS flash on spi1 of QEMU (a copy of the board's
   dump): versions, check, read, write, faults (pns-fault.c), power-on
   blocking, the web endpoints and page, and the web BMC update (reimu-abd).

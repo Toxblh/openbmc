@@ -290,7 +290,7 @@ def t_control(b, h):
     s, r = action("OsPower", "rm -rf /")
     check(s >= 400, "OsPower with another action refused (%s)" % s)
     s, r = action("LoadEdac")
-    check(s == 200 and wait(lambda: "modprobe edac_e2k" in h.commands(), 15), "LoadEdac -> modprobe edac_e2k")
+    check(s == 200 and wait(lambda: "modprobe e2k_edac" in h.commands(), 15), "LoadEdac -> modprobe e2k_edac (the module of the board's kernel)")
     check(wait(lambda: sum(1 for x in state()["results"] if x["done"] and x["ok"]) >= 2, 15), "both results back")
 
 

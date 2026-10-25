@@ -327,10 +327,14 @@ static int ctl_client(const char *cmd)
 static void publish_files(void)
 {
     static unsigned sens_gen = ~0u, gen = ~0u;
-    static int64_t last_state;
-    if (H.sens_gen != sens_gen)
+    static int64_t last_state, metrics_at = -1;
+    /* every fresh sample, the same value or not: reimu-fand judges the file
+     * by its age (a steady 96 °C must keep driving the board fans); when the
+     * samples stop, the value expires (NAN after LOST_SEC: the file goes) */
+    if (H.sens_gen != sens_gen || H.metrics_at != metrics_at)
     {
         sens_gen = H.sens_gen;
+        metrics_at = H.metrics_at;
         double t = hl_gpu_temp(&H);
         char s[32];
         snprintf(s, sizeof(s), "%ld\n", (long)lround(t * 1000));
