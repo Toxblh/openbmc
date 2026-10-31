@@ -21,7 +21,7 @@ ADDR s later (CONF = 5, USBSTS bit 27 = high speed unless hs=False) and scans
 its ports SCAN s after that: obmc_hid bound by then = keyboard enumerated
 ("configured", usboff 0), otherwise an empty hub, suspended for good.
 """
-import os, shutil, stat, subprocess, sys, tempfile, threading, time
+import os, re, shutil, stat, subprocess, sys, tempfile, threading, time
 
 SCRIPT = sys.argv[1]
 PROBE, ADDR, SCAN = 0.05, 0.15, 0.15
@@ -37,7 +37,11 @@ def check(cond, what):
 
 
 class Fake:
-    def __init__(self, off=99, state="configured", host=True, media=False, hs=True, addr=True, agent=False):
+    def __init__(self, off=99, state="configured", host=True, media=False, hs=True, addr=True, agent=False,
+                 dbus=None, fand=None, argv=()):
+        """dbus=(chassis, host): the D-Bus power states the fake busctl
+        answers (host None: unreadable), fand: reimu-fand --status "host";
+        both None: the HOST_ON override (host=True/False)"""
         self.w = tempfile.mkdtemp(prefix="hidwatch-")
         self.hs, self.addr_comes = hs, addr
         self.g = self.w + "/sys/kernel/config/usb_gadget"
@@ -63,14 +67,28 @@ class Fake:
             threading.Thread(target=self.driver, args=(d + "/" + f, f), daemon=True).start()
         threading.Thread(target=self.watch_udc, daemon=True).start()
         os.makedirs(self.w + "/bin")
+        if dbus is not None or fand is not None:
+            ch, hs_ = dbus or ("Off", None)
+            bc = self.w + "/bin/busctl"
+            open(bc, "w").write('#!/bin/sh\ncase "$*" in\n'
+                                '  *State.Chassis*) echo \'s "xyz.openbmc_project.State.Chassis.PowerState.%s"\' ;;\n'
+                                '  *State.Host*) %s ;;\n  *) exit 1 ;;\nesac\n'
+                                % (ch, "exit 1" if hs_ is None else "echo 's \"xyz.openbmc_project.State.Host.HostState.%s\"'" % hs_))
+            os.chmod(bc, 0o755)
+            rf = self.w + "/bin/reimu-fand"
+            open(rf, "w").write('#!/bin/sh\n%s\n' % ('exit 1' if fand is None else
+                                'echo \'{"version":1,"host":"%s","zones":[]}\'' % fand))
+            os.chmod(rf, 0o755)
         dm = self.w + "/bin/devmem"
         open(dm, "w").write('#!/bin/sh\ncat "%s/regs/$1" 2>/dev/null || echo 0x00000000\n' % self.w)
         os.chmod(dm, 0o755)
         self.host(host)
-        env = dict(os.environ, ROOT=self.w, POLL="1", GRACE="2", HOST_ON="test -f %s/host_on" % self.w,
-                   USBOFF="cat %s/usboff" % self.w, DEVMEM=dm, PATH="/tmp/bb")
+        env = dict(os.environ, ROOT=self.w, POLL="1", GRACE="2", USBOFF="cat %s/usboff" % self.w, DEVMEM=dm,
+                   PATH="%s/bin:/tmp/bb" % self.w)
+        if dbus is None and fand is None:
+            env["HOST_ON"] = "test -f %s/host_on" % self.w
         self.log = open(self.w + "/log", "w")
-        self.p = subprocess.Popen(["/usr/bin/busybox", "sh", SCRIPT], env=env, stdout=self.log, stderr=self.log)
+        self.p = subprocess.Popen(["/usr/bin/busybox", "sh", SCRIPT] + list(argv), env=env, stdout=self.log, stderr=self.log)
 
     def reg(self, a, v):
         open(self.w + "/regs/" + a, "w").write("0x%08X\n" % v)
@@ -238,6 +256,52 @@ def main():
     f = Fake(off=0, state="not attached", agent=True)
     time.sleep(5)
     check(f.resets() == 0 and "virtual media is in use" in f.text(), "no reset under the agent disk (%d)" % f.resets())
+    f.stop()
+
+    print("== host on judged as reimu-fand does: chassis Off, Host Running (this board): the watcher acts")
+    f = Fake(off=0, state="not attached", dbus=("Off", "Running"))
+    time.sleep(5)
+    check(f.resets() == 1, "one reset with Host.CurrentHostState Running, Chassis Off (%d)" % f.resets())
+    f.stop()
+    print("== Host Off, but reimu-fand's platform probe says the platform answers: acts")
+    f = Fake(off=0, state="not attached", dbus=("Off", "Off"), fand="unknown")
+    time.sleep(5)
+    check(f.resets() == 1, "one reset (%d)" % f.resets())
+    f.stop()
+    print("== Host unreadable, reimu-fand says on: acts; Host Off and reimu-fand off: nothing")
+    f = Fake(off=0, state="not attached", dbus=("Off", None), fand="on")
+    time.sleep(5)
+    check(f.resets() == 1, "host state unreadable, reimu-fand on: one reset (%d)" % f.resets())
+    f.stop()
+    f = Fake(off=0, state="not attached", dbus=("Off", "Off"), fand="off")
+    time.sleep(5)
+    check(f.resets() == 0, "Host Off, reimu-fand off: no reset (%d)" % f.resets())
+    f.stop()
+
+    print("== the reset's trace: timestamps of the bind, the ports, the address, the UDC, the state")
+    f = Fake(off=0, state="not attached")
+    time.sleep(7)
+    t = f.text()
+    for what in ("unbind", "bind", "port", "address 5", "high speed", "obmc_hid bound", "state"):
+        check(any(re.match(r"reimu-hid-watch: \+?\d+\.\d+ .*%s" % what, l) for l in t.splitlines()),
+              "a timestamped line with '%s'" % what)
+    f.stop()
+
+    print("== reimu-hid-watch reset udc: one reset now, obmc_hid bound as soon as its port is back (before the address)")
+    f = Fake(off=0, state="configured", argv=("reset", "udc"))
+    time.sleep(6)
+    b, pts, a, k = f.at("bind"), f.at("ports"), f.at("addressed"), f.at("udc " + PORT)
+    k = [x for x in k if b and x > b[0]]
+    check(f.resets() == 1 and b and pts and a and k and pts[0] <= k[0] < a[0],
+          "UDC bound after the ports came back, before the host addressed the hub (%s)" % [w for _, w in f.events])
+    check(f.p.poll() is not None, "and exits")
+    f.stop()
+    print("== reimu-hid-watch reset delay:100: the UDC 100 ms after the vhub bind")
+    f = Fake(off=0, state="configured", argv=("reset", "delay:100"))
+    time.sleep(6)
+    b, k = f.at("bind"), f.at("udc " + PORT)
+    k = [x for x in k if b and x > b[0]]
+    check(b and k and 0.09 <= k[0] - b[0] < 0.2, "bound %.0f ms after the bind" % ((k[0] - b[0]) * 1000 if b and k else -1))
     f.stop()
 
     print("== the host takes the hub at full speed: said so")

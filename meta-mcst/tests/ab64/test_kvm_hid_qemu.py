@@ -127,7 +127,7 @@ def t_restart(b, base):
 def t_vhubreset(b):
     check("g_mass_storage" not in b.out("dmesg"), "after boot: no legacy g_mass_storage in dmesg")
     udc0 = b.out("cat %s/UDC" % G).strip()
-    out = b.out("systemctl stop reimu-hid-watch; HOST_ON=true GRACE=2 POLL=1 timeout 15 /usr/sbin/reimu-hid-watch 2>&1;"
+    out = b.out("systemctl stop reimu-hid-watch; HOST_ON=true GRACE=2 POLL=1 timeout 30 /usr/sbin/reimu-hid-watch 2>&1;"
                 " systemctl start reimu-hid-watch", timeout=60)
     check(out.count("resetting the virtual hub") == 1 and "gadgets bound again" in out,
           "reimu-hid-watch reset the vhub once (%s)" % out.strip().replace("\n", " | ")[:200])

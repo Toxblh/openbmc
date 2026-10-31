@@ -36,7 +36,6 @@ EDID_NAME=reimu-1920x1200.bin
 FW=/lib/firmware/edid/$EDID_NAME
 EDID_B64='AP///////wBJtSAZAQAAAAEkAQMONCB4Cu6Ro1RMmSYPUFQhCADRwLMAqUCBgJUAgQCBwHFAKDyAoHCwI0AwIDYACEUhAAAaAAAA/QAySx5QEQAKICAgICAgAAAA/ABSRUlNVSBLVk0KICAgAAAA/wBCTUMtVkdBCiAgICAgANo='
 EDID_MD5=f2b7fecf2caa9adbf3b2952c0fc26818
-HUB_RULE=/etc/udev/rules.d/60-reimu-bmc-hub.rules
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 say() { printf '%s\n' "$*"; }
@@ -101,17 +100,10 @@ install_edid() {
 }
 
 # the BMC's virtual hub (1d6b:0107) always on (power/control "on"): now and
-# whenever it is plugged in
+# whenever it is plugged in. The udev rule is the host agent's (one source:
+# reimu-hostd.py hub-rule), which also keeps it so at run time
 install_hub_rule() {
-    printf '%s\n' '# REIMU: the BMC USB virtual hub (KVM keyboard/mouse, virtual media) never' \
-        '# autosuspended: the gadgets connecting later do not wake it (reimu-host.sh)' \
-        'ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1d6b", ATTR{idProduct}=="0107", TEST=="power/control", ATTR{power/control}="on"' \
-        > $HUB_RULE
-    udevadm control --reload 2>/dev/null
-    for d in /sys/bus/usb/devices/*; do
-        [ "$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)" = 1d6b:0107 ] || continue
-        echo on > $d/power/control && say "USB: BMC hub ${d##*/} autosuspend off"
-    done
+    python3 "$HERE/reimu-hostd.py" hub-rule install && say "USB: the BMC hub never autosuspended (udev rule)"
 }
 
 do_install() {
@@ -126,7 +118,7 @@ do_install() {
         esac
         shift
     done
-    for f in reimu-fbmirror.c reimu-h264.py; do [ -f "$HERE/$f" ] || die "$f must be next to $0"; done
+    for f in reimu-fbmirror.c reimu-h264.py reimu-hostd.py; do [ -f "$HERE/$f" ] || die "$f must be next to $0"; done
 
     install_edid
     install_hub_rule
@@ -195,12 +187,18 @@ do_uninstall() {
     systemctl disable --now $UNITS 2>/dev/null
     for u in $UNITS; do rm -f /etc/systemd/system/$u; done
     systemctl daemon-reload
-    rm -rf $LIB $XCONF
+    # only its own files: the host agent (install.sh) lives in $LIB too
+    rm -f $LIB/reimu-fbmirror $LIB/reimu-h264.py $LIB/reimu-host.sh $XCONF
+    rmdir $LIB 2>/dev/null
     conn=$(aspeed_conn)
     out=${conn##*/card[0-9]-}
     [ -n "$out" ] && cmdline_param del "drm.edid_firmware=$out:edid/$EDID_NAME"
     echo > /sys/module/drm/parameters/edid_firmware 2>/dev/null
-    rm -f "$FW" $HUB_RULE
+    rm -f "$FW"
+    # the hub rule stays while the host agent is installed (it keeps it too)
+    if [ ! -f $LIB/reimu-hostd.py ]; then
+        python3 "$HERE/reimu-hostd.py" hub-rule remove 2>/dev/null || rm -f /etc/udev/rules.d/60-reimu-bmc-hub.rules
+    fi
     say "removed (X picks up the ASPEED card again after the next login)"
 }
 

@@ -1034,6 +1034,27 @@ def platform_run():
                       "echo ${p#/xyz/openbmc_project/sensors/} $(busctl get-property $s $p xyz.openbmc_project.Sensor.Value Value | cut -d' ' -f2); done")
             return {l.split()[0]: l.split()[1] if len(l.split()) > 1 else "?" for l in o.splitlines() if l.strip()}
 
+        def power_states():
+            """(chassis CurrentPowerState, host CurrentHostState, IPMI chassis
+            status System Power, Redfish Chassis PowerState, Redfish System PowerState)"""
+            o = b.out("busctl get-property xyz.openbmc_project.State.Chassis /xyz/openbmc_project/state/chassis0 "
+                      "xyz.openbmc_project.State.Chassis CurrentPowerState; busctl get-property xyz.openbmc_project.State.Host "
+                      "/xyz/openbmc_project/state/host0 xyz.openbmc_project.State.Host CurrentHostState")
+            v = [x.rsplit(".", 1)[-1] for x in re.findall(r'"([^"]+)"', o)] + ["?", "?"]
+            ch, ho = v[0], v[1]
+            rc, i = ipmi("chassis", "status")
+            m = re.search(r"System Power\s*:\s*(\S+)", i)
+            s1, j1 = get("/redfish/v1/Chassis/motherboard")
+            s2, j2 = get("/redfish/v1/Systems/system")
+            return (ch, ho, m.group(1) if m else "?", j1.get("PowerState") if s1 == 200 else s1,
+                    j2.get("PowerState") if s2 == 200 else s2)
+
+        def check_power(tag, on, timeout=60):
+            want = ("On", "Running", "on", "On", "On") if on else ("Off", "Off", "off", "Off", "Off")
+            st = b.wait(lambda: power_states() == want and power_states(), timeout, 3) or power_states()
+            rec("platform.%s.power_state" % tag, st == want,
+                "chassis/host/IPMI/Redfish chassis/Redfish system: %s (want %s)" % ("/".join(map(str, st)), "/".join(want)))
+
         def thermal_names():
             s, j = get("/redfish/v1/Chassis/motherboard/Thermal")
             return {t.get("Name", "").replace(" ", "_") for t in j.get("Temperatures", [])} if s == 200 else None
@@ -1065,6 +1086,9 @@ def platform_run():
         sens = b.wait(settled, 300, 5)
         rec("platform.on.dbus_sensors", bool(sens), "%d sensors on D-Bus" % dbus_sensors())
         ch = b.wait(lambda: chassis(), 400, 10)
+        # (the board object, and so Redfish's Chassis, only exists once the
+        # FRU ID was read: the power state is checked from then on)
+        check_power("on", True)
         rec("platform.on.chassis", ch == ["/redfish/v1/Chassis/motherboard"], "Chassis %s (after the FRU ID read)" % ch)
         s, j = get("/redfish/v1/Chassis/motherboard")
         rec("platform.on.chassis_asset", s == 200 and j.get("Manufacturer") == "Пантес" and j.get("SerialNumber"),
@@ -1087,6 +1111,7 @@ def platform_run():
         b.transition("Off")
         gone = b.wait(lambda: dbus_sensors() == 0, 300, 5)
         time.sleep(10)
+        check_power("off", False)
         rec("platform.off.dbus_sensors", bool(gone) or dbus_sensors() == 0, "%d sensors left" % dbus_sensors())
         rs = rf_sensors()
         rec("platform.off.redfish_sensors", rs["Sensors"] == (200, 0) and rs["Thermal"] == (200, 0), "%s" % rs)
@@ -1123,6 +1148,17 @@ def platform_run():
         rec("issue.off_during_instantiation", left == 0, "off while hwmon-instantiator was %s: %d sensors left on D-Bus after 90 s" % (busy, left))
         if left:
             b.ssh("systemctl stop 'xyz.openbmc_project.Hwmon@*'")
+        # a BMC reboot with the platform on: the states come up as On
+        b.transition("On")
+        b.wait(settled, 300, 5)
+        b.ssh("reboot")
+        time.sleep(30)
+        rec("platform.reboot_on", b.wait_ssh(900) and wait_redfish(), "BMC back, platform on (%s)" % b.state().get("power"))
+        wait_ipmi()
+        check_power("reboot_on", True, 120)
+        b.transition("Off")
+        b.wait(lambda: b.host_state() == "Off", 120, 5)
+        b.wait(lambda: dbus_sensors() == 0, 120, 5)
         # a BMC reboot with the platform off: the board from the inventory kept
         b.ssh("reboot")
         time.sleep(30)

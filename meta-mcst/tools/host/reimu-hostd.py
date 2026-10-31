@@ -14,6 +14,13 @@ may ask it for a few things.
     card's fan auto / manual DUTY % (never below GPU_FAN_FLOOR) / "turbo"
     (100 % for N minutes); the OS shut down or rebooted (systemctl);
     modprobe e2k_edac (or edac_e2k)
+  * on its own (host-local, in ALLOW as usb_hub, no BMC message): the BMC's
+    virtual USB hub (1d6b:0107: the KVM keyboard/mouse, virtual media) kept
+    out of autosuspend: the host suspends it while it is empty and the BMC
+    can't wake it (its remote wakeup doesn't work on the board), so after a
+    BMC reboot or kexec the KVM input would never come back. The udev rule
+    (hub-rule install, by install.sh and reimu-host.sh) and a check every 2 s
+    (power/control "auto" -> "on"); its state in the inventory and metrics
 
 The video card's fan: the policy the BMC asks for is kept by the agent. The
 driver resets it after a GPU reset (amdgpu hang: pwm1_enable back to 2, the
@@ -40,6 +47,8 @@ ignored. See README.md next to this file.
        ./reimu-hostd.py status
        ./reimu-hostd.py run                            the service itself
        ./reimu-hostd.py restore-auto                   the GPU fan to the driver
+  sudo ./reimu-hostd.py hub-rule install|remove       the udev rule keeping the
+                     BMC's USB hub (KVM keyboard/mouse) out of autosuspend
 
 Config /etc/reimu-hostd.conf (KEY=VALUE), the key /etc/reimu-hostd/secret
 (root only). REIMU_HOSTD_ROOT=DIR: every /sys, /proc, /etc, /dev path under
@@ -60,6 +69,8 @@ SMART_SEC = 600
 INVENTORY_SEC = 3600
 GPU_TICK_SEC = 2
 OPS = ("gpu_fan", "gpu_turbo", "os_power", "edac_load")
+# done by the agent itself, never asked for by the BMC (ALLOW can turn it off)
+LOCAL_OPS = ("usb_hub",)
 
 # ------------------------------------------------------------------ logging
 _logger = None
@@ -92,7 +103,7 @@ DEFAULTS = {
     "INTERVAL": 10,           # s between metrics
     "GPU_FAN_FLOOR": 30,      # % the manual duty never goes below
     "LINK_LOST_SEC": 60,      # no word from the BMC this long: the GPU fan to the driver
-    "ALLOW": set(OPS),
+    "ALLOW": set(OPS + LOCAL_OPS),
     "EDAC_AUTOLOAD": False,   # modprobe e2k_edac at start when EDAC is absent
     "SMART": True,            # smartctl (when installed) every SMART_SEC
 }
@@ -120,7 +131,7 @@ def parse_config(text):
             elif isinstance(d, int):
                 c[k] = int(v)
             elif isinstance(d, set):
-                c[k] = set(x for x in re.split(r"[\s,]+", v) if x in OPS)
+                c[k] = set(x for x in re.split(r"[\s,]+", v) if x in OPS + LOCAL_OPS)
             else:
                 c[k] = v
         except ValueError:
@@ -286,7 +297,7 @@ class Collector:
     def inventory(self):
         return {"os": self.os_info(), "cpu": self.cpu(), "memory": self.memory(), "pci": self.pci(),
                 "disks": self.disks(), "nics": self.nics(), "gpu": self.gpu_info(),
-                "agent": {"version": VERSION, "proto": PROTO}}
+                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "agent": {"version": VERSION, "proto": PROTO}}
 
     def os_info(self):
         fs = self.fs
@@ -457,7 +468,8 @@ class Collector:
         return {"uptime": int(float(up.split()[0])) if up else None, "load": [float(x) for x in la[:3]],
                 "mem": {"total_kib": mi.get("MemTotal"), "avail_kib": mi.get("MemAvailable"),
                         "swap_total_kib": mi.get("SwapTotal"), "swap_free_kib": mi.get("SwapFree")},
-                "temps": self.temps(), "edac": self.edac(), "gpu": self.gpu(), "disks": self.disk_health(now)}
+                "temps": self.temps(), "edac": self.edac(), "gpu": self.gpu(), "disks": self.disk_health(now),
+                "bmc_usb_hub": bmc_usb_hub_state(self.fs)}
 
     def temps(self):
         out = []
@@ -578,6 +590,67 @@ def edac_modprobe(run):
             return True, "modprobe %s" % m
         errs.append("%s: %s" % (m, out.strip()[:120]))
     return False, "modprobe " + "; ".join(errs)
+
+
+# ------------------------------------------------------------------ the BMC's USB hub
+HUB_ID = ("1d6b", "0107")
+HUB_RULE = "/etc/udev/rules.d/60-reimu-bmc-hub.rules"
+HUB_RULE_TEXT = (
+    "# REIMU: the BMC's virtual USB hub (KVM keyboard/mouse, virtual media) never\n"
+    "# autosuspended: the BMC can't wake it (reimu-hostd.py hub-rule install)\n"
+    'ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1d6b", '
+    'ATTR{idProduct}=="0107", TEST=="power/control", ATTR{power/control}="on"\n')
+
+
+def bmc_usb_hubs(fs):
+    for d in fs.glob("/sys/bus/usb/devices/*"):
+        if (fs.read(d + "/idVendor"), fs.read(d + "/idProduct")) == HUB_ID and fs.exists(d + "/power/control"):
+            yield d
+
+
+def bmc_usb_hub_state(fs):
+    for d in bmc_usb_hubs(fs):
+        return {"present": True, "control": fs.read(d + "/power/control"), "status": fs.read(d + "/power/runtime_status")}
+    return {"present": False, "control": None, "status": None}
+
+
+class UsbHub:
+    def __init__(self, fs, cfg):
+        self.fs, self.cfg = fs, cfg
+
+    def tick(self):
+        events = []
+        if "usb_hub" not in self.cfg["ALLOW"]:
+            return events
+        for d in bmc_usb_hubs(self.fs):
+            if self.fs.read(d + "/power/control") != "auto":
+                continue
+            try:
+                self.fs.write(d + "/power/control", "on")
+            except OSError as e:
+                log("BMC USB hub %s: %s" % (os.path.basename(d), e))
+                continue
+            text = "the BMC's USB hub %s: autosuspend off (KVM keyboard/mouse)" % os.path.basename(d)
+            log(text)
+            events.append({"kind": "bmc_usb_hub_on", "text": text})
+        return events
+
+
+def hub_rule(fs, run, action):
+    """install / remove the udev rule; install also sets the hub there now"""
+    path = fs.p(HUB_RULE)
+    if action == "remove":
+        if os.path.exists(path):
+            os.remove(path)
+            run(["udevadm", "control", "--reload"], timeout=10)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".new", "w") as f:
+        f.write(HUB_RULE_TEXT)
+    os.chmod(path + ".new", 0o644)
+    os.rename(path + ".new", path)
+    run(["udevadm", "control", "--reload"], timeout=10)
+    UsbHub(fs, parse_config("")).tick()
 
 
 def edac_autoload(fs, run, cfg):
@@ -1053,6 +1126,7 @@ class Agent:
         self.cred_mtimes = (_mtime(secret_path), _mtime(conf_path))
         self.col = Collector(fs, run, cfg)
         self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"])
+        self.hub = UsbHub(fs, cfg)
         self.ctl = Controller(cfg, self.fan, run)
         self.backoff = Backoff(1, 60)
         self.last_cand = None
@@ -1096,6 +1170,10 @@ class Agent:
                 if m and m["t"] in types:
                     return m
         raise ValueError("no %s from the BMC" % "/".join(types))
+
+    def local_tick(self, now, link_ok):
+        """every 2 s, linked or not: the GPU fan policy, the BMC's USB hub"""
+        return self.fan.tick(now, link_ok) + self.hub.tick()
 
     def credentials_changed(self):
         """a pairing (pair --pair, install.sh) wrote a new key or address"""
@@ -1141,7 +1219,7 @@ class Agent:
             now = time.monotonic()
             if now >= next_gpu:
                 next_gpu = now + GPU_TICK_SEC
-                for e in self.fan.tick(now, True):
+                for e in self.local_tick(now, True):
                     link.send({"t": "event", "data": e})
             if now >= next_metrics:
                 next_metrics = now + self.cfg["INTERVAL"]
@@ -1225,7 +1303,7 @@ class Agent:
                 log("the BMC refused the key (unpaired?): pair again; next try in %d s" % delay)
             end = time.monotonic() + delay
             while not self.stop and time.monotonic() < end and not self.credentials_changed():
-                self.fan.tick(time.monotonic(), time.monotonic() - self.last_rx <= self.cfg["LINK_LOST_SEC"])
+                self.local_tick(time.monotonic(), time.monotonic() - self.last_rx <= self.cfg["LINK_LOST_SEC"])
                 time.sleep(min(GPU_TICK_SEC, max(0.05, end - time.monotonic())))
         self.fan.restore_auto("agent stopped")
 
@@ -1341,6 +1419,10 @@ def main(argv):
         print(json.dumps(Collector(fs, run, cfg).inventory(), indent=1, ensure_ascii=False))
     elif cmd == "metrics":
         print(json.dumps(Collector(fs, run, cfg).metrics(time.monotonic()), indent=1, ensure_ascii=False))
+    elif cmd == "hub-rule":
+        if len(argv) < 3 or argv[2] not in ("install", "remove"):
+            raise SystemExit("usage: reimu-hostd.py hub-rule install|remove")
+        hub_rule(fs, run, argv[2])
     elif cmd == "restore-auto":
         f = GpuFan(fs)
         f.touched = True

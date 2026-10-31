@@ -189,6 +189,7 @@ def board(t):
     t.put("/sys/devices/virtual/net/lo/operstate", "unknown")
     t.put("/sys/devices/virtual/net/lo/type", "772")
     t.link("/sys/class/net/lo", "/sys/devices/virtual/net/lo")
+    usb_dev(t, "4-4", "1d6b", "0107")  # the BMC's virtual hub, autosuspend on (the kernel's default)
     t.put("/proc/net/if_inet6", "fe800000000000009aa7b0fffe060f61 03 40 20 80 enp1s1f1\n"
           "00000000000000000000000000000001 01 80 10 80       lo\n")
 
@@ -785,6 +786,86 @@ class TestCredentials(Base):
             shutil.rmtree(d)
 
 
+def usb_dev(t, name, vid, pid, control="auto", status="suspended"):
+    d = "/sys/devices/platform/ehci/usb4/" + name
+    t.put(d + "/idVendor", vid)
+    t.put(d + "/idProduct", pid)
+    t.put(d + "/power/control", control)
+    t.put(d + "/power/runtime_status", status)
+    t.link("/sys/bus/usb/devices/" + name, d)
+    return d
+
+
+class TestUsbHub(Base):
+    """the BMC's virtual USB hub (1d6b:0107: the KVM keyboard/mouse, virtual
+    media) autosuspended by the host when empty is never woken by the BMC (its
+    remote wakeup doesn't work on the board): no KVM input after a BMC reboot"""
+
+    def setUp(self):
+        super().setUp()
+        self.hub = usb_dev(self.t, "4-4", "1d6b", "0107")
+        self.root_hub = usb_dev(self.t, "usb4", "1d6b", "0002")
+
+    def test_autosuspend_turned_off(self):
+        u = hd.UsbHub(self.fs, hd.parse_config(""))
+        ev = u.tick()
+        self.assertEqual(self.t.get(self.hub + "/power/control"), "on")
+        self.assertEqual([e["kind"] for e in ev], ["bmc_usb_hub_on"])
+        self.assertEqual(u.tick(), [], "once")
+        self.assertEqual(self.t.get(self.root_hub + "/power/control"), "auto", "other USB devices untouched")
+
+    def test_back_to_auto_fixed_again(self):
+        u = hd.UsbHub(self.fs, hd.parse_config(""))
+        u.tick()
+        self.t.put(self.hub + "/power/control", "auto")  # re-plugged (BMC kexec): the kernel's default
+        self.assertTrue(u.tick())
+        self.assertEqual(self.t.get(self.hub + "/power/control"), "on")
+
+    def test_not_in_allow(self):
+        u = hd.UsbHub(self.fs, hd.parse_config("ALLOW=gpu_fan"))
+        self.assertEqual(u.tick(), [])
+        self.assertEqual(self.t.get(self.hub + "/power/control"), "auto")
+
+    def test_not_a_bmc_command(self):
+        fan = hd.GpuFan(self.fs)
+        r = hd.Controller(hd.parse_config(""), fan, self.run).handle({"t": "control", "id": 1, "op": "usb_hub"}, 0)
+        self.assertFalse(r["ok"])
+        self.assertIn("not allowed", r["err"])
+
+    def test_state_in_metrics_and_inventory(self):
+        c = hd.Collector(self.fs, self.run, hd.parse_config(""))
+        self.assertEqual(c.metrics(0)["bmc_usb_hub"], {"present": True, "control": "auto", "status": "suspended"})
+        self.assertEqual(c.inventory()["bmc_usb_hub"]["present"], True)
+        self.t.rm("/sys/bus/usb/devices/4-4")
+        self.assertEqual(c.metrics(1)["bmc_usb_hub"], {"present": False, "control": None, "status": None})
+
+    def test_agent_fixes_it_without_the_bmc(self):
+        """after a BMC reboot the link is down: the hub is fixed all the same"""
+        ag = hd.Agent(hd.parse_config(""), {}, self.fs, self.run)
+        ag.local_tick(0, link_ok=False)
+        self.assertEqual(self.t.get(self.hub + "/power/control"), "on")
+
+    def test_udev_rule(self):
+        self.run.table["udevadm"] = (0, "")
+        hd.hub_rule(self.fs, self.run, "install")
+        rule = self.t.get("/etc/udev/rules.d/60-reimu-bmc-hub.rules")
+        for part in ('SUBSYSTEM=="usb"', 'ATTR{idVendor}=="1d6b"', 'ATTR{idProduct}=="0107"', 'TEST=="power/control"',
+                     'ATTR{power/control}="on"'):
+            self.assertIn(part, rule)
+        self.assertRegex(rule, r'ACTION=="add[|"]')
+        self.assertIn(["udevadm", "control", "--reload"], self.run.calls)
+        self.assertEqual(self.t.get(self.hub + "/power/control"), "on", "applied to the hub there now")
+        hd.hub_rule(self.fs, self.run, "remove")
+        self.assertFalse(os.path.exists(self.t.p("/etc/udev/rules.d/60-reimu-bmc-hub.rules")))
+
+    def test_one_source_of_the_rule(self):
+        """reimu-host.sh (the KVM side) uses the agent's rule, no copy of its own"""
+        text = open(os.path.join(HERE, "..", "reimu-host.sh")).read()
+        self.assertNotIn("ATTR{power/control}", text)
+        self.assertIn("reimu-hostd.py\" hub-rule install", text)
+        self.assertIn("reimu-hostd.py\" hub-rule remove", text)
+
+
 class TestTransport(Base):
     def test_link_local_from_mac(self):
         self.assertEqual(hd.ll_from_mac("98:a7:b0:06:0f:7e"), "fe80::9aa7:b0ff:fe06:f7e")
@@ -914,7 +995,7 @@ class TestProtocol(unittest.TestCase):
     def test_config_defaults(self):
         c = hd.parse_config("# nothing\nUNKNOWN_KEY=1\n")
         self.assertEqual((c["INTERVAL"], c["GPU_FAN_FLOOR"], c["LINK_LOST_SEC"], c["BMC_PORT"]), (10, 30, 60, 5564))
-        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load"})
+        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load", "usb_hub"})
         self.assertEqual(hd.parse_config("INTERVAL=0")["INTERVAL"], 2)
 
 

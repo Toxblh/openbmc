@@ -26,6 +26,7 @@ try {
   check(true, "agent card: подключён");
   const ag = await card("Агент хоста").innerText();
   check(/IPv4/.test(ag) && /elbrus/.test(ag), "agent: host and transport shown");
+  check(/USB-хаб BMC \(KVM\)\s*не засыпает/.test(ag), "agent card: the BMC's USB hub kept awake by the agent");
   const os = await card("ОС и процессор").innerText();
   check(/E8C2/.test(os) && /ALT Workstation/.test(os) && /Linux E2K/.test(os), "OS card: E8C2, ALT, boot chain");
   const gpu = await card("Видеокарта").innerText();

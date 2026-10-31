@@ -18,8 +18,13 @@
 #     configures it again): the state stays "configured" across an unbind and
 #     bind of the gadget (only a bus reset changes it).
 #
+# The host on: as reimu-fand judges it: Host CurrentHostState (reimupwr sets
+# it from GPIO_POWER_IN) anything but Off; Off or unreadable: reimu-fand's own
+# verdict (reimu-fand --status "host": it probes the platform's I2C devices).
+# Chassis CurrentPowerState can say Off with the host running.
+#
 # Rules (every POLL seconds):
-#   - the host powered on (chassis CurrentPowerState On) for GRACE seconds and
+#   - the host powered on for GRACE seconds and
 #     obmc_hid bound to a vhub port, and the host hasn't had the keyboard for
 #     GRACE seconds: the vhub is reset, once;
 #   - not while a virtual media gadget is bound (a reset drops the disk the
@@ -27,13 +32,23 @@
 #     on (no repeated rebinds while the host boots: its firmware may take its
 #     time before it starts USB).
 #
-# The reset (measured on the board): obmc_hid's UDC is bound again right
-# after the vhub driver is back and the host has addressed the hub
-# (AST_VHUB_CONF != 0: the high-speed handshake is over), polled every 20 ms,
-# before the host's hub driver scans the ports (>= 100 ms after it powers
-# them). Bound 2 s later, the host saw an empty hub and suspended it at once;
-# bound within 20 ms of the driver bind, the host took the hub at full speed.
-# The other gadgets are bound after it.
+# The reset: unbind and bind aspeed_vhub (the host sees the hub unplugged and
+# plugged in again), then obmc_hid's UDC bound again (BIND, or the MODE of
+# "reimu-hid-watch reset MODE"):
+#   address  (default) once the host has addressed the hub (AST_VHUB_CONF != 0:
+#            the high-speed handshake is over), polled every 20 ms
+#   udc      as soon as the port is back (/sys/class/udc/<port>), before that
+#   delay:N  N ms after the driver bind
+# On the board (2026-10-24/25): 2 s after the bind: an empty hub, suspended at
+# once; within 20 ms ("udc"): the keyboard seen, but the hub at full speed;
+# "address": high speed, but the host's port scan saw no connection and
+# suspended the hub. Each reset logs a trace (uptime seconds) of the bind,
+# the port, the hub address and speed, the UDC state for TRACE seconds, so
+# one try tells which works. The real answer is on the host: power/control
+# "on" for the hub (1d6b:0107), so it is never suspended.
+#
+#   reimu-hid-watch               the watcher (reimu-hid-watch.service)
+#   reimu-hid-watch reset [MODE]  one reset now (not while a disk is in use)
 ROOT=${ROOT:-}                  # tests: a fake /sys
 POLL=${POLL:-5}
 GRACE=${GRACE:-15}
@@ -45,12 +60,22 @@ USBOFF=${USBOFF:-usb_off}       # tests: a command printing reimu-kvm's "usboff"
 DEVMEM=${DEVMEM:-devmem}        # tests: a fake register read
 REG_CONF=0x1E6A0004             # AST_VHUB_CONF: the hub's USB address
 REG_USBSTS=0x1E6A0024           # AST_VHUB_USBSTS: bit 27 high speed
+BIND=address TRACE=5
+[ -r $ROOT/etc/default/reimu-hid-watch ] && . $ROOT/etc/default/reimu-hid-watch
 
 log() { echo "reimu-hid-watch: $*"; }
+tlog() { echo "reimu-hid-watch: $(cut -d' ' -f1 /proc/uptime) $*"; }
 
 host_on() {
-    busctl get-property xyz.openbmc_project.State.Chassis /xyz/openbmc_project/state/chassis0 \
-        xyz.openbmc_project.State.Chassis CurrentPowerState 2>/dev/null | grep -q 'PowerState\.On"'
+    case "$(busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 \
+            xyz.openbmc_project.State.Host CurrentHostState 2>/dev/null)" in
+        *HostState.Off\"|"") ;;
+        *HostState.*) return 0 ;;
+    esac
+    case "$(reimu-fand --status 2>/dev/null)" in
+        *'"host":"on"'*|*'"host":"unknown"'*|*'"host":"starting"'*) return 0 ;;
+    esac
+    return 1
 }
 
 uptime_s() { cut -d. -f1 /proc/uptime; }
@@ -69,7 +94,27 @@ media_bound() {
     return 1
 }
 
-reset_vhub() {
+# the port, the hub's address and speed, the port's UDC state, obmc_hid's
+# UDC: what changed since the last call, logged with the time
+sample() {
+    n_port=0
+    [ -e $ROOT/sys/class/udc/$hid ] && n_port=1
+    n_addr=$(( $($DEVMEM $REG_CONF 2>/dev/null || echo 0) & 0x7f ))
+    n_hs=$(( ($($DEVMEM $REG_USBSTS 2>/dev/null || echo 0) >> 27) & 1 ))
+    n_state=$(cat $ROOT/sys/class/udc/$hid/state 2>/dev/null)
+    n_udc=$(cat $G/obmc_hid/UDC 2>/dev/null)
+    [ "$n_port" = "$s_port" ] || { [ $n_port = 1 ] && tlog "port $hid back" || tlog "port $hid gone"; }
+    [ "$n_addr" = "$s_addr" ] || tlog "hub address $n_addr"
+    if [ $n_addr != 0 ] && [ "$n_hs/$n_addr" != "$s_hs/$s_addr" ] && [ "$n_hs" != "$s_hs" -o "$s_addr" = 0 ]; then
+        [ $n_hs = 1 ] && tlog "hub at high speed" || tlog "hub at full speed (12 Mbit/s): the host took it on its USB 1.1 companion"
+    fi
+    [ "$n_state" = "$s_state" ] || tlog "state ${n_state:-none}"
+    [ "$n_udc" = "$s_udc" ] || tlog "obmc_hid UDC ${n_udc:-none}"
+    s_port=$n_port s_addr=$n_addr s_hs=$n_hs s_state=$n_state s_udc=$n_udc
+}
+
+reset_vhub() { # reason [mode]
+    mode=${2:-$BIND}
     saved= hid=
     for u in $G/*/UDC; do
         [ -f "$u" ] || continue
@@ -77,35 +122,55 @@ reset_vhub() {
         [ -n "$p" ] || continue
         if [ "${u%/UDC}" = $G/obmc_hid ]; then hid=$p; else saved="$saved ${u%/UDC}=$p"; fi
     done
-    log "the powered host has not had the KVM keyboard ($1): resetting the virtual hub (obmc_hid=$hid$saved)"
+    [ -n "$hid" ] || hid=$VHUB:p1
+    log "$1: resetting the virtual hub, obmc_hid bound at '$mode' (obmc_hid=$hid$saved)"
+    s_port= s_addr= s_hs= s_state= s_udc=
+    sample
+    tlog "unbind $VHUB"
     echo "$VHUB" > $DRV/unbind || { log "unbind failed"; return 1; }
     sleep 1
+    sample
+    tlog "bind $VHUB"
     echo "$VHUB" > $DRV/bind || { log "bind failed"; return 1; }
-    # the port back and the hub addressed by the host, at most 3 s
-    i=0 addr=0
-    while [ $i -lt 150 ]; do
-        if [ -e $ROOT/sys/class/udc/$hid ]; then
-            addr=$(( $($DEVMEM $REG_CONF 2>/dev/null || echo 0) & 0x7f ))
-            [ $addr != 0 ] && break
-        fi
-        usleep 20000
+    case $mode in
+        delay:*) usleep $(( ${mode#delay:} * 1000 )) ;;
+        *)  i=0
+            while [ $i -lt 150 ]; do
+                sample
+                [ $s_port = 1 ] && { [ $mode = udc ] || [ $s_addr != 0 ]; } && break
+                usleep 20000
+                i=$((i + 1))
+            done
+            [ $i = 150 ] && tlog "waited 3 s: port back $s_port, hub address $s_addr" ;;
+    esac
+    if [ "$(cat $G/obmc_hid/UDC 2>/dev/null)" != "$hid" ]; then
+        echo "$hid" > $G/obmc_hid/UDC 2>/dev/null && tlog "obmc_hid bound to $hid" || tlog "obmc_hid: binding to $hid failed"
+    else
+        tlog "obmc_hid bound to $hid (by the gadget core)"
+    fi
+    # what the host makes of it
+    i=0
+    while [ $i -lt $((TRACE * 20)) ]; do
+        sample
+        [ "$s_state" = configured ] && [ $i -gt 10 ] && break
+        usleep 50000
         i=$((i + 1))
     done
-    [ $addr = 0 ] && log "the host did not address the hub within 3 s"
-    if [ "$(cat $G/obmc_hid/UDC 2>/dev/null)" != "$hid" ]; then
-        echo "$hid" > $G/obmc_hid/UDC 2>/dev/null || log "obmc_hid: binding to $hid failed"
-    fi
-    if [ $addr != 0 ] && [ $(( ($($DEVMEM $REG_USBSTS 2>/dev/null || echo 0) >> 27) & 1 )) = 0 ]; then
-        log "the host took the hub at full speed (12 Mbit/s), not high speed"
-    fi
     # (the gadget core binds a gadget again by itself when its UDC comes back;
     # whatever isn't, is bound here)
     for s in $saved; do
         [ "$(cat "${s%%=*}/UDC" 2>/dev/null)" = "${s#*=}" ] && continue
         echo "${s#*=}" > "${s%%=*}/UDC" 2>/dev/null || log "${s%%=*}: binding to ${s#*=} failed"
     done
-    log "virtual hub reset, gadgets bound again (hub address $addr)"
+    [ $s_addr != 0 ] && [ $s_hs = 0 ] && log "the host took the hub at full speed (12 Mbit/s), not high speed"
+    log "virtual hub reset, gadgets bound again (hub address $s_addr, state ${s_state:-none})"
 }
+
+if [ "${1:-}" = reset ]; then
+    if media_bound; then log "virtual media is in use: no reset"; exit 1; fi
+    reset_vhub "by hand" "${2:-}"
+    exit $?
+fi
 
 on_since= na_since= done_this_power_on=0 media_said=
 while :; do
@@ -134,7 +199,7 @@ while :; do
             [ -n "$media_said" ] || log "the host has not had the KVM keyboard ($lost), but virtual media is in use: no reset while it is"
             media_said=1
         else
-            reset_vhub "$lost"
+            reset_vhub "the powered host has not had the KVM keyboard ($lost)"
             done_this_power_on=1 media_said=
         fi
     fi

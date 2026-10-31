@@ -25,6 +25,10 @@ function ago(s) {
   if (s < 5400) return `${Math.round(s / 60)} мин назад`;
   return `${(s / 3600).toFixed(1)} ч назад`;
 }
+// the BMC's virtual USB hub on the host: suspended, the KVM keyboard/mouse
+// can't come back (the agent sets power/control "on")
+const hubText = (u) =>
+  !u ? undefined : !u.present ? "не виден хосту" : u.control === "on" ? `не засыпает${u.status ? ` (${u.status})` : ""}` : `засыпает (${u.control}, ${u.status || "?"}): клавиатура и мышь KVM могут пропасть`;
 const uptime = (s) => (s ? `${Math.floor(s / 86400)} д ${Math.floor((s % 86400) / 3600)} ч ${Math.floor((s % 3600) / 60)} мин` : "—");
 
 async function call(method, args, ok) {
@@ -132,6 +136,7 @@ function agentCard(st) {
       ["Подключён", ag.connected && ag.since ? new Date(ag.since * 1000).toLocaleString("ru-RU") : undefined],
       ["Последние данные", ag.last_seen ? `${new Date(ag.last_seen * 1000).toLocaleString("ru-RU")} (${ago(st.heartbeat.age)})` : undefined],
       ["Пульс", txt],
+      ["USB-хаб BMC (KVM)", hubText((st.metrics || {}).bmc_usb_hub)],
       ["Порт BMC", `${st.port} (TLS, ${st.iface || "все интерфейсы"})`],
       ["Сертификат", st.fingerprint ? h("span", { class: "mono small" }, `SHA-256 ${st.fingerprint.slice(0, 32)}…`) : undefined],
     ]),

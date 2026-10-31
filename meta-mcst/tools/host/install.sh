@@ -18,7 +18,8 @@
 # pinned key, the files it fetches need no trust of their own.
 # Installed: /usr/local/lib/reimu/reimu-hostd.py, the unit
 # /etc/systemd/system/reimu-hostd.service, /etc/reimu-hostd.conf (kept when
-# there), the key /etc/reimu-hostd/secret (by the pairing). Again: an update
+# there), the key /etc/reimu-hostd/secret (by the pairing), the udev rule
+# /etc/udev/rules.d/60-reimu-bmc-hub.rules (the BMC's USB hub never suspended). Again: an update
 # (with --pair: a new pairing). All of it is one { … } block: the shell reads
 # the whole of it before running any of it, so a download cut short runs
 # nothing, and the USB disk may go away while it runs.
@@ -215,6 +216,14 @@ do_install() {
         put "$T/reimu-hostd.conf" "$CONF" 644
     fi
     msg "Агент установлен в $LIB" "the agent installed in $LIB"
+    # the BMC's virtual USB hub (KVM keyboard/mouse) never autosuspended: the
+    # udev rule (the agent's) and the hub there now; the agent keeps it so too
+    if REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" hub-rule install; then
+        msg "USB-хаб BMC (клавиатура и мышь KVM) больше не засыпает" "the BMC's USB hub (KVM keyboard/mouse) kept awake (udev rule)"
+    else
+        msg "Не удалось поставить правило udev для USB-хаба BMC (агент всё равно держит его включённым)" \
+            "the udev rule for the BMC's USB hub not installed (the agent keeps the hub awake anyway)"
+    fi
     if [ -n "$PAIR" ]; then
         msg "Привязка к BMC…" "pairing with the BMC…"
         if ! python3 "$LIB/reimu-hostd.py" pair --pair "$PAIR" --config "$CONF" --secret "$SECRET"; then
@@ -258,6 +267,9 @@ do_install() {
 
 do_uninstall() {
     systemctl_ disable --now reimu-hostd.service 2>/dev/null
+    # the hub rule stays while reimu-host.sh (the KVM side) is installed
+    [ -f "$LIB/reimu-host.sh" ] || [ ! -f "$LIB/reimu-hostd.py" ] ||
+        REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" hub-rule remove 2>/dev/null
     rm -f "$UNIT" "$LIB/reimu-hostd.py" "$SECRET"
     rmdir "$(dirname "$SECRET")" "$LIB" 2>/dev/null
     [ "$PURGE" = 1 ] && rm -f "$CONF"

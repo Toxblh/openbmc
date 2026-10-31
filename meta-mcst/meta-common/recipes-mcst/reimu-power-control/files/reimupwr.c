@@ -32,21 +32,35 @@ static int s_update_delay_init(void)
 }
 
 int success = 0;
-static void set_power_state_on_dbus(int pgood)
+static void set_power_state_on_dbus(int pgood, int changed)
 {
     const char *state = pgood ? "xyz.openbmc_project.State.Host.HostState.Running" : "xyz.openbmc_project.State.Host.HostState.Off";
+    /* the chassis power state follows power good too: phosphor-chassis-
+     * state-manager only learns it from its own power targets (a power-on
+     * through it) and has no power good source on this board, so it read
+     * Off with the platform running (Redfish Chassis PowerState, power-on
+     * hours, anything keyed on the chassis state) */
+    const char *cstate = pgood ? "xyz.openbmc_project.State.Chassis.PowerState.On" : "xyz.openbmc_project.State.Chassis.PowerState.Off";
 
-    reimu_dbus_manage_service("/org/freedesktop/systemd1/unit/hwmon_2dinstantiator_2eservice", pgood ? "Start" : "Stop");
+    /* the sensors: on a change only (the states are re-asserted every 10 s) */
+    static int managed = -1;
+    if (changed || managed != pgood)
+    {
+        reimu_dbus_manage_service("/org/freedesktop/systemd1/unit/hwmon_2dinstantiator_2eservice", pgood ? "Start" : "Stop");
+        managed = pgood;
+    }
 
     int rv;
+    success = 1;
     if ((rv = reimu_dbus_set_property_str("xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0", "xyz.openbmc_project.State.Host", "CurrentHostState", state)) != 0)
     {
         reimu_message(stderr, "Warning: (%s) Can't set host state to %s (error %d), deferring...\n", reimu_gettime(), state, rv);
         success = 0;
     }
-    else
+    if ((rv = reimu_dbus_set_property_str("xyz.openbmc_project.State.Chassis", "/xyz/openbmc_project/state/chassis0", "xyz.openbmc_project.State.Chassis", "CurrentPowerState", cstate)) != 0)
     {
-        success = 1;
+        reimu_message(stderr, "Warning: (%s) Can't set chassis power state to %s (error %d), deferring...\n", reimu_gettime(), cstate, rv);
+        success = 0;
     }
 }
 
@@ -69,13 +83,15 @@ int poll_pgood()
 
 int dbus_available()
 {
-    return !reimu_dbus_call_method("xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0", "org.freedesktop.DBus.Introspectable", "Introspect");
+    return !reimu_dbus_call_method("xyz.openbmc_project.State.Host", "/xyz/openbmc_project/state/host0", "org.freedesktop.DBus.Introspectable", "Introspect") &&
+           !reimu_dbus_call_method("xyz.openbmc_project.State.Chassis", "/xyz/openbmc_project/state/chassis0", "org.freedesktop.DBus.Introspectable", "Introspect");
 }
 
 int main(void)
 {
     int old_pgood = -1;
     int update_delay = -1;
+    int reassert = 0;
 
     reimu_message(stdout, "REIMU power control started at %s\n", reimu_gettime());
     reimu_message(stdout, "Power supply discharge time is %d seconds\n", s_update_delay_init());
@@ -88,7 +104,7 @@ int main(void)
             if (changed) reimu_message(stdout, "(%s) Power good state changed from %d to %d, changing power state\n", reimu_gettime(), old_pgood, pgood);
             if (dbus_available())
             {
-                set_power_state_on_dbus(pgood);
+                set_power_state_on_dbus(pgood, changed);
             }
             else
             {
@@ -116,6 +132,13 @@ int main(void)
             }
         }
         if (update_delay >= 0) --update_delay;
+        /* every 10 s again: a state manager that restarted (crash, restart
+         * policy) starts from its own idea of the state, Off */
+        if (++reassert >= 10)
+        {
+            reassert = 0;
+            success = 0;
+        }
         reimu_msleep(1000, NULL);
     }
 }

@@ -230,6 +230,9 @@ def t_agent(b, h):
         return
     check(st["agent"]["transport"] == "ipv4", "over IPv4 (the QEMU forward): %s %s" % (st["agent"]["transport"], st["agent"]["peer"]))
     check(st["inventory"]["cpu"]["model"] == "E8C2" and len(st["inventory"]["pci"]) == 4, "inventory: E8C2, 4 PCIe devices")
+    hub = wait(lambda: (state()["metrics"] or {}).get("bmc_usb_hub"), 15) or {}
+    check(hub.get("control") == "on" and h.t.get("/sys/bus/usb/devices/4-4/power/control") == "on",
+          "the BMC's USB hub (fake 1d6b:0107 at auto): kept awake by the agent, the BMC sees it: %s" % hub)
     check(st["sensors"]["Host_GPU_Edge"] == 52 and st["sensors"]["Host_GPU_Junction"] == 61, "sensors in the Json")
     v = wait(lambda: prop(b, "/xyz/openbmc_project/sensors/temperature/Host_GPU_Junction", "xyz.openbmc_project.Sensor.Value", "Value"), 10)
     check(v == "d 61", "D-Bus Sensor.Value Host_GPU_Junction: %s" % v)

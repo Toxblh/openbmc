@@ -332,6 +332,26 @@ class Network(Base):
         self.assertNotIn("restart", self.systemctl())
         self.assertIn("--pair", out, "tells how to pair")
 
+    def test_usb_hub_rule(self):
+        """the BMC's virtual USB hub (1d6b:0107) kept out of autosuspend: the
+        udev rule installed (paired or not) and applied to the hub there now;
+        removed by --uninstall"""
+        hub = os.path.join(self.root, "sys/bus/usb/devices/4-4")
+        os.makedirs(os.path.join(hub, "power"))
+        for f, v in (("idVendor", "1d6b"), ("idProduct", "0107"), ("power/control", "auto")):
+            open(os.path.join(hub, f), "w").write(v + "\n")
+        rule = os.path.join(self.root, "etc/udev/rules.d/60-reimu-bmc-hub.rules")
+        script = self.installed_script()
+        rc, out = sh(["sh", script, "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(rule), out)
+        self.assertIn('ATTR{idVendor}=="1d6b", ATTR{idProduct}=="0107"', open(rule).read())
+        self.assertIn('ATTR{power/control}="on"', open(rule).read())
+        self.assertEqual(open(os.path.join(hub, "power/control")).read().strip(), "on")
+        rc, out = sh(["sh", script, "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(rule), "removed by --uninstall")
+
     def test_bad_pairing_string(self):
         rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url, "--pair", "reimu1:@@;rm -rf /"], env=self.env)
         self.assertEqual(rc, 2, out)
