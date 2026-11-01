@@ -414,7 +414,8 @@ do_uninstall() {
     rm -f "$UNIT" "$LIB/reimu-hostd.py" "$SECRET" "$INITD/reimu-hostd" "$LOGF" "$LOGF.1" \
         "$REIMU_ROOT/var/run/reimu-hostd.pid" "$REIMU_ROOT/var/run/reimu-hostd.agent.pid"
     rm -rf "$REIMU_ROOT/var/run/reimu-hostd.lock"
-    rmdir "$(dirname "$SECRET")" "$LIB" 2>/dev/null
+    rm -f "$REIMU_ROOT/var/lib/reimu-hostd/policy" "$REIMU_ROOT/var/lib/reimu-hostd/policy.new"
+    rmdir "$(dirname "$SECRET")" "$LIB" "$REIMU_ROOT/var/lib/reimu-hostd" 2>/dev/null
     [ "$PURGE" = 1 ] && rm -f "$CONF"
     [ "$INIT" = sysv ] || systemctl_ daemon-reload 2>/dev/null
     msg "Агент удалён$([ "$PURGE" = 1 ] || echo " (настройки $CONF оставлены)"). Отозвать ключ на BMC: страница «Хост» → «Отключить агент»." \

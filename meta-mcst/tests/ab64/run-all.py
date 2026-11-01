@@ -25,6 +25,8 @@ FLASH_SRC = "/work/openbmc/meta-mcst/meta-ab64/recipes-mcst/reimu-ab/files/reimu
 FLASH_TEST = ("d=$(mktemp -d) && gcc -O2 -o $d/reimu-flash %s && gcc -shared -fPIC -o $d/flaky.so %s/flaky-pwrite.c -ldl"
               " && python3 %s/test_reimu_flash.py $d/reimu-flash $d/flaky.so $d/w; r=$?; rm -rf $d; exit $r" % (FLASH_SRC, AB, AB))
 CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab_plan": ["python3", AB + "/test_ab_plan.py"], "test_ab_lock": ["python3", AB + "/test_ab_lock.py"],
+                    "test_reimu_fit": ["python3", AB + "/test_reimu_fit.py"],
+                    "test_pns_tool": ["python3", AB + "/test_pns_tool.py"],
                     "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
@@ -163,6 +165,8 @@ def main():
     # no QEMU, on this machine: the web tree in a browser (PY: a python with pyte for real zsh, vim)
     jobs.append(Job("console_size", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                      "node", os.path.join(e2e, "console-size.stub.mjs")]))
+    jobs.append(Job("pns_blank", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                  "node", os.path.join(e2e, "pns-blank.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

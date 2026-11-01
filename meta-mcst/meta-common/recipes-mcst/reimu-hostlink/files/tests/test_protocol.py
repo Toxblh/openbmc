@@ -504,11 +504,11 @@ def t_agent():
         check(wait(lambda: any(x["op"] == "os_power" and x["ok"] for x in d.state()["results"]), 6), "its result back")
         d.ctl("edac")
         check(wait(lambda: "modprobe e2k_edac" in open(cl).read(), 6), "LoadEdac -> modprobe e2k_edac")
-        # the BMC goes away: the GPU fan back to the driver after LINK_LOST_SEC
+        # the BMC goes away (bug 69): a manual policy holds at least GPU_FAN_LINK_LOST after LINK_LOST_SEC
         d.stop(signal.SIGKILL)
-        t0 = time.time()
-        check(wait(lambda: h.pwm()[0] == "2", 25), "BMC gone: the GPU fan back to auto (pwm1_enable 2)")
-        print("    after %.0f s (LINK_LOST_SEC=15)" % (time.time() - t0))
+        time.sleep(20)
+        p = h.pwm()
+        check(p[0] == "1" and int(p[1]) >= 102, "BMC gone: the agent holds the GPU fan: %s" % (p,))
         # the BMC back: the agent reconnects by itself and sets the policy again
         d.start()
         check(wait(lambda: d.state()["agent"]["connected"], 40), "BMC back: the agent reconnects")

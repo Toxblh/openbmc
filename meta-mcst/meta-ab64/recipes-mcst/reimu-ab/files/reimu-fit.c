@@ -4,7 +4,8 @@
  *
  *   reimu-fit FIT DIR      writes DIR/kernel, DIR/fdt, DIR/ramdisk
  *
- * FIT may be an MTD partition: only the FIT's own size is read.
+ * FIT may be an MTD partition: only the FIT's own size is read. Nothing in it
+ * is trusted: an offset or a length out of the image is refused (exit 1).
  */
 
 #include <arpa/inet.h>
@@ -16,6 +17,12 @@
 #define FDT_MAGIC 0xd00dfeed
 
 static uint32_t be(const unsigned char *p) { return ntohl(*(const uint32_t *)p); }
+
+static int corrupt(const char *file, const char *why)
+{
+    fprintf(stderr, "reimu-fit: %s: corrupt FIT: %s\n", file, why);
+    return 1;
+}
 
 int main(int argc, char **argv)
 {
@@ -44,7 +51,10 @@ int main(int argc, char **argv)
     if (fread(fit + sizeof hdr, 1, total - sizeof hdr, f) != total - sizeof hdr)
         return fprintf(stderr, "reimu-fit: %s: short read\n", argv[1]), 1;
     fclose(f);
+    if (ostruct > total || (ostruct & 3) || ostrings >= total)
+        return corrupt(argv[1], "bad offsets in the header");
 
+    /* (total <= 64 MiB, p <= total + 3 here: no sum below wraps) */
     for (p = ostruct; p + 4 <= total;)
     {
         uint32_t tok = be(fit + p);
@@ -52,12 +62,15 @@ int main(int argc, char **argv)
         if (tok == 1) /* BEGIN_NODE */
         {
             const char *name = (const char *)fit + p;
+            size_t nlen = strnlen(name, total - p);
+            if (nlen == total - p)
+                return corrupt(argv[1], "node name not terminated");
             depth++;
             if (depth == 2)
                 inimages = !strcmp(name, "images");
             if (depth == 3 && inimages)
                 data = type = NULL;
-            p += (strlen(name) + 4) & ~3u;
+            p += (nlen + 4) & ~3u;
         }
         else if (tok == 2) /* END_NODE: an image under /images is complete */
         {
@@ -80,12 +93,26 @@ int main(int argc, char **argv)
         }
         else if (tok == 3) /* PROP */
         {
-            uint32_t len = be(fit + p), nameoff = be(fit + p + 4);
-            const char *name = (const char *)fit + ostrings + nameoff;
+            uint32_t len, nameoff;
+            const char *name;
+            if (p + 8 > total)
+                return corrupt(argv[1], "property header past the end");
+            len = be(fit + p), nameoff = be(fit + p + 4);
+            if (len > total - p - 8)
+                return corrupt(argv[1], "property value past the end");
+            if (nameoff >= total - ostrings)
+                return corrupt(argv[1], "property name past the end");
+            name = (const char *)fit + ostrings + nameoff;
+            if (!memchr(name, 0, total - ostrings - nameoff))
+                return corrupt(argv[1], "property name not terminated");
             if (depth == 3 && inimages && !strcmp(name, "data"))
                 data = fit + p + 8, dlen = len;
             if (depth == 3 && inimages && !strcmp(name, "type"))
+            {
                 type = fit + p + 8;
+                if (!memchr(type, 0, len))
+                    return corrupt(argv[1], "image type not terminated");
+            }
             p += 8 + ((len + 3) & ~3u);
         }
         else if (tok == 4) /* NOP */

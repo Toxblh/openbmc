@@ -242,6 +242,16 @@ class Fs:
         with open(self.p(path), "w") as f:
             f.write(str(value))
 
+    def write_atomic(self, path, value):
+        """the whole new file or the old one, also across a power cut"""
+        p = self.p(path)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p + ".new", "w") as f:
+            f.write(str(value))
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(p + ".new", p)
+
     def glob(self, pattern):
         return sorted(self.un(x) for x in glob.glob(self.p(pattern)))
 
@@ -901,6 +911,17 @@ def bus_owner_state(fs, cfg):
             "modprobe_conf": fs.exists(BUS_CONF)}
 
 
+def bus_state_keep(fs, was):
+    """how pwmd was before we touched it, written down once: bus_owner remove
+    gives it back from this"""
+    state = fs.p(BUS_STATE)
+    if not os.path.exists(state):
+        os.makedirs(os.path.dirname(state), mode=0o700, exist_ok=True)
+        with open(state + ".new", "w") as f:
+            f.write("pwmd=%s\n" % was)
+        os.rename(state + ".new", state)
+
+
 class BusOwner:
     SETTLE = 3  # seconds bus_owner gives a stopped pwmd to be gone
 
@@ -924,8 +945,14 @@ class BusOwner:
         """SysV: enabled at boot again, or never disabled: the links say so"""
         self.boot_checked = True
         svc = Init(self.fs, self.run)
-        if svc.kind != "sysv" or svc.state("pwmd") not in PWMD_ON:
+        cur = svc.state("pwmd") if svc.kind == "sysv" else None
+        if cur not in PWMD_ON:
             return []
+        try:
+            bus_state_keep(self.fs, cur)
+        except OSError as e:  # one I2C master comes first
+            log_error("pwmd is being disabled at boot, but how it was can't be written down, --uninstall won't "
+                      "give it back: %s" % e)
         if svc.disable("pwmd"):
             log("the BMC is the only I2C master here: pwmd disabled at boot")
             return []
@@ -1062,11 +1089,7 @@ def bus_owner(fs, run, action, cfg):
     os.chmod(conf + ".new", 0o644)
     os.rename(conf + ".new", conf)
     cur = svc.state("pwmd")
-    if not os.path.exists(state):
-        os.makedirs(os.path.dirname(state), mode=0o700, exist_ok=True)
-        with open(state + ".new", "w") as f:
-            f.write("pwmd=%s\n" % cur)
-        os.rename(state + ".new", state)
+    bus_state_keep(fs, cur)
     ok = True
     if cur in PWMD_ON:
         ok = svc.disable_now("pwmd")
@@ -1103,6 +1126,24 @@ def edac_autoload(fs, run, cfg):
 
 
 # ------------------------------------------------------------------ GPU fan
+# the policy across a restart of the agent or of the host (so not in /run): with
+# the BMC down a new process has nothing else, and auto would let the idle driver
+# stop the fan. The BMC sends its own at every connection, which overwrites this
+GPU_POLICY = "/var/lib/reimu-hostd/policy"
+
+
+def remove_gpu_policy(fs):
+    for f in (GPU_POLICY, GPU_POLICY + ".new"):
+        try:
+            os.remove(fs.p(f))
+        except OSError:
+            pass
+    try:
+        os.rmdir(fs.p(os.path.dirname(GPU_POLICY)))
+    except OSError:
+        pass
+
+
 class GpuFan:
     """the policy the BMC asked for, kept on the card: auto (the driver's),
     manual DUTY (>= floor), turbo (100 % until a time, then the policy)"""
@@ -1112,7 +1153,7 @@ class GpuFan:
     # a card this hot goes to the driver, back below the second
     LOST_HOT, LOST_COOL = 70000, 60000
 
-    def __init__(self, fs, floor=30, link_lost_duty=40):
+    def __init__(self, fs, floor=30, link_lost_duty=40, load=True):
         self.fs, self.floor, self.link_lost_duty = fs, floor, link_lost_duty
         self.lost_hot = False
         self.mode, self.duty = "auto", None
@@ -1123,6 +1164,35 @@ class GpuFan:
         self.present = False
         self.last_err = None
         self.applied = None      # (enable, pwm) as last written/seen right
+        self.saved = None        # what GPU_POLICY holds
+        if load:
+            self._load_policy()
+
+    def _load_policy(self):
+        text = self.fs.read(GPU_POLICY)
+        if text is None:
+            return
+        try:
+            p = json.loads(text)
+        except (ValueError, RuntimeError):
+            p = None
+        mode, duty = (p.get("mode"), p.get("duty")) if isinstance(p, dict) else (None, None)
+        number = isinstance(duty, (int, float)) and not isinstance(duty, bool)
+        if mode == "auto" or (mode == "manual" and number and self.set_policy(mode, duty, save=False)[0]):
+            self.saved = {"mode": mode, "duty": self.duty}
+            log("GPU fan: the policy from before this start: %s" % (mode if mode == "auto" else "manual %g %%" % self.duty))
+        else:
+            log("GPU fan: %s is not a policy: ignored" % GPU_POLICY)
+
+    def _save_policy(self):
+        want = {"mode": self.mode, "duty": self.duty}
+        if want == self.saved:
+            return
+        try:
+            self.fs.write_atomic(GPU_POLICY, json.dumps(want) + "\n")
+            self.saved = want
+        except OSError as e:
+            log("GPU fan: the policy not saved: %s" % e)
 
     def hwmon(self):
         for d in self.fs.glob("/sys/bus/pci/devices/*"):
@@ -1133,9 +1203,11 @@ class GpuFan:
                     return h
         return None
 
-    def set_policy(self, mode, duty=None):
+    def set_policy(self, mode, duty=None, save=True):
         if mode == "auto":
             self.mode, self.duty = "auto", None
+            if save:
+                self._save_policy()
             return True, "auto"
         if mode != "manual":
             return False, "mode must be auto or manual"
@@ -1150,6 +1222,8 @@ class GpuFan:
             msg = "manual %d %% (raised from %g to the floor %d %%)" % (self.floor, d, self.floor)
             d = self.floor
         self.mode, self.duty = "manual", d
+        if save:
+            self._save_policy()
         return True, msg
 
     def turbo(self, minutes, now, cancel=False):
@@ -1625,7 +1699,8 @@ class Agent:
         self.secret_path, self.conf_path = secret_path, conf_path
         self.cred_mtimes = (_mtime(secret_path), _mtime(conf_path))
         self.col = Collector(fs, run, cfg)
-        self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"], link_lost_duty=cfg["GPU_FAN_LINK_LOST"])
+        # not allowed: the BMC's word is ignored, so is what it once said
+        self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"], link_lost_duty=cfg["GPU_FAN_LINK_LOST"], load="gpu_fan" in cfg["ALLOW"])
         self.hub = UsbHub(fs, cfg)
         self.bus = BusOwner(fs, run, cfg)
         self.ctl = Controller(cfg, self.fan, run, self.col)
@@ -1941,6 +2016,7 @@ def do_uninstall():
         raise SystemExit("run with sudo")
     remove_service(Fs(), run_cmd)
     bus_owner(Fs(), run_cmd, "remove", load_config())
+    remove_gpu_policy(Fs())
     for f in (os.path.join(LIB, "reimu-hostd.py"), SECRET):
         if os.path.exists(f):
             os.remove(f)
@@ -1978,7 +2054,7 @@ def main(argv):
             log_error("the BMC's I2C buses: %s" % e)
             return 1
     elif cmd == "restore-auto":
-        f = GpuFan(fs)
+        f = GpuFan(fs, load=False)
         f.touched = True
         f.restore_auto("restore-auto")
     elif cmd == "pair":

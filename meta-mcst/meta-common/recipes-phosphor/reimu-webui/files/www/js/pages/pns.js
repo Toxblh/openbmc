@@ -32,6 +32,14 @@ const run = (action, arg = "") => call("Run", [action, arg]);
 
 const hostOn = () => appState.power !== "Off";
 
+// the chip as last read: reads empty or has no image (a chip.json of an older
+// firmware says nothing of the magic); never read: not known
+const noImage = (chip) => {
+  if (!chip) return false;
+  const i = chip.info || {};
+  return i.empty || i.magic === false || !i.boot;
+};
+
 function sha256hex(buf) {
   return crypto.subtle.digest("SHA-256", buf).then((d) => [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join(""));
 }
@@ -294,6 +302,17 @@ export function pnsFlashCard() {
             "Перед записью весь флеш будет прочитан в резервную копию. Пишутся только отличающиеся блоки, каждый читается обратно; затем весь флеш сверяется. Платформу до конца записи (несколько минут) включить нельзя.",
         );
       });
+      // a plain write refuses such a chip: it may just not have connected
+      const blank = noImage(st.chip) ? h("button", { class: "btn danger", disabled: running || on || busy || !(c && c.ok) }, "Записать на флеш без образа") : null;
+      if (blank)
+        blank.addEventListener("click", () =>
+          act(
+            "write-blank",
+            "upload",
+            `На флеше ПНС нет образа: он читается пустым или повреждён. Возможно, он просто не подключился к BMC: проверьте это, если не ждали такого.\n\nЗаписать образ ${c.name} (${fmtBytes(up.size)})?\n\n` +
+              "Плата проверяется, как обычно, по device tree на флеше; если его там нет, запись будет отменена. Перед записью весь флеш будет прочитан в резервную копию.",
+          ),
+        );
       const recheck = h("button", { class: "btn", disabled: busy }, "Проверить");
       recheck.addEventListener("click", async () => {
         try {
@@ -312,7 +331,7 @@ export function pnsFlashCard() {
       section.append(
         h("div", { class: "small" }, `Загружен: ${(c && c.name) || "образ"}, ${fmtBytes(up.size)}, ${when(up.time)} `, c ? h("span", { class: `badge ${c.ok ? "ok" : "err"}` }, c.ok ? "годен" : "не годен") : h("span", { class: "badge" }, "не проверен")),
         c ? checkInfo(c) : null,
-        h("div", { class: "row" }, c ? null : recheck, write, drop),
+        h("div", { class: "row" }, c ? null : recheck, write, blank, drop),
       );
     }
     section.append(h("p", { class: "muted small" }, "Из консоли BMC: reimu-pns-flash check|write ФАЙЛ, reimu-pns-flash read; update-host-flash URL."));

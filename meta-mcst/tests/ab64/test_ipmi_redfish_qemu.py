@@ -57,6 +57,7 @@ DOCKER = os.environ.get("IPMI_DOCKER", "reimu")
 # key -> why the new firmware may do worse there (or differ) than the stock one
 KNOWN = {
     "redfish.account.ldap": "LDAP/Kerberos removed from the A/B image for space (conscious)",
+    "crawl./redfish/v1/Managers/bmc/EthernetInterfaces/eth1*": "no eth1: disabled in the device tree, bug 68",
     "crawl./redfish/v1/AccountService/LDAP": "LDAP removed",
 }
 # keys that must pass on the new firmware, whatever the stock one does
@@ -1191,8 +1192,9 @@ def report():
         c = sym[nw[0]] if nw else "n/a"
         note = ""
         if "stock" in R and "new" in R and st and st[0] is True and (not nw or nw[0] is False):
-            if k in KNOWN or any(k.startswith(x) for x in KNOWN if x.endswith("*")):
-                note = "  [known: %s]" % KNOWN[k]
+            why = KNOWN.get(k) or next((v for x, v in KNOWN.items() if x.endswith("*") and k.startswith(x[:-1])), None)
+            if why:
+                note = "  [known: %s]" % why
             else:
                 regress.append(k)
                 note = "  [REGRESSION]"

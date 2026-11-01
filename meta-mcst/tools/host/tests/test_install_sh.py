@@ -822,6 +822,24 @@ class SysvInstall(SysvBase):
         self.assertEqual(len(now), 1)
         self.assertNotEqual(first, now, "restarted: the new code runs")
 
+    def test_uninstall_removes_the_gpu_policy(self):
+        self.make_paired()
+        self.mkrc()
+        self.install()
+        d = self.p("var/lib/reimu-hostd")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "policy"), "w").write('{"mode": "manual", "duty": 50}\n')
+        rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(d), "the file and the directory it leaves empty")
+        self.install()
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "policy"), "w").write('{"mode": "auto", "duty": null}\n')
+        open(os.path.join(d, "not-ours"), "w").write("x")
+        rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.listdir(d), ["not-ours"])
+
     def test_uninstall_removes_everything(self):
         self.make_paired()
         self.mkrc()
@@ -1003,6 +1021,92 @@ class InitScript(SysvBase):
         rc, out = self.do("start")
         self.assertEqual(rc, 0, out)
         self.wait_agents(1)
+
+    # the lock's holder: a pid file with a live action of this script in it
+    def lock_dir(self, pid=None):
+        d = self.p("var/run/reimu-hostd.lock")
+        os.makedirs(d)
+        if pid is not None:
+            open(os.path.join(d, "pid"), "w").write(pid)
+        return d
+
+    def holder(self, secs):
+        """an action of this script, by name, holding the lock (`restart` over a stubborn agent)"""
+        d = self.p("var/run/reimu-hostd.lock")
+        f = self.p("var/tmp/reimu-hostd")
+        os.makedirs(os.path.dirname(f))
+        open(f, "w").write('mkdir "%s"\necho $$ > "%s/pid"\nsleep %d\nrm -rf "%s"\n' % (d, d, secs, d))
+        os.makedirs(self.p("var/run"), exist_ok=True)
+        p = subprocess.Popen(self.SHELL.split() + [f, "restart"], env=self.env)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        end = time.time() + 5
+        while not os.path.exists(os.path.join(d, "pid")) and time.time() < end:
+            time.sleep(0.05)
+        return p, d
+
+    def bg(self, action):
+        p = subprocess.Popen(self.SHELL.split() + [self.init, action], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait(), p.stdout.close()))
+        return p
+
+    def test_lock_live_holder_is_waited_for_however_long(self):
+        h, d = self.holder(40)
+        t0 = time.time()
+        start = self.bg("start")
+        time.sleep(36)  # the old rule broke in at 30 s
+        self.assertIsNone(start.poll(), "the start must still wait")
+        self.assertEqual(open(os.path.join(d, "pid")).read().strip(), str(h.pid), "the holder's lock still its own")
+        self.assertEqual(self.loops(), [])
+        self.assertFalse(os.path.exists(self.p("var/run/reimu-hostd.pid")))
+        out = start.communicate(timeout=30)[0].decode()
+        self.assertEqual(start.returncode, 0, out)
+        self.assertEqual(h.wait(timeout=1), 0)
+        self.assertGreaterEqual(time.time() - t0, 39, "started only when the holder was done")
+        self.wait_agents(1)
+        self.assertEqual(len(self.loops()), 1)
+
+    def timed_start(self):
+        t0 = time.time()
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        self.wait_agents(1)
+        return time.time() - t0
+
+    def test_lock_holder_pid_is_a_stranger(self):
+        p = subprocess.Popen(["sleep", "100"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        self.lock_dir("%d\n" % p.pid)
+        self.assertLess(self.timed_start(), 10, "not ours: taken at once")
+
+    def test_lock_holder_pid_reused_by_our_own_agent(self):
+        """the name alone isn't an action of the script: it would wait for ever"""
+        p = subprocess.Popen(["sh", "-c", "sleep 100; :", "/elsewhere/reimu-hostd.py", "run"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        self.lock_dir("%d\n" % p.pid)
+        self.assertLess(self.timed_start(), 10)
+
+    def test_lock_garbage_pid(self):
+        self.lock_dir("not a pid\n")
+        self.assertLess(self.timed_start(), 10)
+
+    def test_lock_empty_pid_taken_after_a_short_while(self):
+        self.lock_dir()
+        self.assertLess(self.timed_start(), 15)
+
+    def test_lock_empty_pid_then_its_holder_writes_it(self):
+        """between mkdir and echo: the holder is alive, the bound must not break in"""
+        p = subprocess.Popen(self.SHELL.split() + ["-c", "sleep 8; :", self.init, "restart"], env=self.env)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        d = self.lock_dir()
+        start = self.bg("start")
+        time.sleep(1)
+        open(os.path.join(d, "pid"), "w").write("%d\n" % p.pid)
+        time.sleep(5)
+        self.assertIsNone(start.poll(), "waits for the holder")
+        self.assertTrue(os.path.isdir(d))
+        p.wait()
+        shutil.rmtree(d)
+        self.assertEqual(start.wait(timeout=20), 0)
 
     def test_supervisor_killed_orphan_agent_no_second_copy(self):
         self.do("start")

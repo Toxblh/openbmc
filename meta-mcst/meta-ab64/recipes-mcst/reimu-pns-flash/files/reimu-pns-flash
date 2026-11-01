@@ -59,7 +59,9 @@
 # /var/lib/reimu-pns/chip.json (versions last read from the chip),
 # /tmp/reimu-pns/backup-*.bin.gz + .sha256 (RAM, ~1 MiB each: the chip is
 # mostly erased), /var/lib/reimu-pns/backup-last.bin.gz
-# (the chip before the last write, kept on the BMC flash when small).
+# (the chip before the last write, kept on the BMC flash when small),
+# /var/lib/reimu-pns/write-unfinished (a write began and wasn't proven: what
+# the chip holds now is no backup, backup-last stays what it is).
 # A backup's .sha256: "SHA256  NAME", then "# reimu-pns-flash: bmc=MAC
 # jedec=ID size=BYTES date=... board=COMPATIBLE" (who read it, from what).
 set -u
@@ -73,6 +75,7 @@ KEEP_MAX=${REIMU_PNS_KEEP_MAX:-4194304}
 LOCK=$RUN/lock
 STATE=$RUN/state.json
 CHIP=$KEEP/chip.json
+UNFINISHED=$KEEP/write-unfinished
 
 BOOT_END=$((0x490000))
 TRAILER=$((0x48fff8))
@@ -233,7 +236,7 @@ cleanup() {
             log "PNS flash switched back to the host"
         else
             log "CAN'T SWITCH THE PNS FLASH BACK TO THE HOST (GPIO_SPI_CONNECT): the platform won't boot"
-            S_WARN="Не удалось переключить флеш ПНС обратно на хост"
+            S_WARN="${S_WARN:+$S_WARN }Не удалось переключить флеш ПНС обратно на хост"
         fi
         connected=
     fi
@@ -480,8 +483,9 @@ info() {
 }
 
 info_json() {
-    printf '{"size":%d,"boot":%s,"board":%s,"cpu":%s,"vbios":%s,"empty":%s,"dtb":' "$I_SIZE" \
-        "$(ja "$I_BOOT")" "$(ja "$I_TAG")" "$(ja "$I_CPU")" "$(ja "$I_VBIOS")" "$([ -n "$I_EMPTY" ] && echo true || echo false)"
+    printf '{"size":%d,"boot":%s,"board":%s,"cpu":%s,"vbios":%s,"magic":%s,"empty":%s,"dtb":' "$I_SIZE" \
+        "$(ja "$I_BOOT")" "$(ja "$I_TAG")" "$(ja "$I_CPU")" "$(ja "$I_VBIOS")" \
+        "$([ -n "$I_MAGIC" ] && echo true || echo false)" "$([ -n "$I_EMPTY" ] && echo true || echo false)"
     if [ -n "$I_DTB" ]; then
         printf '{"valid":true,"size":%d,"version":%s,"model":%s,"compatible":%s}}' "$I_DTBSIZE" \
             "$(ja "$I_DTBVER")" "$(ja "$I_MODEL")" "$(ja "$I_COMPAT")"
@@ -672,6 +676,13 @@ do_write() {
         CHIPSIZE=${CHIPSIZE:-67108864}; room 2
         img=$(tmp image) sidecar=${f%.gz}.sha256
         gzip -dc "$f" > $img 2>/dev/null || die "Не удалось распаковать $f"
+    else
+        # the job's own copy: all below reads this, whatever the path holds
+        # later (a link of a symlink would still follow the path)
+        [ -f "$f" ] || die "Файл $f не найден"
+        img=$(tmp image)
+        { [ ! -L "$f" ] && ln "$f" $img 2>/dev/null; } || cp "$f" $img ||
+            die "Не удалось сохранить образ $f для записи в $WORK"
     fi
     # the image as such (the board once the chip is read)
     R_COMPAT=; check_image "$img" 1 || die "$(printf '%s' "$C_ERR" | tr '\n' ' ' | sed 's/ *$//')"
@@ -693,15 +704,17 @@ do_write() {
     bk=$(tmp chip)
     backup $bk 2 40 || die "Два чтения флеша ПНС не совпадают: запись отменена, флеш не изменён"
     info $bk; mark $bk.sha256
+    chip_magic=$I_MAGIC
     name=backup-$(date +%Y%m%d-%H%M%S).bin
     pack $bk $name
     prune 4 "$f"
     S_BACKUP=$WORK/$name.gz
+    # (before a refusal too: the page offers write-blank by what this says)
+    save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
     [ -n "$I_EMPTY" ] && [ -z "$I_MAGIC" ] && [ $blank = 0 ] &&
         die "Флеш ПНС читается пустым: он не подключился к BMC или пуст. Запись отменена (--blank-ok: писать в пустой)"
     [ -z "$I_MAGIC" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
         die "На флеше ПНС нет образа Lintel: он не подключился к BMC или повреждён. Запись отменена (--blank-ok: писать всё равно)"
-    save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
     ref_from_info "флеш"
     # no device tree on the chip to check the board against: only a backup
     # this BMC made of this chip is taken as this board's
@@ -725,6 +738,7 @@ do_write() {
     if [ "$(filesum $bk 0 $len)" = "$tsum" ]; then
         S_CHANGED=0
         info $t; save_chip write $(head -1 $bk.sha256 | cut -d' ' -f1)
+        unfinished_clear
         switch 0 && connected=
         [ "$f" = $WORK/upload.bin ] && rm -f "$f"
         finish ok "Флеш ПНС уже содержит этот образ: ничего не записано"
@@ -733,8 +747,23 @@ do_write() {
     fi
 
     # the chip before this write, on the BMC flash (not for a write that
-    # changes nothing: "last" stays the chip before the last real write)
-    keep_backup $WORK/$name
+    # changes nothing: "last" stays the chip before the last real write).
+    # Only a good chip: after a write that didn't finish it may be half-written
+    # and still have its magic (written from offset 0), and "last" may be the
+    # only good copy left
+    keep_warn=
+    if [ -e $UNFINISHED ]; then
+        log "an earlier write didn't finish ($UNFINISHED): the chip isn't kept as backup-last"
+    elif [ -z "$chip_magic" ]; then
+        log "no image on the chip: it isn't kept as backup-last"
+    elif ! keep_backup $WORK/$name; then
+        log "the backup wasn't saved to the BMC flash: only $WORK/$name.gz, in RAM"
+        keep_warn="; резервная копия на флеш BMC не сохранена"
+        S_WARN="${S_WARN:+$S_WARN }Резервная копия не сохранена на флеш BMC: она только в памяти ($WORK/$name.gz) и пропадёт при его перезагрузке"
+    fi
+    # (nothing written yet: without the marker a failed write here could cost
+    # the good copy on the next try)
+    unfinished_set || die "Не удалось записать отметку о начале записи ($UNFINISHED): запись отменена, флеш не изменён"
 
     # erase + write the blocks that differ, every one read back (reimu-flash);
     # an I/O error: again (it rewrites only what still differs)
@@ -765,6 +794,7 @@ do_write() {
         [ "$s" = "$(filesum $bk $len $((CHIPSIZE - len)))" ] ||
             die "Сверка не прошла: флеш за пределами образа (после 0x$(printf %x $len)) изменился"
     fi
+    unfinished_clear
     switch 0 && connected=
     p=$(power)
     [ "$p" = 0 ] || S_WARN="${S_WARN:+$S_WARN }Платформа включилась во время записи (флеш был отключён от неё)"
@@ -780,7 +810,7 @@ do_write() {
     # the whole chip now (both parts were read back above)
     csum=$( { cat $t; dd if=$bk bs=4096 skip=$((len / 4096)) 2>/dev/null; } | sha256sum | cut -d' ' -f1)
     save_chip write $csum
-    finish ok "Флеш ПНС записан и сверен: $(printf '0x0-0x%x' $len), изменено блоков: ${S_CHANGED:-?}; ПНС $I_BOOT"
+    finish ok "Флеш ПНС записан и сверен: $(printf '0x0-0x%x' $len), изменено блоков: ${S_CHANGED:-?}; ПНС $I_BOOT$keep_warn"
     rm -f $WORK/.tmp.$$.target
     # RAM: an uploaded image is on the chip now
     [ "$f" = $WORK/upload.bin ] && rm -f "$f"
@@ -789,15 +819,31 @@ do_write() {
     return 0
 }
 
-# the chip before the write (WORK/NAME.gz), on the BMC flash if it is small
+# the chip before the write (WORK/NAME.gz), on the BMC flash if it is small;
+# 1 if it isn't there now
 keep_backup() {
     mkdir -p $KEEP
     [ "$(fsize $1.gz)" -le "$KEEP_MAX" ] &&
         cp $1.gz $KEEP/backup-last.bin.gz.tmp && cp $1.sha256 $KEEP/backup-last.bin.sha256.tmp &&
         mv $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.gz &&
-        mv $KEEP/backup-last.bin.sha256.tmp $KEEP/backup-last.bin.sha256 ||
-        rm -f $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.sha256.tmp
-    return 0
+        mv $KEEP/backup-last.bin.sha256.tmp $KEEP/backup-last.bin.sha256 && return 0
+    rm -f $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.sha256.tmp
+    return 1
+}
+
+# the marker of a write in progress: on the disk before the first erase (it
+# and the backup kept just before it survive a power cut), gone only once the
+# chip is proven good
+unfinished_set() {
+    [ -e $UNFINISHED ] && return 0
+    { date +%Y-%m-%dT%H:%M:%S > $UNFINISHED; } 2>/dev/null && sync && return 0
+    rm -f $UNFINISHED
+    return 1
+}
+unfinished_clear() {
+    [ -e $UNFINISHED ] || return 0
+    rm -f $UNFINISHED
+    sync
 }
 
 do_status() {

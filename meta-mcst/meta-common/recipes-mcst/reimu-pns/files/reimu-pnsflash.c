@@ -10,15 +10,19 @@
  *     method Run(s action, s arg) -> s     JSON {"ok", "message", ...}
  *        check      -            check the uploaded image ("check": the result)
  *        upload-done SHA256      the upload is complete: compare its sha256,
- *                                then check it
- *        discard    -            delete the uploaded image
+ *                                then check it (refused while a job runs)
+ *        discard    -            delete the uploaded image (refused while a job
+ *                                runs)
  *        read       -            back up the chip (a job)
  *        write      NAME         write "upload", a backup (backup-*.bin.gz) or
  *        write-any-board NAME    "last" (the chip before the last write) (a job)
+ *        write-blank NAME        as write, also onto a chip that reads empty or
+ *                                has no image (--blank-ok); the board is checked
  *        disconnect -            give the flash back to the host
  *     method Upload(t offset, s data) -> s
  *        data (base64) at offset of the upload; offset 0 starts a new one;
- *        "ff:N": N bytes of 0xff (the browser skips erased parts)
+ *        "ff:N": N bytes of 0xff (the browser skips erased parts); refused
+ *        while a job runs
  *     method Download(s name, t offset, u length) -> s
  *        a backup (backup-*.bin.gz or "last"), unpacked: offset 0 unpacks it,
  *        the last chunk drops the unpacked copy;
@@ -320,6 +324,23 @@ static int start_job(sd_bus_message *m, const char *what, char *const args[])
     return reply(m, 1, msg, NULL);
 }
 
+/* the unit of a job is there (unknown: as if it is): the upload stays as it is
+ * meanwhile. A job just ending, in its ExecStopPost, is waited for as in
+ * start_job. */
+#define JOB_RUNNING_MSG "Идёт операция с флешем ПНС: загрузка и удаление образа возможны после её окончания"
+static int job_running(void)
+{
+    char *ask[] = { "/bin/systemctl", "is-active", "reimu-pns-job", NULL };
+    char state[64];
+    for (int i = 0;; i++)
+    {
+        run_tool(ask, state, sizeof(state));
+        if (strcmp(state, "deactivating") || i >= 20) break;
+        sleep(1);
+    }
+    return strcmp(state, "inactive") && strcmp(state, "failed") && strcmp(state, "unknown");
+}
+
 static int check_upload(sd_bus_message *m, const char *path, const char *okmsg)
 {
     char *argv[] = { (char *)TOOL, "check", (char *)path, "--json", NULL };
@@ -369,6 +390,7 @@ static int method_run(sd_bus_message *m, void *ud, sd_bus_error *err)
     }
     if (!strcmp(action, "upload-done"))
     {
+        if (job_running()) return reply(m, 0, JOB_RUNNING_MSG, NULL);
         char part[300], sum[65];
         snprintf(part, sizeof(part), "%s.part", up);
         if (access(part, R_OK)) return reply(m, 0, "Загрузка не начата", NULL);
@@ -383,6 +405,7 @@ static int method_run(sd_bus_message *m, void *ud, sd_bus_error *err)
     }
     if (!strcmp(action, "discard"))
     {
+        if (job_running()) return reply(m, 0, JOB_RUNNING_MSG, NULL);
         char part[300];
         snprintf(part, sizeof(part), "%s.part", up);
         unlink(part);
@@ -395,12 +418,13 @@ static int method_run(sd_bus_message *m, void *ud, sd_bus_error *err)
         char *args[] = { "read", NULL };
         return start_job(m, "Чтение флеша ПНС", args);
     }
-    if (!strcmp(action, "write") || !strcmp(action, "write-any-board"))
+    if (!strcmp(action, "write") || !strcmp(action, "write-any-board") || !strcmp(action, "write-blank"))
     {
         if (name_to_path(arg, path, sizeof(path)) || access(path, R_OK))
             return reply(m, 0, "Нет такого образа или резервной копии", NULL);
         if (!host_is_off(bus, why, sizeof(why))) return reply(m, 0, why, NULL);
-        char *args[] = { "write", path, !strcmp(action, "write") ? NULL : "--any-board", NULL };
+        char *opt = !strcmp(action, "write") ? NULL : !strcmp(action, "write-blank") ? "--blank-ok" : "--any-board";
+        char *args[] = { "write", path, opt, NULL };
         return start_job(m, "Запись флеша ПНС", args);
     }
     if (!strcmp(action, "disconnect"))
@@ -470,6 +494,7 @@ static int method_upload(sd_bus_message *m, void *ud, sd_bus_error *err)
     const char *data;
     int r = sd_bus_message_read(m, "ts", &off, &data);
     if (r < 0) return r;
+    if (job_running()) return reply(m, 0, JOB_RUNNING_MSG, NULL);
     char part[300];
     snprintf(part, sizeof(part), "%s/upload.bin.part", WORK);
     mkdir(WORK, 0755);

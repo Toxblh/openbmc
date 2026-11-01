@@ -338,7 +338,9 @@ def t_smoke(b):
     to = b.out("grep FallbackTimeout /etc/ip-fallback/fallback-eth0.conf | cut -d= -f2").strip()
     check(to.isdigit(), "fallback-eth0.conf: FallbackTimeout %s" % to)
     check(rc("[ ! -e /sys/class/net/eth1 ]") == 0, "no eth1 (bug 68)")
-    check("exited" in b.out("systemctl show -p SubState ip-fallback") or b.out("systemctl is-active ip-fallback").strip() == "active", "ip-fallback ran without eth1")
+    # Type=simple: running while it counts, dead once eth0 has its address
+    check(b.out("systemctl show -p Result --value ip-fallback").strip() == "success" and
+          b.out("systemctl show -p ExecMainStartTimestampMonotonic --value ip-fallback").strip() not in ("", "0"), "ip-fallback ran without eth1")
     check(rc("journalctl -b -u ip-fallback --no-pager | grep -q 'eth1'") != 0, "ip-fallback: nothing about eth1")
     check("192.168.1.1" not in b.out("ip addr show eth0"), "eth0, with DHCP: no fallback address")
 

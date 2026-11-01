@@ -42,6 +42,7 @@ Run the tests:
     cd e2e && npm install playwright@1.56 && export CHROME=/path/to/chromium
     node console.spec.mjs       # consoles: 20000-line history, timestamps, input, xterm
     node console-size.stub.mjs  # no BMC: terminal size vs the host's 80 columns; PY=python with pyte: real zsh, vim
+    node pns-blank.stub.mjs     # no BMC: the PNS card's button for a chip with no image
     node media.spec.mjs         # RW virtual media: OPFS, files, snapshot, CD-ROM
     node media-stress.spec.mjs  # parallel I/O, fsck, browser crash recovery
     node vm-buffer.spec.mjs     # bmcweb NBD buffer overflow regression

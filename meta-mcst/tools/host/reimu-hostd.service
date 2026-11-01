@@ -10,7 +10,7 @@ ExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-hostd.py run
 ExecStopPost=/usr/bin/python3 /usr/local/lib/reimu/reimu-hostd.py restore-auto
 Restart=always
 RestartSec=5
-# reads /sys, /proc; writes only the amdgpu fan files; runs systemctl/modprobe
+# reads /sys, /proc; writes the amdgpu fan files and /var/lib/reimu-hostd; runs systemctl/modprobe
 # from its allow-list
 ProtectHome=yes
 PrivateTmp=yes

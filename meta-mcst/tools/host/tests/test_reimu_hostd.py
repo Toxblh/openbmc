@@ -441,6 +441,114 @@ class TestGpuFan(Base):
     def hw(self, k):
         return self.t.get(self.HW + "/" + k)
 
+    # the policy kept across a restart (of the agent, of the host)
+    def test_policy_survives_a_restart_with_the_bmc_down(self):
+        self.fan().set_policy("manual", 50)
+        f = self.fan()  # the new process, no word from the BMC yet
+        self.assertEqual((f.mode, f.duty), ("manual", 50))
+        self.assertTrue(f.lost_hold())
+        f.tick(0, False)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", "128"))
+
+    def test_policy_low_duty_held_at_link_lost_duty_after_a_restart(self):
+        self.fan().set_policy("manual", 30)
+        f = self.fan(link_lost_duty=40)
+        f.tick(0, False)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", str(int(40 * 255 / 100.0 + 0.5))))
+
+    def test_policy_hot_or_unknown_card_goes_to_the_driver_after_a_restart(self):
+        self.fan().set_policy("manual", 50)
+        self.t.put(self.HW + "/temp1_input", "71000")
+        f = self.fan()
+        f.tick(0, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+        self.t.rm(self.HW + "/temp1_input")
+        f = self.fan()
+        f.tick(0, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+
+    def test_policy_auto_from_the_bmc_overwrites(self):
+        self.fan().set_policy("manual", 50)
+        self.fan().set_policy("auto")
+        f = self.fan()
+        self.assertEqual(f.mode, "auto")
+        self.assertFalse(f.lost_hold())
+        f.tick(0, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+
+    def test_policy_a_bad_file_counts_for_nothing(self):
+        for bad in ("", "{", "[]", "1", "null", '{"duty":50}', '{"mode":"turbo","duty":50}', '{"mode":"manual"}',
+                    '{"mode":"manual","duty":null}', '{"mode":"manual","duty":"50"}', '{"mode":"manual","duty":true}',
+                    '{"mode":"manual","duty":101}', '{"mode":"manual","duty":-1}', '{"mode":"manual","duty":NaN}',
+                    '{"mode":["manual"],"duty":50}', "\xff\xfe\x00"):
+            self.t.put(hd.GPU_POLICY, bad)
+            f = self.fan()
+            self.assertEqual((f.mode, f.duty), ("auto", None), bad)
+            self.assertFalse(f.lost_hold(), bad)
+
+    def test_policy_valid_file_read_with_the_floor(self):
+        self.t.put(hd.GPU_POLICY, '{"mode": "manual", "duty": 10}')
+        f = self.fan()
+        self.assertEqual((f.mode, f.duty), ("manual", 30))
+
+    def test_policy_refused_is_not_written(self):
+        self.fan().set_policy("manual", 50)
+        self.assertFalse(self.fan().set_policy("manual", 500)[0])
+        self.assertEqual(self.fan().duty, 50)
+
+    def test_policy_written_atomically(self):
+        f = self.fan()
+        f.set_policy("manual", 50)
+        self.assertEqual(os.listdir(os.path.dirname(self.t.p(hd.GPU_POLICY))), [os.path.basename(hd.GPU_POLICY)])
+        rename, hd.os.rename = hd.os.rename, lambda *a: (_ for _ in ()).throw(OSError("no"))
+        try:
+            ok, _ = f.set_policy("manual", 60)
+        finally:
+            hd.os.rename = rename
+        self.assertTrue(ok, "not saved: still the policy of this process")
+        self.assertEqual(f.duty, 60)
+        self.assertEqual(self.fan().duty, 50, "the old file whole")
+
+    def test_policy_unwritable_directory_does_not_raise(self):
+        self.t.put("/var/lib/reimu-hostd", "a file where the directory should be")
+        ok, _ = self.fan().set_policy("manual", 50)
+        self.assertTrue(ok)
+
+    def test_policy_same_again_is_not_written_again(self):
+        f = self.fan()
+        f.set_policy("manual", 50)
+        ino = os.stat(self.t.p(hd.GPU_POLICY)).st_ino
+        f.set_policy("manual", 50)
+        self.assertEqual(os.stat(self.t.p(hd.GPU_POLICY)).st_ino, ino)
+        g = self.fan()
+        g.set_policy("manual", 50)
+        self.assertEqual(os.stat(self.t.p(hd.GPU_POLICY)).st_ino, ino, "a reconnect sends it again: no write")
+
+    def test_policy_stays_through_restore_auto(self):
+        f = self.fan()
+        f.set_policy("manual", 50)
+        f.tick(0, True)
+        f.restore_auto("agent stopped")
+        self.assertEqual(self.hw("pwm1_enable"), "2", "still given back at stop")
+        self.assertEqual(self.fan().mode, "manual")
+
+    def test_policy_not_applied_when_the_host_does_not_allow_it(self):
+        self.fan().set_policy("manual", 50)
+        cfg = hd.parse_config("ALLOW=diag")
+        a = hd.Agent(cfg, {"KEY": "00", "FINGERPRINT": "00"}, self.fs, lambda argv, timeout=10: (127, ""))
+        self.assertEqual(a.fan.mode, "auto")
+
+    def test_policy_removed_with_its_directory_if_empty(self):
+        self.fan().set_policy("manual", 50)
+        hd.remove_gpu_policy(self.fs)
+        self.assertFalse(os.path.exists(self.t.p(os.path.dirname(hd.GPU_POLICY))))
+        hd.remove_gpu_policy(self.fs)  # twice: nothing there
+        self.fan().set_policy("manual", 50)
+        self.t.put("/var/lib/reimu-hostd/other", "x")
+        hd.remove_gpu_policy(self.fs)
+        self.assertFalse(os.path.exists(self.t.p(hd.GPU_POLICY)))
+        self.assertTrue(os.path.exists(self.t.p("/var/lib/reimu-hostd/other")))
+
     def test_manual(self):
         f = self.fan()
         ok, msg = f.set_policy("manual", 50)
@@ -1464,6 +1572,38 @@ class TestInitChoice(SysvBase):
 class TestPwmdSysv(SysvBase):
     def running(self):
         self.t.put("/proc/4242/comm", "pwmd")
+
+    # installed unpaired, paired later: the first bus_owner run is the agent's
+    def test_boot_check_writes_down_what_it_disables(self):
+        self.pwmd_script()
+        self.owner().tick()
+        self.assertEqual(self.t.get(hd.BUS_STATE), "pwmd=enabled")
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["K20pwmd"])
+        self.assertTrue(hd.bus_owner(self.fs, self.run, "remove", self.cfg))
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["S20pwmd"], "--uninstall gives it back")
+        self.assertFalse(os.path.exists(self.t.p(hd.BUS_STATE)))
+
+    def test_boot_check_keeps_what_was_written_down(self):
+        self.pwmd_script()
+        self.t.put(hd.BUS_STATE, "pwmd=disabled")  # the admin enabled it after our install
+        self.owner().tick()
+        self.assertEqual(self.t.get(hd.BUS_STATE), "pwmd=disabled")
+
+    def test_boot_check_disables_even_if_it_cant_write_down(self):
+        self.pwmd_script()
+        self.t.put("/etc/reimu-hostd", "a file where the directory should be")
+        self.owner().tick()
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["K20pwmd"], "one I2C master first")
+        self.assertTrue(self.errors(), self.logged)
+
+    def test_boot_check_and_install_write_the_same(self):
+        self.pwmd_script()
+        self.owner().tick()
+        at_boot = open(self.t.p(hd.BUS_STATE)).read()
+        os.remove(self.t.p(hd.BUS_STATE))
+        os.rename(self.t.p("/etc/rc3.d/K20pwmd"), self.t.p("/etc/rc3.d/S20pwmd"))
+        hd.bus_owner(self.fs, self.run, "install", self.cfg)
+        self.assertEqual(open(self.t.p(hd.BUS_STATE)).read(), at_boot)
 
     def test_stopped_by_its_script(self):
         self.pwmd_script()

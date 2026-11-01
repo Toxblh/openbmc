@@ -56,6 +56,9 @@ ours() { # pid pattern
 }
 is_loop() { ours "$1" "$NAME.* _loop"; }
 is_agent() { ours "$1" "$NAME.py"; }
+# this script running start, stop, restart or force-reload (not _loop, status,
+# the agent's "reimu-hostd.py run" or "restore-auto"): cmdline's NULs are spaces
+is_action() { ours "$1" "$NAME[^ ]* [srf][a-z-]*[tpd] "; }
 loop_pid() { p=$(cat "$PIDFILE" 2>/dev/null); is_loop "$p" && echo "$p"; }
 agent_pid() { p=$(cat "$AGENTPID" 2>/dev/null); is_agent "$p" && echo "$p"; }
 
@@ -109,20 +112,26 @@ do_loop() {
 }
 
 # ------------------------------------------------------------------ the actions
-# one action at a time: never two copies
+# one action at a time: never two copies. A live holder is waited for however
+# long it takes (restart can take over 30 s), never timed out
 lock() {
     i=0
     while ! mkdir "$LOCK" 2>/dev/null; do
         h=$(cat "$LOCK/pid" 2>/dev/null)
-        if [ -n "$h" ] && ! kill -0 "$h" 2>/dev/null; then
-            rm -rf "$LOCK" # its holder died
-            continue
-        fi
-        i=$((i + 1))
-        if [ $i -gt 30 ]; then # its holder hung, or the pid is someone else's now
-            rm -rf "$LOCK"
+        if [ -z "$h" ]; then
+            # a holder between its mkdir and its echo: a moment. Longer: it died there
+            i=$((i + 1))
+            if [ $i -gt 5 ]; then
+                rm -rf "$LOCK"
+                i=0
+                continue
+            fi
+        elif ! is_action "$h"; then
+            rm -rf "$LOCK" # its holder died, the pid is someone else's now
             i=0
             continue
+        else
+            i=0
         fi
         sleep 1
     done

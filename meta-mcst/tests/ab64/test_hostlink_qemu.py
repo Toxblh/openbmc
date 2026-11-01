@@ -327,9 +327,10 @@ def t_e2e():
 def t_drop(b, h):
     print("== drop", flush=True)
     b.ssh("systemctl stop reimu-hostlink")
-    t0 = time.time()
-    check(wait(lambda: h.pwm()[0] == "2", 40), "BMC daemon stopped: the host's GPU fan back to the driver")
-    print("    after %.0f s (LINK_LOST_SEC=15)" % (time.time() - t0))
+    # bug 69: a manual policy holds at least GPU_FAN_LINK_LOST: the card's the only airflow over the IOHUB
+    time.sleep(25)
+    p = h.pwm()
+    check(p[0] == "1" and int(p[1]) >= 102, "BMC daemon stopped, link lost after 25 s: the agent holds the GPU fan: %s" % (p,))
     check(b.out("test -e /run/reimu-hostlink/gpu-temp && echo yes").strip() == "", "gpu-temp gone with it")
     b.ssh("systemctl start reimu-hostlink")
     check(wait(lambda: state()["agent"]["connected"], 90), "started: the agent reconnects")

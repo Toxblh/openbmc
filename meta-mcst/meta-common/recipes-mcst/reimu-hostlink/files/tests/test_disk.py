@@ -6,7 +6,9 @@ reimu-agent-disk, has its own tests), the real agent pairing and connecting.
 
     python3 tests/test_disk.py ./tests/reimu-hostlink-native [TEST...]
 
-About two minutes (the disk's 60 s time-out is waited for).
+About three minutes (the disk's 60 s time-out is waited for; helpers that hang).
+NATIVE_SSL as for the Makefile: the "watchdog" test builds the daemon again,
+with notify_shim.c writing down what it tells systemd.
 """
 import json, os, shutil, signal, subprocess, sys, tempfile, time
 
@@ -65,14 +67,27 @@ exit 0
 """
 
 
+# a helper that hangs, from when the file "hang" is there; before that it does nothing
+HANGING = """#!/bin/sh
+read -r line || line=
+echo "$1 $line" >> "%(log)s"
+[ -e "%(hang)s" ] || exit 0
+%(body)s
+"""
+CLOSES_STDERR = '[ "$1" = start ] || exit 0\nexec 2>&-; sleep 60'
+HOLDS_STDERR = "sleep 60"
+
+
 class Daemon:
-    def __init__(self, conf=""):
+    def __init__(self, conf="", body=None):
         self.d = tempfile.mkdtemp(prefix="hl-disk-")
         self.port = free_port()
         self.hlog = os.path.join(self.d, "helper.log")
         self.fail = os.path.join(self.d, "fail")
         helper = os.path.join(self.d, "reimu-agent-disk")
-        open(helper, "w").write(HELPER % {"log": self.hlog, "fail": self.fail})
+        self.hang = os.path.join(self.d, "hang")
+        text = HELPER % {"log": self.hlog, "fail": self.fail} if body is None else HANGING % {"log": self.hlog, "hang": self.hang, "body": body}
+        open(helper, "w").write(text)
         os.chmod(helper, 0o755)
         self.conf = os.path.join(self.d, "conf")
         open(self.conf, "w").write("PORT=%d\nIFACE=\nPING_SEC=2\nLOST_SEC=10\nDISK_HELPER=%s\n%s" % (self.port, helper, conf))
@@ -81,8 +96,8 @@ class Daemon:
         self.p = None
         self.log = os.path.join(self.d, "daemon.log")
 
-    def start(self):
-        self.p = subprocess.Popen([DAEMON], env=self.env, stdout=open(self.log, "a"), stderr=subprocess.STDOUT)
+    def start(self, exe=None):
+        self.p = subprocess.Popen([exe or DAEMON], env=self.env, stdout=open(self.log, "a"), stderr=subprocess.STDOUT)
         ok = wait(lambda: os.path.exists(os.path.join(self.d, "run", "ctl")) and self.ctl("state").get("ok"), 10)
         assert ok, "daemon didn't start: " + open(self.log).read()[-2000:]
         return self
@@ -93,8 +108,8 @@ class Daemon:
             self.p.wait(10)
             self.p = None
 
-    def ctl(self, cmd):
-        r = subprocess.run([DAEMON, "--ctl", cmd], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    def ctl(self, cmd, timeout=20):
+        r = subprocess.run([DAEMON, "--ctl", cmd], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         try:
             return json.loads(r.stdout)
         except ValueError:
@@ -202,7 +217,61 @@ def t_timeout():
         d.cleanup()
 
 
-TESTS = {"installed": t_installed, "helper_fails": t_helper_fails, "timeout": t_timeout}
+def t_helper_closes_stderr():
+    """read() sees the end at once, the helper lives on: bounded all the same"""
+    d = Daemon(body=CLOSES_STDERR).start()
+    try:
+        open(d.hang, "w").close()
+        t0 = time.time()
+        r = d.ctl("disk", timeout=90)
+        took = time.time() - t0
+        check(took <= 17, "the helper closed its stderr and hangs: the daemon back after %.1f s" % took)
+        check(not r.get("ok") and not d.disk().get("on") and not d.state()["pairing"]["active"], "no disk, no pairing left open: %s" % r)
+        check(d.ctl("state").get("ok"), "the daemon polls again")
+    finally:
+        os.remove(d.hang)
+        d.cleanup()
+
+
+def build_with_notify_shim(out):
+    """the daemon again, its dbus_notify writing down what systemd would get"""
+    src = os.path.dirname(HERE)
+    ssl = os.environ.get("NATIVE_SSL", "")
+    cmd = ["gcc", "-g", "-O1", "-w", "-I" + src, "-o", out, os.path.join(HERE, "notify_shim.c")]
+    cmd += [os.path.join(src, f) for f in ("hl-proto.c", "hl-json.c", "hl-net.c")]
+    if ssl:
+        cmd += ["-I%s/include" % ssl, "-L%s/lib" % ssl, "-Wl,-rpath,%s/lib" % ssl]
+    subprocess.check_call(cmd + ["-lssl", "-lcrypto", "-lm"])
+
+
+def t_watchdog():
+    """WatchdogSec=30: a helper that hangs (stop, start, stop: up to 45 s in a
+    row in daemon_disk_start) must not get the daemon aborted"""
+    d = Daemon(body=HOLDS_STDERR)
+    try:
+        exe = os.path.join(d.d, "reimu-hostlink-shim")
+        build_with_notify_shim(exe)
+        log = os.path.join(d.d, "notify")
+        d.env["REIMU_HOSTLINK_NOTIFY"] = log
+        d.start(exe)
+        wait(lambda: os.path.exists(log), 10)
+        open(d.hang, "w").close()
+        mark = time.time()
+        r = d.ctl("disk", timeout=90)
+        took = time.time() - mark
+        check(not r.get("ok") and took >= 25, "the helper hung for start and for stop: %.1f s (%s)" % (took, r.get("err")))
+        beats = [float(x.split()[1]) for x in open(log).read().splitlines() if x.startswith("WATCHDOG=1 ")]
+        beats = [b for b in beats if b >= mark]
+        gaps = [b - a for a, b in zip([mark] + beats, beats + [mark + took])]
+        check(beats and max(gaps) < 10, "WATCHDOG=1 meanwhile: %d, the longest gap %.1f s (WatchdogSec=30)" % (len(beats), max(gaps)))
+    finally:
+        if os.path.exists(d.hang):
+            os.remove(d.hang)
+        d.cleanup()
+
+
+TESTS = {"installed": t_installed, "helper_fails": t_helper_fails, "timeout": t_timeout,
+         "helper_closes_stderr": t_helper_closes_stderr, "watchdog": t_watchdog}
 
 if __name__ == "__main__":
     for name, fn in TESTS.items():

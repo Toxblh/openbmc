@@ -191,7 +191,9 @@ back). reimu-fand's «Турбо» (`TurboLeft`, read every 5 s) turns the GPU f
 100 % as well (`FOLLOW_FAND_TURBO`). The agent checks the card every 2 s: the
 driver's reset after an amdgpu hang (`pwm1_enable` back to 2, fans stopped:
 the IOHUB behind the card reached 90 °C), or the hwmon coming back under
-another number, is set again (event `gpu_fan_reapplied`). No word from the BMC
+another number, is set again (event `gpu_fan_reapplied`). The agent keeps the
+policy too (`/var/lib/reimu-hostd/policy`, removed by `--uninstall`), for a
+restart with the BMC down. No word from the BMC
 for `LINK_LOST_SEC` (60 s), the agent stopping (and `ExecStopPost` after a
 crash): the driver's automatic control again.
 

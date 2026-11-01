@@ -133,7 +133,8 @@ static void on_diag(struct hl *h, const char *b64)
 
 /* ------------------------------------------------------------------ the installer's USB disk */
 /* DISK_HELPER ACTION, INPUT on its stdin, at most 15 s; 0 = it exited 0, else
- * its last line on stderr in err */
+ * its last line on stderr in err. The main loop waits meanwhile (a disk's start
+ * can be three of these in a row, WatchdogSec=30): this keeps the watchdog fed */
 static int run_helper(const char *helper, const char *action, const char *input, char *err, size_t n)
 {
     int in[2], er[2];
@@ -177,7 +178,10 @@ static int run_helper(const char *helper, const char *action, const char *input,
         int64_t left = end - now_ms();
         if (left <= 0) break;
         struct pollfd p = { er[0], POLLIN, 0 };
-        if (poll(&p, 1, (int)left) <= 0) break;
+        int pr = poll(&p, 1, left < 1000 ? (int)left : 1000);
+        dbus_notify("WATCHDOG=1");
+        if (pr < 0) break;
+        if (pr == 0) continue;
         ssize_t r = read(er[0], b + got, sizeof(b) - 1 - got);
         if (r <= 0) break;
         got += r;
@@ -185,9 +189,16 @@ static int run_helper(const char *helper, const char *action, const char *input,
     }
     close(er[0]);
     int st = 0;
-    if (waitpid(pid, &st, WNOHANG) == 0)
+    /* its stderr closed is not its end */
+    pid_t w;
+    while ((w = waitpid(pid, &st, WNOHANG)) == 0 && now_ms() < end)
     {
-        if (now_ms() >= end) kill(pid, SIGKILL);
+        dbus_notify("WATCHDOG=1");
+        poll(NULL, 0, 100);
+    }
+    if (w == 0)
+    {
+        kill(pid, SIGKILL);
         waitpid(pid, &st, 0);
     }
     b[got] = 0;

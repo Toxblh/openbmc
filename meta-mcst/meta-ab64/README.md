@@ -162,6 +162,9 @@ whole flash, for QEMU) and `reimu-ab-kexec.tar` (to start it from RAM).
   every state of the slots (digests, booted kernel, state, slot asked for),
   against a model of what boots: every plan safe, a refusal only when no
   order is.
+* `test_ab_lock.py`: `reimu-ab boot` against install/set-slot, a manual restart
+  of it, and install/set-slot refused while the bootcmd isn't the A/B one (setup-env).
+* `test_reimu_fit.py`: reimu-fit on crafted FITs (ASan): refused, a valid one still read.
 * `test_pns_qemu.py`: the PNS flash on spi1 of QEMU (a copy of the board's
   dump): versions, check, read, write, faults (pns-fault.c), power-on
   blocking, the web endpoints and page, and the web BMC update (reimu-abd).

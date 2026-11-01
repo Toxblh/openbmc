@@ -85,7 +85,11 @@ changed() {
     lock_wait
     [ "$(env_get reimu_slot)" = "$s0" ] && [ "$(env_get reimu_pending)" = "$p0" ] && [ "$(cat "$DECIDED" 2>/dev/null)" = "$g0" ] && return 1
     log "slot/pending changed by an install or set-slot meanwhile: the U-Boot environment is left alone"
+    return 0 # (log's status is logger's)
 }
+# install, set-slot: U-Boot would not boot what they select. The first install
+# from the stock firmware runs setup-env before it (reimu-ab-from-stock).
+ab_bootcmd() { [ "$(env_get bootcmd)" = "run reimu_ab" ] || die "bootcmd is not the A/B one: reimu-ab setup-env first"; }
 kexec_started() { grep -qwE 'reimu\.(ram|test)' /proc/cmdline; }
 
 # the last 4 KiB of rofs-X: "reimu-rofs BYTES SHA256", "reimu-kernel BYTES
@@ -236,6 +240,7 @@ do_plan() {
 
 do_install() {
     lock_nb
+    ab_bootcmd
     tar=${1:-}
     [ -f "$tar" ] || die "$tar: no such file"
     choose "${2:-}"
@@ -288,6 +293,11 @@ do_boot() {
         log "started by kexec (reimu.ram/reimu.test): nothing to confirm, the U-Boot environment is left alone"
         return 0
     fi
+    # a manual restart of this service: an install or set-slot decided this boot
+    if [ -e "$DECIDED" ]; then
+        log "an install or set-slot decided this boot: the U-Boot environment is left alone"
+        return 0
+    fi
     s0=$(env_get reimu_slot) p0=$(env_get reimu_pending) g0=$(cat "$DECIDED" 2>/dev/null)
     [ "$(env_get reimu_slot)" = "$k" ] || log "U-Boot booted slot $k, not slot $(env_get reimu_slot): slot $(env_get reimu_slot) didn't start"
     if [ "$st" = fallback ]; then
@@ -329,6 +339,7 @@ do_boot() {
 do_set_slot() {
     case ${1:-} in a|b) ;; *) die "set-slot a|b" ;; esac
     lock_nb
+    ab_bootcmd
     verify_slot $1 || die "slot $1 is not intact: not switching"
     env_set reimu_slot $1; env_set reimu_tries 0; env_set reimu_pending 1
     decided
