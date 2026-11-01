@@ -21,7 +21,7 @@ installer are the ones run. About 8 minutes:
 Tests (all by default, one boot): files pin web (the install flow, the page's
 layout with the board's data) install linklocal selfcontained disk
 """
-import base64, hashlib, http.server, json, os, re, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import base64, hashlib, http.server, json, os, re, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -106,7 +106,8 @@ class Prefix:
         self.bin = os.path.join(self.root, "fakebin")
         os.makedirs(self.bin)
         for n, body in (("systemctl", 'echo "$*" >> "$REIMU_ROOT/systemctl.log"; [ "$1" = is-active ] && echo active; exit 0'),
-                        ("journalctl", 'cat "$REIMU_ROOT/agent.log" 2>/dev/null')):
+                        ("journalctl", 'cat "$REIMU_ROOT/agent.log" 2>/dev/null'),
+                        ("sync", 'exit 0')):     # a prefix: not this machine's disks, a hung mount here blocks it
             p = os.path.join(self.bin, n)
             open(p, "w").write("#!/bin/sh\n" + body + "\n")
             os.chmod(p, 0o755)
@@ -116,12 +117,18 @@ class Prefix:
         self.secret = os.path.join(self.root, "etc/reimu-hostd/secret")
         self.lib = os.path.join(self.root, "usr/local/lib/reimu/reimu-hostd.py")
         self.env = dict(os.environ, REIMU_ROOT=self.root, REIMU_SYSTEMCTL=os.path.join(self.bin, "systemctl"),
-                        REIMU_JOURNALCTL=os.path.join(self.bin, "journalctl"))
+                        REIMU_JOURNALCTL=os.path.join(self.bin, "journalctl"),
+                        PATH=self.bin + ":" + os.environ["PATH"])
         self.agent = None
 
     def sh(self, cmd, timeout=180):
-        r = subprocess.run(["sh", "-c", cmd], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        return r.returncode, r.stdout.decode(errors="replace")
+        p = subprocess.Popen(["sh", "-c", cmd], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            out = p.communicate(timeout=timeout)[0]
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            return 124, "(no end in %d s) " % timeout + p.communicate()[0].decode(errors="replace")
+        return p.returncode, out.decode(errors="replace")
 
     def run_agent(self):
         """what systemctl restart would start: the installed agent, its /sys a fake board"""
@@ -201,9 +208,14 @@ def t_web(b):
         src = next(p for p in (os.path.join(HERE, "..", "e2e", f), os.path.join(HERE, f)) if os.path.exists(p))
         shutil.copy(src, os.path.join(d, f))
     out = os.path.join(ab.W, "shots")
-    r = subprocess.run(["node", "agent-install.qemu.mjs"], cwd=d, env=dict(os.environ, BASE=BASE, OUT=out, AGENT_DISK="on" if b.out("ls /sys/class/udc").strip() else "error"),
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
-    o = r.stdout.decode()
+    r = subprocess.Popen(["node", "agent-install.qemu.mjs"], cwd=d, env=dict(os.environ, BASE=BASE, OUT=out, AGENT_DISK="on" if b.out("ls /sys/class/udc").strip() else "error"),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        o = r.communicate(timeout=300)[0].decode()
+    except subprocess.TimeoutExpired:
+        os.killpg(r.pid, signal.SIGKILL)
+        o = r.communicate()[0].decode() + "\nFAIL the browser test: no end in 300 s"
+        print("    " + o[-1500:].replace("\n", "\n    "), flush=True)
     for l in o.splitlines():
         if l.startswith(("PASS", "FAIL", "INFO")):
             print("    " + l)
@@ -328,7 +340,7 @@ def t_linklocal():
             check(rc == 0 and os.path.exists(x.lib), "the link-local loop (en0 fails, lo0 works), the downloads over the zone: rc %d %s" % (
                 rc, out.strip()[-300:]))
             check(state()["paired"], "paired (the link through the forward)")
-            path = "/usr/bin:/bin:/usr/sbin:/sbin"
+            path = x.bin + ":/usr/bin:/bin:/usr/sbin:/sbin"
             x.env["PATH"] = os.path.join(d, "nocurl") + ":" + path
             os.makedirs(os.path.join(d, "nocurl"))
             os.symlink("/usr/bin/false", os.path.join(d, "nocurl", "curl"))

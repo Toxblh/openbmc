@@ -295,7 +295,19 @@ static int start_job(sd_bus_message *m, const char *what, char *const args[])
     for (int i = 0; args[i] && n < 19; i++) argv[n++] = args[i];
     argv[n] = NULL;
     char out[1024];
-    int rc = run_tool(argv, out, sizeof(out));
+    /* the job's state says "ok" before its ExecStopPost ended: a next job right
+     * then waits for that, a job still running is refused at once */
+    int rc;
+    for (int i = 0;; i++)
+    {
+        rc = run_tool(argv, out, sizeof(out));
+        if (rc == 0 || !strstr(out, "already") || i >= 20) break;
+        char *ask[] = { "/bin/systemctl", "is-active", "reimu-pns-job", NULL };
+        char state[64];
+        run_tool(ask, state, sizeof(state));
+        if (!strstr(state, "deactivating")) break;
+        sleep(1);
+    }
     if (rc != 0)
     {
         char msg[1200];
