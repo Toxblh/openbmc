@@ -107,6 +107,8 @@ def run_job(job, slot, a, out, src, img):
         print("STALLED %s: nothing in its log for %d min, stopped. Its last lines:\n%s" % (
             job.name, a.quiet, "\n".join("    " + l[:150] for l in text.splitlines()[-4:])), flush=True)
     job.passed, job.failed = len(PASS.findall(text)), len(FAIL.findall(text))
+    if job.suite == "ipmi_redfish":     # FAIL lines there: the stock firmware's too, its verdict is these two
+        job.failed = 0 if "regressions: none" in text and "MUST checks failed on the new firmware: none" in text else 1
     if d and not a.keep:
         shutil.rmtree(d, ignore_errors=True)
     return job

@@ -273,6 +273,9 @@ def t_install(b, p):
         rc, out = x.sh(as_here(CMDS["v4"]))
         print("    " + out.strip().replace("\n", "\n    ")[-1500:])
         check(rc == 0, "the command: rc %d" % rc)
+        if rc == 90:     # the pin the page gave vs what bmcweb shows now, and since when
+            print("    pin in the command %s, TLS now %s" % (CMDS["pin"], tls_pin("127.0.0.1", ab.HTTPS)))
+            print("    " + b.out("ls -la --time-style=full-iso /etc/ssl/certs/https/; uptime; journalctl -u bmcweb -n 8 --no-pager | cut -c1-120").replace("\n", "\n    "), flush=True)
         check(os.path.exists(x.lib) and open(x.lib, "rb").read() == open(os.path.join(TOOLS, "reimu-hostd.py"), "rb").read(),
               "the agent installed in the prefix")
         check("KEY=" in (open(x.secret).read() if os.path.exists(x.secret) else ""), "paired: the key in etc/reimu-hostd/secret")
