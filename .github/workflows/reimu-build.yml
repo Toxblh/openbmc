@@ -1,0 +1,52 @@
+# The A/B firmware for REIMU-5564. Push to reimu-ci: a build, the result as an
+# artifact. A tag reimu-*: the same, and a pre-release with it.
+name: reimu build
+on:
+  push:
+    branches: [reimu-ci]
+    tags: ['reimu-*']
+permissions:
+  contents: write
+concurrency:
+  group: reimu-${{ github.ref }}
+jobs:
+  stage1:
+    uses: ./.github/workflows/reimu-build-stage.yml
+    with: {stage: '1'}
+  stage2:
+    needs: [stage1]
+    if: ${{ !(needs.stage1.outputs.done == 'true') }}
+    uses: ./.github/workflows/reimu-build-stage.yml
+    with: {stage: '2'}
+  stage3:
+    needs: [stage1, stage2]
+    if: ${{ !(needs.stage1.outputs.done == 'true' || needs.stage2.outputs.done == 'true') }}
+    uses: ./.github/workflows/reimu-build-stage.yml
+    with: {stage: '3'}
+  stage4:
+    needs: [stage1, stage2, stage3]
+    if: ${{ !(needs.stage1.outputs.done == 'true' || needs.stage2.outputs.done == 'true' || needs.stage3.outputs.done == 'true') }}
+    uses: ./.github/workflows/reimu-build-stage.yml
+    with: {stage: '4'}
+  stage5:
+    needs: [stage1, stage2, stage3, stage4]
+    if: ${{ !(needs.stage1.outputs.done == 'true' || needs.stage2.outputs.done == 'true' || needs.stage3.outputs.done == 'true' || needs.stage4.outputs.done == 'true') }}
+    uses: ./.github/workflows/reimu-build-stage.yml
+    with: {stage: '5'}
+  release:
+    needs: [stage1, stage2, stage3, stage4, stage5]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && contains(needs.*.outputs.done, 'true') && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: reimu-bundle
+          path: out
+      - name: Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          ls -la
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --prerelease --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file RELEASE.md *.tar.gz *.sha256

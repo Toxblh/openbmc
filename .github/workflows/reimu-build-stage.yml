@@ -1,0 +1,78 @@
+# One stage of the REIMU build: a job may run 6 h, a first build takes longer on
+# 4 vCPU, so bitbake stops itself in time, the sstate goes to the cache and the
+# next stage goes on from there. Called by reimu-build.yml.
+name: reimu build stage
+on:
+  workflow_call:
+    inputs:
+      stage: {type: string, required: true}
+    outputs:
+      done:
+        value: ${{ jobs.build.outputs.done }}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    outputs:
+      done: ${{ steps.bb.outputs.done }}
+    steps:
+      - name: Disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup
+          sudo mkdir -p /mnt/work/sstate /mnt/work/downloads /mnt/work/build-ab
+          sudo chown -R "$(id -u):$(id -g)" /mnt/work
+          df -h / /mnt
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tags for the version
+        run: git fetch --tags --force origin || true
+      - name: Restore the sstate
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/work/sstate
+          key: sstate-${{ github.run_id }}-${{ inputs.stage }}
+          restore-keys: |
+            sstate-${{ github.run_id }}-
+            sstate-
+      - name: Bitbake
+        id: bb
+        run: |
+          rc=0
+          docker run --rm -e UID_OUT="$(id -u)" -e GID_OUT="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work/openbmc" -v /mnt/work/sstate:/work/sstate \
+            -v /mnt/work/downloads:/work/downloads -v /mnt/work/build-ab:/work/build-ab \
+            ubuntu:20.04 sh /work/openbmc/meta-mcst/tools/ab64/ci-build.sh || rc=$?
+          echo "bitbake rc=$rc"
+          case $rc in
+            0) echo done=true >> "$GITHUB_OUTPUT" ;;
+            124) echo done=false >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+      - name: Log tail and disk
+        if: always()
+        run: |
+          df -h / /mnt; du -sh /mnt/work/* 2>/dev/null || true
+          find /mnt/work/build-ab/tmp/work -name 'log.do_*' -newermt '-5 minutes' 2>/dev/null | tail -5 || true
+      - name: Failed task logs
+        if: failure()
+        run: |
+          grep -rl 'ERROR:' /mnt/work/build-ab/tmp/log/cooker 2>/dev/null | tail -1 | xargs -r grep -E 'ERROR|Logfile of failure' | tail -40 || true
+          grep -rhE 'Logfile of failure stored in: ' /mnt/work/build-ab/tmp/log/cooker 2>/dev/null | sed 's/.*stored in: //; s#^/work/build-ab#/mnt/work/build-ab#' | sort -u | tail -4 | while read -r f; do echo "=== $f"; tail -60 "$f"; done
+      - name: Save the sstate
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/work/sstate
+          key: sstate-${{ github.run_id }}-${{ inputs.stage }}-${{ github.run_attempt }}
+      - name: Bundle
+        if: steps.bb.outputs.done == 'true'
+        run: sh meta-mcst/tools/ab64/make-bundle.sh /mnt/work/build-ab/tmp/deploy/images/reimu-5564 "$RUNNER_TEMP/out"
+      - name: Keep the bundle
+        if: steps.bb.outputs.done == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reimu-bundle
+          path: ${{ runner.temp }}/out/*
+          compression-level: 0
+          retention-days: 30
