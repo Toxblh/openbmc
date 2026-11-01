@@ -241,12 +241,21 @@ rc_base() { # the directory with rc3.d
     return 1
 }
 
+boot_linked() { # base -> a start link in a multi-user runlevel?
+    for l in "$1"/rc[2345].d/S*reimu-hostd; do
+        [ -e "$l" ] || [ -L "$l" ] && return 0
+    done
+    return 1
+}
+
 boot_on() {
     how=
     if t=$(rc_tool update-rc.d) && "$t" reimu-hostd defaults >/dev/null 2>&1; then how=update-rc.d
     elif t=$(rc_tool chkconfig) && "$t" --add reimu-hostd >/dev/null 2>&1 && "$t" reimu-hostd on >/dev/null 2>&1; then how=chkconfig
     elif t=$(rc_tool insserv) && "$t" reimu-hostd >/dev/null 2>&1; then how=insserv
-    elif b=$(rc_base); then
+    fi
+    # a tool's exit code is no proof: where the rc?.d are known, look for its link
+    if b=$(rc_base) && { [ -z "$how" ] || ! boot_linked "$b"; }; then
         target=${INITD#"$REIMU_ROOT"}/reimu-hostd
         for l in 3 5; do mkdir -p "$b/rc$l.d" && ln -sf "$target" "$b/rc$l.d/S99reimu-hostd"; done
         for l in 0 6; do mkdir -p "$b/rc$l.d" && ln -sf "$target" "$b/rc$l.d/K01reimu-hostd"; done

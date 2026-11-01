@@ -609,9 +609,11 @@ class SysvBase(Base):
     def p(self, rel):
         return os.path.join(self.root, rel)
 
-    def rc_tool(self, name, rc=0):
+    def rc_tool(self, name, rc=0, link=None):
+        """link: the boot link the tool makes when it enables, as a real one does."""
         f = os.path.join(self.rcbin, name)
-        open(f, "w").write('#!/bin/sh\necho "%s $*" >> "$REIMU_ROOT/rc.log"\nexit %d\n' % (name, rc))
+        make = ('case "$*" in *remove*|--del*|-r*) ;; *) ln -sf x "$REIMU_ROOT/%s" ;; esac\n' % link) if link else ""
+        open(f, "w").write('#!/bin/sh\necho "%s $*" >> "$REIMU_ROOT/rc.log"\n%sexit %d\n' % (name, make, rc))
         os.chmod(f, 0o755)
 
     def rc_log(self):
@@ -718,12 +720,12 @@ class SysvInstall(SysvBase):
             with self.subTest(tool):
                 for t in os.listdir(self.rcbin):
                     os.remove(os.path.join(self.rcbin, t))
-                self.rc_tool(tool)
+                self.rc_tool(tool, link="etc/rc3.d/S50reimu-hostd")
                 self.make_paired()
                 self.mkrc()
                 self.install()
                 self.assertIn(want, self.rc_log())
-                self.assertEqual(os.listdir(self.p("etc/rc3.d")), [], "the tool's job")
+                self.assertEqual(os.listdir(self.p("etc/rc3.d")), ["S50reimu-hostd"], "the tool's job")
                 rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
                 self.assertEqual(rc, 0, out)
                 self.assertRegex(self.rc_log(), {"update-rc.d": r"update-rc.d -f reimu-hostd remove",
@@ -731,6 +733,43 @@ class SysvInstall(SysvBase):
                                                  "insserv": r"insserv -r reimu-hostd"}[tool])
                 self.assertFalse(os.path.exists(self.p("etc/init.d/reimu-hostd")))
                 os.remove(self.p("rc.log"))
+
+    def test_boot_tool_says_ok_but_makes_no_link(self):
+        # its exit code is no proof: without a link the agent would not start
+        # at boot while the installer says it will
+        self.make_paired()
+        self.mkrc()
+        self.rc_tool("chkconfig")
+        rc, out = self.install()
+        self.assertTrue(os.path.lexists(self.p("etc/rc3.d/S99reimu-hostd")), out)
+        self.assertIn("/rc?.d", out)
+        self.assertNotIn("(chkconfig)", out)
+
+    def elbrus_95_tree(self):
+        # as on Elbrus Linux 9.5.5 (its owner's listing): init.d and rc?.d in
+        # /etc, /etc/rc.d only has a link back, rcS.d a link to rcsysinit.d
+        for n in ("rc0.d", "rc1.d", "rc2.d", "rc3.d", "rc4.d", "rc5.d", "rc6.d", "rcsysinit.d", "init.d", "rc.d"):
+            os.makedirs(self.p("etc/" + n), exist_ok=True)
+        os.symlink("../init.d", self.p("etc/rc.d/init.d"))
+        os.symlink("rcsysinit.d", self.p("etc/rcS.d"))
+
+    def test_elbrus_95_tree(self):
+        self.elbrus_95_tree()
+        self.make_paired()
+        self.rc_tool("chkconfig", rc=1)
+        self.rc_tool("insserv", rc=1)
+        self.install()
+        self.assertTrue(os.path.isfile(self.p("etc/init.d/reimu-hostd")))
+        self.assertTrue(os.path.islink(self.p("etc/rc.d/init.d")), "the link stays a link")
+        self.assertEqual(os.readlink(self.p("etc/rc3.d/S99reimu-hostd")), "/etc/init.d/reimu-hostd")
+        self.assertEqual(os.readlink(self.p("etc/rc0.d/K01reimu-hostd")), "/etc/init.d/reimu-hostd")
+        self.assertFalse(os.path.exists(self.p("etc/rc.d/rc3.d")))
+        self.assertEqual(len(self.agents()), 1)
+        rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.listdir(self.p("etc/rc3.d")), [])
+        self.assertFalse(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+        self.assertEqual(self.agents(), [])
 
     def test_boot_tool_order_and_failure_falls_through(self):
         self.make_paired()
