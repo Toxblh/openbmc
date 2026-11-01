@@ -17,6 +17,10 @@ cat > /tmp/ci-inner.sh <<'E'
 #!/bin/bash
 git config --global --add safe.directory '*'
 cd /work/openbmc && source setup reimu-5564 /work/build-ab >/dev/null || exit 1
+# the A/B layer isn't in the board's template: without it, the plain image
+grep -q meta-ab64 conf/bblayers.conf ||
+    sed -i '/meta-device-reimu-5564 \\$/a\  /work/openbmc/meta-mcst/meta-ab64 \\' conf/bblayers.conf
+grep -q meta-ab64 conf/bblayers.conf || { echo "ci-build.sh: meta-ab64 not added" >&2; exit 1; }
 grep -q '^REIMU_CI' conf/local.conf || cat >> conf/local.conf <<'C'
 REIMU_CI = "1"
 DL_DIR = "/work/downloads"
