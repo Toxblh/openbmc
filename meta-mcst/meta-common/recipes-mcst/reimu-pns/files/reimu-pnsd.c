@@ -51,6 +51,7 @@
 #include "reimu-sensors.h"
 #ifndef PARSER_ONLY
 #include "reimu-pnsflash.h"
+#include "reimu-overheat.h"
 #endif
 
 #define FRU_XML   "/var/volatile/motherboard_info.xml"
@@ -793,6 +794,8 @@ static int run_daemon(void)
                                      journal_vtable, NULL);
     /* backups, upload, check and write of the flash (reimu-pnsflash.c) */
     if (r >= 0) r = pnsflash_register(bus);
+    /* the switch of overheatd's power actions, the reason of an emergency (reimu-overheat.c) */
+    if (r >= 0) r = overheat_register(bus);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
     if (r < 0)

@@ -1,0 +1,73 @@
+From 62cf219ad7f3adbf64c9ac6417321be57bae57f5 Mon Sep 17 00:00:00 2001
+From: reimu <reimu@localhost>
+Date: Sun, 1 Nov 2026 00:45:21 +0000
+Subject: [PATCH] reimu_gpio: a line another reader has for a moment isn't an
+ error
+
+gpiod_line_request_*() fail with EBUSY while another process holds the line,
+which each reader does for the moment of its read. A power-off (server_pwr_off
+reads GPIO_POWER_IN first) that hit reimupwr's read every second failed with
+-3 (exit status 253) and the platform stayed on. Now 20 tries, 50 ms apart.
+
+Upstream-Status: Pending
+---
+ reimu_gpio.c | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/reimu_gpio.c b/reimu_gpio.c
+index 701918b..efaab44 100644
+--- a/reimu_gpio.c
++++ b/reimu_gpio.c
+@@ -1,5 +1,6 @@
+ #include <gpiod.h>
+ #include <string.h>
++#include <errno.h>
+ #include "reimu.h"
+ 
+ int reimu_is_atexit_gpiochip_fini = 0;
+@@ -19,6 +20,22 @@ int reimu_gpiochip_init(void)
+     return 1;
+ }
+ 
++/* Every reader takes a line only for the moment of its read, but while it
++ * has it (EBUSY) another one's request fails: reimupwr reads GPIO_POWER_IN
++ * every second, and a power-off that hit that moment failed with -3. So a
++ * busy line gets a second: 20 tries, 50 ms apart */
++static int request_retrying(struct gpiod_line *line, int output, int value)
++{
++    int rv = -1;
++    for (int attempt = 0; attempt < 20; ++attempt)
++    {
++        if (attempt) reimu_msleep(50, NULL);
++        rv = output ? gpiod_line_request_output(line, "libreimu", value) : gpiod_line_request_input(line, "libreimu");
++        if (!rv || errno != EBUSY) break;
++    }
++    return rv;
++}
++
+ int reimu_get_gpio(int num)
+ {
+     int rv = reimu_gpiochip_init();
+@@ -27,7 +44,7 @@ int reimu_get_gpio(int num)
+     struct gpiod_line *line = gpiod_chip_get_line(reimu_gpiochip, num);
+     if (line == NULL) return -2;
+ 
+-    rv = gpiod_line_request_input(line, "libreimu");
++    rv = request_retrying(line, 0, 0);
+     if (rv) return -3;
+ 
+     rv = gpiod_line_get_value(line);
+@@ -43,8 +60,8 @@ int reimu_set_gpio(int num, int value, int delay)
+     struct gpiod_line *line = gpiod_chip_get_line(reimu_gpiochip, num);
+     if (line == NULL) return -2;
+ 
+-    rv = gpiod_line_request_output(line, "libreimu", value);
+-    if (rv) { gpiod_line_release(line); return -3; }
++    rv = request_retrying(line, 1, value);
++    if (rv) return -3;
+ 
+     reimu_msleep(delay, NULL);
+     gpiod_line_release(line);
+-- 
+2.25.1
+

@@ -1,0 +1,15 @@
+[Unit]
+Description=Sensor instantiator: the sensors not ready at the first try
+After=hwmon-instantiator.service
+# pulled in by hwmon-instantiator.service, stopped before it (the order of
+# After= reversed), so its cleanup finds nothing being instantiated
+PartOf=hwmon-instantiator.service
+
+[Service]
+# not oneshot: a start job waiting for minutes would hold "boot finished"
+# (is-system-running) back on a BMC booting with the platform on
+Type=simple
+Environment="RESCAN=30 60 120 240"
+ExecStart=/sbin/hwmon-instantiator rescan $RESCAN
+# stopped at power-off while it waits: not a failure
+SuccessExitStatus=SIGTERM

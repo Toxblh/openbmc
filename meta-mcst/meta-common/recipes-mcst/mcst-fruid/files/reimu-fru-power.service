@@ -6,9 +6,10 @@ After=mcst-fruid.service
 PartOf=hwmon-instantiator.service
 
 [Service]
-Type=oneshot
+# not oneshot: a start job waiting for minutes would hold "boot finished"
+# (is-system-running) back on a BMC booting with the platform on
+Type=simple
 Environment=FRU_SETTLE=120
 ExecStart=/usr/libexec/reimu-fru power
-TimeoutStartSec=15min
 # stopped at power-off while it waits: not a failure
 SuccessExitStatus=SIGTERM

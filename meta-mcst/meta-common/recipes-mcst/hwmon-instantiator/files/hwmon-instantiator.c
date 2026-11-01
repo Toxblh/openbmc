@@ -14,7 +14,7 @@ extern char *reimu_dtb;
 
 // phosphor-hwmon reads <config_dir><device path in /sys, ":" as "--">.conf
 const char *config_dir = "/etc/default/obmc/hwmon";
-const char *supported_devices[] = { "lm96163", "pmbus", "emc2305", "l_pcs_i2c", NULL };
+const char *supported_devices[] = { "lm96163", "pmbus", "l_pcs_i2c", NULL };
 
 /* E8C2 Power Control System: CPU N's temperature sensors answer at
  * 0x20 + 0x10 * N + k on this BMC bus (device tree: a pcs@N node outside the
@@ -73,7 +73,6 @@ static int instantiate(int node, const char *compatible, int bus, int reg)
             reimu_writefile(sysfspath, sysfsdata, strlen(sysfsdata));
             return 3;
         }
-        printf(" - device %s (%d:%02x) exported no hwmon directory yet, delaying (attempt %d/10)\n", compatible, bus, reg, attempt);
         reimu_msleep(100, NULL);
     }
 
@@ -234,10 +233,11 @@ static int create_sensor(enum cancel_type_t unused __attribute__((unused)), int 
 
 /* a D-Bus object name of "<device> <sensor>": [A-Za-z0-9_] only (D-Bus Spec,
  * "Valid Object Paths"), no repeated '_', unique among this run's sensors */
+static char s_used[256][96];
+static int s_nused;
+
 static void object_name(char *out, size_t size, const char *devlabel, const char *label)
 {
-    static char used[256][96];
-    static int nused;
     char raw[256];
     snprintf(raw, sizeof(raw), "%s %s", devlabel, label);
     size_t n = 0;
@@ -251,13 +251,13 @@ static void object_name(char *out, size_t size, const char *devlabel, const char
     out[n] = '\0';
     char base[96];
     snprintf(base, sizeof(base), "%s", out);
-    for (int k = 2, i = 0; i < nused; ++i)
-        if (!strcmp(used[i], out))
+    for (int k = 2, i = 0; i < s_nused; ++i)
+        if (!strcmp(s_used[i], out))
         {
             snprintf(out, size, "%s_%d", base, k++);
             i = -1;
         }
-    if (nused < 256) snprintf(used[nused++], sizeof(used[0]), "%s", out);
+    if (s_nused < 256) snprintf(s_used[s_nused++], sizeof(s_used[0]), "%s", out);
 }
 
 /* a sysfs attribute's text, without the newline; -1 on a read error
@@ -369,7 +369,44 @@ static void create_config(int parent, const char *pcompatible, int bus, int dev,
     if (s_sensors) run("/usr/bin/start_hwmon.sh", "start", devpath);
 }
 
-enum serv_op { SERVICE_START, SERVICE_STOP, SERVICE_OP_UNKNOWN };
+enum serv_op { SERVICE_START, SERVICE_STOP, SERVICE_RESCAN, SERVICE_KEEP_NAMES, SERVICE_OP_UNKNOWN };
+
+/* a device whose driver is bound, hwmon there */
+static int is_up(int bus, int reg)
+{
+    char hwmon[1024];
+    return !hwmon_dir(bus, reg, hwmon, sizeof(hwmon));
+}
+
+/* the D-Bus names of a device that is up stay taken (object_name()) */
+static void keep_names(int bus, int reg)
+{
+    char path[1024], devpath[1024], line[256];
+    detect_config_dir(bus, path, sizeof(path), devpath, sizeof(devpath));
+    size_t len = strlen(path);
+    snprintf(path + len, sizeof(path) - len, "/%d-%04x.conf", bus, reg);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *eq = strchr(line, '=');
+        if (strncmp(line, "LABEL_", 6) || !eq || s_nused >= 256) continue;
+        eq[1 + strcspn(eq + 1, "\n")] = '\0';
+        snprintf(s_used[s_nused++], sizeof(s_used[0]), "%s", eq + 1);
+    }
+    fclose(f);
+}
+
+/* a client without hwmon, should one be left: not in the way of the retry */
+static void drop_client(int bus, int reg)
+{
+    char path[128], data[16];
+    snprintf(path, sizeof(path), "/sys/bus/i2c/devices/%d-%04x", bus, reg);
+    if (reimu_chkdir(path)) return;
+    snprintf(path, sizeof(path), "/sys/bus/i2c/devices/i2c-%d/delete_device", bus);
+    snprintf(data, sizeof(data), "0x%02x\n", reg);
+    reimu_writefile(path, data, strlen(data));
+}
 
 static int instantiator_callback(enum cancel_type_t unused __attribute__((unused)), const char *pcompatible, int node, int bus, int reg, const char *label, const void *data)
 {
@@ -382,6 +419,16 @@ static int instantiator_callback(enum cancel_type_t unused __attribute__((unused
 
         case SERVICE_STOP:
             deinstantiate(node, pcompatible, bus, reg);
+            break;
+
+        case SERVICE_KEEP_NAMES:
+            if (is_up(bus, reg)) keep_names(bus, reg);
+            break;
+
+        case SERVICE_RESCAN:
+            if (!reimu_is_in_dict(supported_devices, pcompatible) || is_up(bus, reg)) break;
+            drop_client(bus, reg);
+            if (!instantiate(node, pcompatible, bus, reg)) create_config(node, pcompatible, bus, reg, label);
             break;
 
         default:
@@ -412,6 +459,11 @@ static void pcs_devices(enum serv_op op)
                 deinstantiate(node, "l_pcs_i2c", PCS_BUS, reg);
                 continue;
             }
+            if (op == SERVICE_RESCAN)
+            {
+                if (is_up(PCS_BUS, reg)) continue;
+                drop_client(PCS_BUS, reg);
+            }
             if (instantiate(node, "l_pcs_i2c", PCS_BUS, reg)) continue;
             /* the driver doesn't touch the chip at probe: a sensor that
              * doesn't answer (the CPU has fewer) goes, rather than be a
@@ -431,7 +483,7 @@ static void pcs_devices(enum serv_op op)
             }
             if (!answers)
             {
-                printf(" - device l_pcs_i2c (%d:%02x) doesn't answer, skipping\n", PCS_BUS, reg);
+                printf(" - device l_pcs_i2c (%d:%02x) doesn't answer (or its driver isn't there yet), skipping\n", PCS_BUS, reg);
                 deinstantiate(node, "l_pcs_i2c", PCS_BUS, reg);
                 continue;
             }
@@ -459,11 +511,31 @@ int main(int argc, char *argv[])
     {
         if (!strcmp(argv[1], "start")) op = SERVICE_START;
         if (!strcmp(argv[1], "stop")) op = SERVICE_STOP;
+        if (!strcmp(argv[1], "rescan")) op = SERVICE_RESCAN;
     }
-    if (op == SERVICE_OP_UNKNOWN) reimu_cancel(3, "Incorrect parameters, use {start|stop}\n");
+    if (op == SERVICE_OP_UNKNOWN) reimu_cancel(3, "Incorrect parameters, use {start|stop|rescan [seconds...]}\n");
     if (access("/var/volatile/motherboard_devtree.dtb", R_OK))
     {
         printf("No platform device tree (see mcst-fruid.service): no platform sensors\n");
+        return 0;
+    }
+    /* rescan (hwmon-instantiator-rescan.service): a driver that bound late
+     * or a chip not ready at the first try (the platform still starting, its
+     * master on the bus) doesn't lose its sensors for the whole power cycle.
+     * What is up stays untouched; each of the given seconds, then a try of
+     * what isn't */
+    if (op == SERVICE_RESCAN)
+    {
+        for (int i = 2; i < argc; ++i)
+        {
+            sleep(atoi(argv[i]));
+            printf("Trying the sensors that aren't there yet (%s s)\n", argv[i]);
+            enum serv_op keep = SERVICE_KEEP_NAMES;
+            s_nused = 0;
+            reimu_traverse_all_i2c((void *)&keep, instantiator_callback, CANCEL_ON_ERROR);
+            reimu_traverse_all_i2c((void *)&op, instantiator_callback, CANCEL_ON_ERROR);
+            pcs_devices(SERVICE_RESCAN);
+        }
         return 0;
     }
     /* start: first whatever an earlier run left (a start that failed, a

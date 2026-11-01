@@ -21,6 +21,14 @@ may ask it for a few things.
     BMC reboot or kexec the KVM input would never come back. The udev rule
     (hub-rule install, by install.sh and reimu-host.sh) and a check every 2 s
     (power/control "auto" -> "on"); its state in the inventory and metrics
+  * on its own too (bmc_owns_i2c in ALLOW, default on; the BMC can't command
+    it): the BMC is the only master of the platform I2C buses the host shares
+    (host i2c-0 = BMC i2c-6, host i2c-1 = BMC i2c-2): both sides polling put
+    0x98 in every writable register of an lm96163. Every 2 s any pwm-fan and
+    any driver bound to those clients (BUS_OWNED) is unbound and pwmd stopped;
+    these buses' hwmon is never read; bus-owner install keeps the modules out
+    and pwmd disabled. With the BMC down or on its stock firmware nobody drives
+    the fans then (README.md). Not enforceable from an x86 OS under Lintel
 
 The video card's fan: the policy the BMC asks for is kept by the agent. The
 driver resets it after a GPU reset (amdgpu hang: pwm1_enable back to 2, the
@@ -49,12 +57,15 @@ ignored. See README.md next to this file.
        ./reimu-hostd.py restore-auto                   the GPU fan to the driver
   sudo ./reimu-hostd.py hub-rule install|remove       the udev rule keeping the
                      BMC's USB hub (KVM keyboard/mouse) out of autosuspend
+  sudo ./reimu-hostd.py bus-owner install|remove      the BMC the only master of
+                     the shared I2C buses: the modules kept out, pwmd disabled
+                     (its state written down; remove gives both back)
 
 Config /etc/reimu-hostd.conf (KEY=VALUE), the key /etc/reimu-hostd/secret
 (root only). REIMU_HOSTD_ROOT=DIR: every /sys, /proc, /etc, /dev path under
 DIR and no command executed (logged to DIR/commands.log): the tests.
 """
-import base64, binascii, glob, hashlib, hmac, json, os, re, select, shutil, signal, socket, ssl, struct, subprocess
+import base64, binascii, glob, gzip, hashlib, hmac, json, os, re, select, shutil, signal, socket, ssl, struct, subprocess
 import sys, time, uuid
 
 VERSION = "1.0"
@@ -68,9 +79,12 @@ PING_SEC = 10
 SMART_SEC = 600
 INVENTORY_SEC = 3600
 GPU_TICK_SEC = 2
-OPS = ("gpu_fan", "gpu_turbo", "os_power", "edac_load")
+OPS = ("gpu_fan", "gpu_turbo", "os_power", "edac_load", "diag")
+# the diag op's report on the wire (the BMC takes lines up to 128 KiB)
+DIAG_MAX_B64 = 96 * 1024
+DIAG_LOG_TAIL = 256 * 1024
 # done by the agent itself, never asked for by the BMC (ALLOW can turn it off)
-LOCAL_OPS = ("usb_hub",)
+LOCAL_OPS = ("usb_hub", "bmc_owns_i2c")
 
 # ------------------------------------------------------------------ logging
 _logger = None
@@ -258,6 +272,8 @@ def fake_runner(root):
     def run(argv, timeout=10):
         with open(os.path.join(root, "commands.log"), "a") as f:
             f.write(" ".join(argv) + "\n")
+        if argv[0] == "systemctl" and os.environ.get("REIMU_SYSTEMCTL"):  # the installer's tests
+            return run_cmd([os.environ["REIMU_SYSTEMCTL"]] + list(argv[1:]), timeout)
         if argv[0] in ("systemctl", "modprobe"):
             return 0, ""
         return 127, "%s: not run (REIMU_HOSTD_ROOT)" % argv[0]
@@ -297,7 +313,8 @@ class Collector:
     def inventory(self):
         return {"os": self.os_info(), "cpu": self.cpu(), "memory": self.memory(), "pci": self.pci(),
                 "disks": self.disks(), "nics": self.nics(), "gpu": self.gpu_info(),
-                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "agent": {"version": VERSION, "proto": PROTO}}
+                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "i2c_owner": bus_owner_state(self.fs, self.cfg),
+                "agent": {"version": VERSION, "proto": PROTO}}
 
     def os_info(self):
         fs = self.fs
@@ -469,12 +486,16 @@ class Collector:
                 "mem": {"total_kib": mi.get("MemTotal"), "avail_kib": mi.get("MemAvailable"),
                         "swap_total_kib": mi.get("SwapTotal"), "swap_free_kib": mi.get("SwapFree")},
                 "temps": self.temps(), "edac": self.edac(), "gpu": self.gpu(), "disks": self.disk_health(now),
-                "bmc_usb_hub": bmc_usb_hub_state(self.fs)}
+                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "i2c_owner": bus_owner_state(self.fs, self.cfg)}
 
     def temps(self):
         out = []
         for h in self.fs.glob("/sys/class/hwmon/hwmon*"):
             chip = self.fs.read(h + "/name") or os.path.basename(h)
+            # the platform's shared buses are the BMC's: a read here is a
+            # transfer on them, even with a driver left bound
+            if chip == "pwmfan" or SHARED_BUS_CLIENT.match(os.path.basename(self.fs.realpath(h + "/device"))):
+                continue
             for t in sorted(self.fs.glob(h + "/temp*_input"), key=_natkey):
                 v = self.fs.int(t)
                 if v is None:
@@ -653,6 +674,181 @@ def hub_rule(fs, run, action):
     UsbHub(fs, parse_config("")).tick()
 
 
+# ------------------------------------------------------------------ the shared I2C buses
+# host i2c-0 = BMC i2c-6: lm96163, ir38064 x3, pmbus; host i2c-1 = BMC i2c-2:
+# lm96163, emc2305 x2, pmbus x2. i2c-3 (FRU, RTC) and l_pcs are the host's.
+BUS_OWNED = ("0-004c", "0-0044", "0-0045", "0-0046", "0-0060", "1-004c", "1-002c", "1-002e", "1-0058", "1-0059")
+SHARED_BUS_CLIENT = re.compile(r"^[01]-[0-9a-f]{4}$")
+BUS_MODULES = ("lm63", "emc2305", "pwm_fan", "pmbus", "ir38064")
+BUS_CONF = "/etc/modprobe.d/reimu-bmc-owns-i2c.conf"
+BUS_STATE = "/etc/reimu-hostd/bus-owner.state"
+# "install" too: pwmd's init script runs modprobe by name, past a blacklist
+BUS_CONF_TEXT = ("# REIMU: the BMC is the only master of the platform I2C buses the host shares\n"
+                 "# (reimu-hostd.py bus-owner install; removed by uninstalling the agent)\n" +
+                 "".join("blacklist %s\ninstall %s /bin/true\n" % (m, m) for m in BUS_MODULES))
+PWMD_ON = ("enabled", "enabled-runtime", "indirect", "alias", "linked", "static")
+PWMD_WORDS = PWMD_ON + ("disabled", "masked", "generated")
+
+
+def shared_bus_bound(fs):
+    """(device, driver, its unbind file): the pwm-fans first, they use the
+    PWMs of the lm63 and emc2305 behind them"""
+    out = []
+    for d in fs.glob("/sys/bus/platform/devices/*"):
+        if fs.link_name(d + "/driver") == "pwm-fan":
+            out.append((os.path.basename(d), "pwm-fan", d + "/driver/unbind"))
+    for n in BUS_OWNED:
+        d = "/sys/bus/i2c/devices/" + n
+        drv = fs.link_name(d + "/driver")
+        if drv:
+            out.append((n, drv, d + "/driver/unbind"))
+    return out
+
+
+def pwmd_running(fs):
+    return any(fs.read(c) == "pwmd" for c in fs.glob("/proc/[0-9]*/comm"))
+
+
+def bus_owner_state(fs, cfg):
+    found = [n if drv == "pwm-fan" else "%s (%s)" % (n, drv) for n, drv, _ in shared_bus_bound(fs)]
+    if pwmd_running(fs):
+        found.append("pwmd")
+    return {"enforced": "bmc_owns_i2c" in cfg["ALLOW"], "clean": not found, "found": found,
+            "modprobe_conf": fs.exists(BUS_CONF)}
+
+
+class BusOwner:
+    def __init__(self, fs, run, cfg):
+        self.fs, self.run, self.cfg = fs, run, cfg
+        self.failed = set()
+        self.pwmd_told = False
+
+    def tick(self):
+        events = []
+        if "bmc_owns_i2c" not in self.cfg["ALLOW"]:
+            return events
+        for name, drv, unbind in shared_bus_bound(self.fs):
+            try:
+                self.fs.write(unbind, name)
+            except OSError as e:
+                if name not in self.failed:  # tried again every tick, said once
+                    self.failed.add(name)
+                    log("the BMC's I2C buses: %s (%s) not unbound: %s" % (name, drv, e))
+                continue
+            self.failed.discard(name)
+            text = "the BMC is the only I2C master here: %s (%s) unbound" % (name, drv)
+            log(text)
+            events.append({"kind": "bmc_owns_i2c", "text": text})
+        if pwmd_running(self.fs):
+            rc, _ = self.run(["systemctl", "stop", "pwmd"], timeout=30)
+            if rc != 0:
+                self.run(["pkill", "-x", "pwmd"], timeout=10)
+            if not self.pwmd_told:
+                self.pwmd_told = True
+                text = "the BMC is the only I2C master here: pwmd stopped"
+                log(text)
+                events.append({"kind": "bmc_owns_i2c", "text": text})
+        else:
+            self.pwmd_told = False
+        return events
+
+
+def _pwmd_enabled(run):
+    """how systemctl has pwmd (its stderr is in the output): absent if unknown"""
+    _, out = run(["systemctl", "is-enabled", "pwmd"], timeout=15)
+    for line in reversed(out.splitlines()):
+        if line.strip() in PWMD_WORDS:
+            return line.strip()
+    return "absent"
+
+
+def _initramfs_data(raw):
+    """its uncompressed bytes (an early cpio may be in front), None = can't"""
+    try:  # distributions package these apart: without one, "can't be read"
+        import bz2, lzma, zlib
+    except ImportError:
+        return raw if raw[:6] == b"070701" else None
+    out = raw if raw[:6] == b"070701" else b""
+    for magic, new in ((b"\x1f\x8b\x08", lambda: zlib.decompressobj(31)), (b"\xfd7zXZ", lzma.LZMADecompressor),
+                       (b"BZh", bz2.BZ2Decompressor)):
+        at = 0 if raw.startswith(magic) else (raw.find(magic) if out else -1)
+        if at >= 0:
+            try:
+                return out + new().decompress(raw[at:])
+            except (OSError, EOFError, ValueError, zlib.error, lzma.LZMAError):
+                return out or None
+    return out or None
+
+
+def initramfs_check(fs):
+    """{"file": the running kernel's initramfs, "found": those modules in it
+    (None: it can't be read here)}"""
+    k = fs.read("/proc/sys/kernel/osrelease") or ""
+    for f in ("/boot/initrd-%s.img" % k, "/boot/initramfs-%s.img" % k, "/boot/initrd.img-%s" % k, "/boot/initrd-%s" % k,
+              "/boot/initrd.img", "/boot/initrd"):
+        try:
+            with open(fs.p(f), "rb") as h:
+                raw = h.read()
+        except OSError:
+            continue
+        data = _initramfs_data(raw)
+        if data is None:
+            return {"file": f, "found": None}
+        mods = re.findall(rb"(lm63|emc2305|pwm[-_]fan|pmbus|ir38064)\.ko", data)
+        return {"file": f, "found": sorted(set(m.decode().replace("-", "_") for m in mods))}
+    return {"file": None, "found": None}
+
+
+def bus_owner(fs, run, action, cfg):
+    """install: the modules kept out, pwmd disabled (how it was written down
+    once, an update keeps that), the drivers unbound now. remove: both given
+    back, nothing unbound (the drivers come back with the next boot)"""
+    conf, state = fs.p(BUS_CONF), fs.p(BUS_STATE)
+    if action == "remove":
+        if os.path.exists(conf):
+            os.remove(conf)
+        try:
+            with open(state) as f:
+                was = f.read().strip().partition("=")[2]
+            os.remove(state)
+        except OSError:
+            was = ""
+        if was in PWMD_ON:
+            run(["systemctl", "enable", "--now", "pwmd"], timeout=60)
+        elif was == "generated":
+            run(["chkconfig", "pwmd", "on"], timeout=15)
+            run(["systemctl", "start", "pwmd"], timeout=60)
+        return
+    if "bmc_owns_i2c" not in cfg["ALLOW"]:
+        log("bmc_owns_i2c is not in ALLOW: the host keeps its own drivers on the shared I2C buses")
+        return
+    os.makedirs(os.path.dirname(conf), exist_ok=True)
+    with open(conf + ".new", "w") as f:
+        f.write(BUS_CONF_TEXT)
+    os.chmod(conf + ".new", 0o644)
+    os.rename(conf + ".new", conf)
+    cur = _pwmd_enabled(run)
+    if not os.path.exists(state):
+        os.makedirs(os.path.dirname(state), mode=0o700, exist_ok=True)
+        with open(state + ".new", "w") as f:
+            f.write("pwmd=%s\n" % cur)
+        os.rename(state + ".new", state)
+    if cur in PWMD_ON:
+        run(["systemctl", "disable", "--now", "pwmd"], timeout=60)
+    elif cur == "generated":  # an init script: chkconfig has its state
+        run(["chkconfig", "pwmd", "off"], timeout=15)
+        run(["systemctl", "stop", "pwmd"], timeout=60)
+    BusOwner(fs, run, cfg).tick()
+    r = initramfs_check(fs)
+    k = fs.read("/proc/sys/kernel/osrelease") or "$(uname -r)"
+    how = "make-initrd -k %s (ALT; or dracut -f --kver %s)" % (k, k)
+    if r["found"]:
+        log("%s has %s: they can load at boot, until the agent unbinds them. To keep them out from the start, "
+            "rebuild it (the modprobe.d file goes in): %s" % (r["file"], " ".join(r["found"]), how))
+    elif r["file"] and r["found"] is None:
+        log("%s can't be read here: if it has %s (lsinitrd), rebuild it: %s" % (r["file"], " ".join(BUS_MODULES), how))
+
+
 def edac_autoload(fs, run, cfg):
     if cfg["EDAC_AUTOLOAD"] and not fs.glob("/sys/devices/system/edac/mc/mc[0-9]*"):
         ok, text = edac_modprobe(run)
@@ -801,8 +997,9 @@ class GpuFan:
 class Controller:
     """the BMC's requests: only OPS, each with its own checked arguments"""
 
-    def __init__(self, cfg, fan, run):
-        self.cfg, self.fan, self.run = cfg, fan, run
+    def __init__(self, cfg, fan, run, col=None):
+        self.cfg, self.fan, self.run, self.col = cfg, fan, run, col
+        self.diag_gz = None
 
     def handle(self, msg, now):
         rid = msg.get("id")
@@ -822,6 +1019,8 @@ class Controller:
         except Exception as e:  # never let a request kill the agent
             ok, text = False, "error: %s" % type(e).__name__
         res.update(ok=ok, err=None if ok else text, text=text if ok else None)
+        if op == "diag" and ok:
+            res["gz"] = self.diag_gz
         log("control: %s: %s" % (op, text))
         return res
 
@@ -840,6 +1039,31 @@ class Controller:
 
     def op_edac_load(self, msg, now):
         return edac_modprobe(self.run)
+
+    def op_diag(self, msg, now):
+        """the report for the BMC's diagnostic archive: a fixed set, no user
+        files; temps() leaves the shared I2C buses alone. gzip+base64, the
+        kernel log's tail shortened until it fits a line."""
+        if not self.col:
+            return False, "no collector"
+        col, fs = self.col, self.col.fs
+        rc, klog = self.run(["dmesg"], timeout=10)
+        klog = (klog if rc == 0 else "dmesg: %s" % klog[:200])[-DIAG_LOG_TAIL:]
+        up = fs.read("/proc/uptime")
+        d = {"inventory": col.inventory(), "edac": col.edac(), "gpu": col.gpu(), "temps": col.temps(),
+             "mem": _meminfo(fs.read("/proc/meminfo")), "uptime": up.split()[0] if up else None,
+             "bmc_usb_hub": bmc_usb_hub_state(fs), "i2c_owner": bus_owner_state(fs, self.cfg),
+             "agent": {"version": VERSION, "proto": PROTO}}
+        while True:
+            d["kernel_log"] = klog
+            z = base64.b64encode(gzip.compress(json.dumps(d).encode(), 6, mtime=0)).decode()
+            if len(z) <= DIAG_MAX_B64 or not klog:
+                break
+            klog = klog[-len(klog) // 2:]
+        if len(z) > DIAG_MAX_B64:
+            return False, "report too large"
+        self.diag_gz = z
+        return True, "report of %d bytes" % len(z)
 
     def policy(self, msg, now):
         """the BMC's standing policy (sent at every connection and change);
@@ -1127,7 +1351,8 @@ class Agent:
         self.col = Collector(fs, run, cfg)
         self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"])
         self.hub = UsbHub(fs, cfg)
-        self.ctl = Controller(cfg, self.fan, run)
+        self.bus = BusOwner(fs, run, cfg)
+        self.ctl = Controller(cfg, self.fan, run, self.col)
         self.backoff = Backoff(1, 60)
         self.last_cand = None
         self.last_rx = time.monotonic()  # the link-loss clock starts at start-up
@@ -1172,8 +1397,8 @@ class Agent:
         raise ValueError("no %s from the BMC" % "/".join(types))
 
     def local_tick(self, now, link_ok):
-        """every 2 s, linked or not: the GPU fan policy, the BMC's USB hub"""
-        return self.fan.tick(now, link_ok) + self.hub.tick()
+        """every 2 s, linked or not: the GPU fan policy, the BMC's USB hub, its I2C buses"""
+        return self.fan.tick(now, link_ok) + self.hub.tick() + self.bus.tick()
 
     def credentials_changed(self):
         """a pairing (pair --pair, install.sh) wrote a new key or address"""
@@ -1212,6 +1437,9 @@ class Agent:
         self.last_rx = time.monotonic()
         if isinstance(w.get("policy"), dict):
             self.ctl.policy(w["policy"], time.monotonic())
+        # now, not in the loop: a stop signal may already be waiting, and what a
+        # killed agent left on the card must be ours to hand back
+        self.fan.tick(time.monotonic(), True)
         self.send_inventory(link, force=True)
         next_metrics = next_gpu = 0
         next_inv = time.monotonic() + INVENTORY_SEC
@@ -1385,6 +1613,8 @@ def do_install(pstr):
         os.chmod(CONF, 0o644)
     if pstr:
         pair(pstr, Fs())
+    if load_secret().get("KEY"):
+        bus_owner(Fs(), run_cmd, "install", load_config())
     shutil.copy(os.path.join(here, "reimu-hostd.service"), UNIT)
     os.chmod(UNIT, 0o644)
     os.sync()  # a BMC reboot resets this host: no empty files
@@ -1399,6 +1629,7 @@ def do_uninstall():
     if os.geteuid() != 0:
         raise SystemExit("run with sudo")
     subprocess.call(["systemctl", "disable", "--now", "reimu-hostd.service"])
+    bus_owner(Fs(), run_cmd, "remove", load_config())
     for f in (UNIT, os.path.join(LIB, "reimu-hostd.py"), SECRET):
         if os.path.exists(f):
             os.remove(f)
@@ -1423,6 +1654,10 @@ def main(argv):
         if len(argv) < 3 or argv[2] not in ("install", "remove"):
             raise SystemExit("usage: reimu-hostd.py hub-rule install|remove")
         hub_rule(fs, run, argv[2])
+    elif cmd == "bus-owner":
+        if len(argv) < 3 or argv[2] not in ("install", "remove"):
+            raise SystemExit("usage: reimu-hostd.py bus-owner install|remove")
+        bus_owner(fs, run, argv[2], cfg)
     elif cmd == "restore-auto":
         f = GpuFan(fs)
         f.touched = True

@@ -295,6 +295,11 @@ def t_control(b, h):
     s, r = action("LoadEdac")
     check(s == 200 and wait(lambda: "modprobe e2k_edac" in h.commands(), 15), "LoadEdac -> modprobe e2k_edac (the module of the board's kernel)")
     check(wait(lambda: sum(1 for x in state()["results"] if x["done"] and x["ok"]) >= 2, 15), "both results back")
+    # the host's report in the diagnostic archive (off by default)
+    r = b.ssh("reimu-diag --with-host", timeout=200)
+    p = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+    o = b.out("cd /tmp && rm -rf hd && mkdir hd && cd hd && tar -xzf '%s' && cat */host-report.json; grep -h host-report */MANIFEST; rm -f '%s'" % (p, p), timeout=60)
+    check(r.returncode == 0 and '"kernel_log"' in o and '"inventory"' in o, "reimu-diag --with-host: the agent's report in the archive (%s)" % o[-120:].strip())
 
 
 def t_e2e():

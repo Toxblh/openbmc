@@ -5,6 +5,8 @@ After=mcst-fruid.service
 # started at platform power-on, stopped at power-off (reimupwr); the FRU ID
 # is read then too, if it wasn't at boot
 Wants=reimu-fru-power.service
+# and the sensors not ready at the first try get more tries
+Wants=hwmon-instantiator-rescan.service
 
 [Service]
 # the platform's devices are left alone while it powers up; a power-off

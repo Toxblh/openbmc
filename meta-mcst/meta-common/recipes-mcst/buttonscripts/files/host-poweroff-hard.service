@@ -4,5 +4,7 @@ Conflicts=host-poweroff.service host-poweron.service host-reset.service
 
 [Service]
 Type=oneshot
+# stopped by a conflicting unit: not a failure
+SuccessExitStatus=SIGTERM
 ExecStart=/usr/bin/env server_pwr_off_hard
 SyslogIdentifier=buttonscripts

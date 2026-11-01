@@ -3,6 +3,7 @@
 #include <string.h>
 #include <libgen.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <syslog.h>
@@ -74,7 +75,17 @@ static int press_button(const char *sym, int delay)
     if (rv) return rv;
     /* the power button of a platform that is off: it powers up */
     int powering_on = !strcmp(sym, "GPIO_PWR_BTN") && get_power_state() == 0;
+    /* The pulse isn't cut short: the power units' mutual Conflicts= stop this
+     * one (TimeoutStopSec is much longer than a press), and a line given up half
+     * way stays driven low, the button held. A signal takes effect after it. */
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGHUP);
+    sigprocmask(SIG_BLOCK, &block, &old);
     rv = reimu_set_gpio_by_name(sym, 0, delay);
+    sigprocmask(SIG_SETMASK, &old, NULL);
     if (rv || !powering_on) return rv;
     for (int i = 0; i < POWER_ON_WAIT_S * 5; ++i)
     {
@@ -150,7 +161,17 @@ static int server_watchdog_reset(int argc, char *argv[])
         int power_state = get_power_state();
         switch(power_state)
         {
-            case 1: return dbus_watchdog_off();
+            case 1:
+                /* the host watchdog is started along with the platform, it
+                 * may not be on D-Bus yet; without one nothing is to be
+                 * turned off: the power-on itself didn't fail */
+                for (int try = 0; try < 5; ++try)
+                {
+                    if (!dbus_watchdog_off()) return 0;
+                    reimu_msleep(1000, NULL);
+                }
+                fprintf(stderr, "Warning: can't turn the host watchdog off (not running?)\n");
+                return 0;
             case 0: break;
             default: return power_state;
         }
@@ -338,6 +359,15 @@ static int uid_switch(int argc __attribute__((unused)), char *argv[] __attribute
 
 struct func_list_t { const char *basename; int (*func)(int argc, char *argv[]); };
 
+/* SIGKILL can't be held off: a press killed before left its button driven low.
+ * Reading a line makes it an input again; busy: someone is pressing it right now.
+ * The reset line is the BMC's on purpose until allow_host_boot releases it. */
+static void release_stuck_buttons(void)
+{
+    reimu_get_gpio_by_name("GPIO_PWR_BTN");
+    if (!access("/run/reimu-reset-released", F_OK)) reimu_get_gpio_by_name("GPIO_RST_BTN");
+}
+
 struct func_list_t uid_cmds[] =
 {
     { "on", uid_on },
@@ -385,6 +415,7 @@ int main(int argc, char *argv[])
     for (int i = 0; main_cmds[i].basename != NULL; ++i)
     {
         if (strcmp(cmd, main_cmds[i].basename)) continue;
+        if (strcmp(cmd, "server_uid")) release_stuck_buttons();
         return main_cmds[i].func(argc, argv);
     }
     return 51;

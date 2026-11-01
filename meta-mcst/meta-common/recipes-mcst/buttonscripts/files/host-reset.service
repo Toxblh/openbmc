@@ -1,8 +1,12 @@
 [Unit]
 Description=Reset Host
 Conflicts=host-poweroff-hard.service host-poweroff.service host-poweron.service
+# after the conflicting unit's press has ended (a stop is ordered before a start)
+After=host-poweroff-hard.service host-poweroff.service
 
 [Service]
 Type=oneshot
+# stopped by a conflicting unit: not a failure
+SuccessExitStatus=SIGTERM
 ExecStart=/usr/bin/env server_reset
 SyslogIdentifier=buttonscripts

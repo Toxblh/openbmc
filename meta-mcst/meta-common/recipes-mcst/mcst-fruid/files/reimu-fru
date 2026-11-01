@@ -13,7 +13,13 @@
 #   reimu-fru power  reimu-fru-power.service, pulled in by hwmon-instantiator
 #                    at platform power-on: the FRU ID once the platform has run
 #                    FRU_SETTLE seconds (its boot loader uses the bus early),
-#                    if it wasn't read yet. Stopped at power-off.
+#                    if it wasn't read yet. Stopped at power-off. And the
+#                    time: a BMC that lost its standby power with the platform
+#                    off has no clock (rtcread found the platform's RTC
+#                    unpowered at boot, AUTO_POWER_ON=off by default), and a
+#                    wrong clock breaks the web's TLS: a clock before 2010 is
+#                    set from the RTC then, once (rtcread power-on, which
+#                    deletes its client after, as at boot).
 #
 # Only this reads the EEPROM (reimu-pnsd doesn't, see its unit), one reader
 # at a time (a lock), and nothing here writes the flash or the EEPROM. The
@@ -104,6 +110,11 @@ fru_read() {
     return 1
 }
 
+# before 2010: rtcread's limit of a right clock
+clock_wrong() {
+    [ "$(date +%s)" -lt 1262304000 ]
+}
+
 case "$1" in
 boot)
     devtree
@@ -118,17 +129,21 @@ boot)
     fi
     ;;
 power)
-    [ -s $XML ] && exit 0
-    echo "FRU ID read in $FRU_SETTLE s, once the platform has started"
+    [ -s $XML ] && ! clock_wrong && exit 0
+    echo "FRU ID/RTC read in $FRU_SETTLE s, once the platform has started"
     sleep $FRU_SETTLE
     i=0
     while [ $i -lt $FRU_TRIES ]
     do
-        fru && exit 0
+        fru && break
         i=$((i + 1))
-        [ $i -lt $FRU_TRIES ] && sleep 60
+        [ $i -lt $FRU_TRIES ] && sleep 60 || echo "FRU ID EEPROM doesn't answer; tried again at the next platform power-on"
     done
-    echo "FRU ID EEPROM doesn't answer; tried again at the next platform power-on"
+    if clock_wrong
+    then
+        echo "The clock is before 2010: reading the platform's RTC"
+        ( flock 9 && /libexec/rtcread power-on ) 9>$LOCK
+    fi
     ;;
 *)
     echo "usage: $0 boot|power" >&2

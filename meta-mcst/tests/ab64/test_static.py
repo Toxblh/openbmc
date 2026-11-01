@@ -21,6 +21,9 @@ Options:
   --rofs DIR      an unpacked rootfs instead (e.g. /work/stock/rofs)
   --kexec TAR     reimu-ab-kexec.tar (default: the deploy dir's)
   --update TAR    reimu-ab.tar (default: the deploy dir's)
+  --backup DIR    the dump of the real BMC's flash (default ~/git/new-reimu/backup)
+  --official MTD  the official release's flash image (default
+                  ~/git/new-reimu/work/upstream/obmc-phosphor-image-reimu-5564.static.mtd)
   --red           also run every check against its bug put back (a mutant
                   of the input): each must FAIL there, or the check would not
                   see the bug come back. Exit 1 if one doesn't.
@@ -48,6 +51,8 @@ IMAGE = opt("--image")
 ROFS = opt("--rofs")
 KEXEC = opt("--kexec", os.path.join(DEPLOY, "reimu-ab-kexec.tar"))
 UPDATE = opt("--update", os.path.join(DEPLOY, "reimu-ab.tar"))
+BACKUP = opt("--backup", os.path.expanduser("~/git/new-reimu/backup"))
+OFFICIAL = opt("--official", os.path.expanduser("~/git/new-reimu/work/upstream/obmc-phosphor-image-reimu-5564.static.mtd"))
 # pristine upstream sources at the pinned revisions (the recipes patch them)
 FRUID_SRC = opt("--fruid-src", "/work/mcst-fruid-src")
 LIBREIMU_SRC = opt("--libreimu-src", "/work/libreimu-src")
@@ -78,6 +83,7 @@ class Ctx:
         self.fruid_seds = True
         self.libreimu_patched = True
         self.fand_mutant = None
+        self.backup_flip = None  # a file of the backup read with a bit flipped
 
     def src(self, rel):
         if rel in self.files:
@@ -602,10 +608,11 @@ def _(ctx):
     sub(ctx, NETW[0], "DHCP=true", "DHCP=yes")
 
 
-@check("S36", 36, "phosphor-fan-control and -monitor not in the image (reimu-fand owns the fans)")
+@check("S36", 36, "phosphor-fan-control, -monitor and -presence-tach not in the image (reimu-fand owns the fans)")
 def s36(ctx):
-    there = [p for p in ("/usr/bin/phosphor-fan-control", "/usr/bin/phosphor-fan-monitor",
-                         "/lib/systemd/system/phosphor-fan-control@.service", "/lib/systemd/system/phosphor-fan-monitor@.service")
+    there = [p for p in ("/usr/bin/phosphor-fan-control", "/usr/bin/phosphor-fan-monitor", "/usr/bin/phosphor-fan-presence-tach",
+                         "/lib/systemd/system/phosphor-fan-control@.service", "/lib/systemd/system/phosphor-fan-monitor@.service",
+                         "/lib/systemd/system/phosphor-fan-presence-tach@.service")
              if ctx.fs(p) is not None]
     fand = ctx.fs("/usr/sbin/reimu-fand") is not None
     return not there and fand, "fan control besides reimu-fand: %s; reimu-fand: %s" % (there or "none", fand)
@@ -616,16 +623,21 @@ def _(ctx):
     ctx.rootfs["/usr/bin/phosphor-fan-control"] = b"\x7fELF"
 
 
-@check("S37", 37, "DTS: multi-master on the buses the platform's masters share (i2c2, i2c3, i2c5, i2c6)")
+@check("S37", 37, "DTS: multi-master on the buses the platform's masters share (i2c2, i2c3, i2c5, i2c6, i2c7: the host's i2c@2, /bmc i2c8 in the PNS device tree)")
 def s37(ctx):
     t = ctx.src(DTS)
-    r = {n: bool(re.search(r"^&%s\s*{[^}]*multi-master;" % n, t, re.M)) for n in ("i2c2", "i2c3", "i2c5", "i2c6")}
+    r = {n: bool(re.search(r"^&%s\s*{[^}]*multi-master;" % n, t, re.M)) for n in ("i2c2", "i2c3", "i2c5", "i2c6", "i2c7")}
     return all(r.values()), str(r)
 
 
 @mutant("S37", "i2c5 (the PCS of the CPUs) without multi-master")
 def _(ctx):
     sub(ctx, DTS, '&i2c5 { status = "okay"; multi-master; };', '&i2c5 { status = "okay"; };')
+
+
+@mutant("S37", "i2c7 (the host's i2c@2) without multi-master")
+def _(ctx):
+    sub(ctx, DTS, '&i2c7 { status = "okay"; multi-master; };', '&i2c7 { status = "okay"; };')
 
 
 @check("S40", 40, "no git source of meta-mcst left at ${AUTOREV} in the A/B build: each pinned (here or by a bbappend of meta-ab64)")
@@ -650,6 +662,71 @@ def s40(ctx):
 def _(ctx):
     sub(ctx, "meta-mcst/meta-common/recipes-mcst/libreimu/libreimu_0.1.bb", 'SRCREV = "4b706bc6d73e3c384cc995547be7cacbb2069a8a"',
         'SRCREV = "${AUTOREV}"')
+
+
+REIMU_AB = "meta-mcst/meta-ab64/recipes-mcst/reimu-ab/files/reimu-ab"
+
+
+@check("S60", 60, "restore-stock: the dump checked against its SHA256SUMS before anything is written")
+def s60(ctx):
+    t = ctx.src(REIMU_AB)
+    f = t[t.index("do_restore_stock() {"):]
+    f = f[:f.index("\n}\n")]
+    chk = f.find('damaged (SHA256SUMS)')
+    wr = min((i for i in (f.find("flash_write"), f.find("$FLASH write"), f.find("env_set")) if i >= 0), default=-1)
+    return 0 <= chk < wr, "check at %d, first write at %d" % (chk, wr)
+
+
+@mutant("S60", "the SHA256SUMS check dropped from restore-stock")
+def _(ctx):
+    sub(ctx, REIMU_AB, """        [ "$(sha256sum < "$d/$f.bin" | cut -d' ' -f1)" = "$want" ] || die "$d/$f.bin: damaged (SHA256SUMS)"\n""", "")
+
+
+@check("S65", 65, "hwmon-instantiator doesn't instantiate the EMC2305 (reimu-fand owns it over i2c-dev, the 6.18 driver's probe would zero its PWM setup)")
+def s65(ctx):
+    t = ctx.src("meta-mcst/meta-common/recipes-mcst/hwmon-instantiator/files/hwmon-instantiator.c")
+    line = t[t.index("supported_devices[]"):].split("\n")[0]
+    return "emc2305" not in line, line
+
+
+@mutant("S65", "emc2305 back in the supported list")
+def _(ctx):
+    sub(ctx, "meta-mcst/meta-common/recipes-mcst/hwmon-instantiator/files/hwmon-instantiator.c", '{ "lm96163", "pmbus", "l_pcs_i2c"', '{ "lm96163", "pmbus", "emc2305", "l_pcs_i2c"')
+
+
+def backup_bytes(ctx, name):
+    p = os.path.join(BACKUP, name)
+    if not os.path.exists(p):
+        raise Skip("no %s (--backup)" % p)
+    b = open(p, "rb").read()
+    if ctx.backup_flip == name:
+        b = bytes([b[0] ^ 1]) + b[1:]
+    return b
+
+
+@check("S61", 61, "the backup restore-stock would write matches its SHA256SUMS; its U-Boot, kernel, rofs are byte for byte the official release's (the programmer's fallback)")
+def s61(ctx):
+    import hashlib
+    sums = backup_bytes(ctx, "SHA256SUMS").decode().split("\n")
+    bad = []
+    for l in sums:
+        if l.strip():
+            d, n = l.split()
+            if hashlib.sha256(backup_bytes(ctx, n)).hexdigest() != d:
+                bad.append(n)
+    if not os.path.exists(OFFICIAL):
+        raise Skip("no %s (--official)" % OFFICIAL)
+    off = open(OFFICIAL, "rb").read()
+    for n, o in (("u-boot.bin", 0), ("kernel.bin", 0x100000), ("rofs.bin", 0x680000)):
+        b = backup_bytes(ctx, n)
+        if off[o:o + len(b)] != b:
+            bad.append(n + " != official")
+    return not bad, "differ: %s" % (bad or "none")
+
+
+@mutant("S61", "a bit flipped in the backup's rofs")
+def _(ctx):
+    ctx.backup_flip = "rofs.bin"
 
 
 DEFCONFIG = "meta-mcst/meta-ab64/recipes-kernel/linux/linux-aspeed/reimu-5564/defconfig"
@@ -682,10 +759,11 @@ PATCHES = [
     (14, "meta-mcst/meta-common/recipes-mcst/libreimu/libreimu_0.1.bb", "0001-reimu_fdt-free-the-previous-device-tree.patch"),
     (14, "meta-mcst/meta-common/recipes-mcst/libreimu/libreimu_0.1.bb", "0002-reimu_find_filename-copy-the-name-before-closedir.patch"),
     (14, "meta-mcst/meta-common/recipes-mcst/libreimu/libreimu_0.1.bb", "0003-reimu_readfile-without-a-size-read-errors-and-the-end.patch"),
+    (44, "meta-mcst/meta-common/recipes-mcst/libreimu/libreimu_0.1.bb", "0004-reimu_dbus-property-sets-wait-for-the-reply.patch"),
 ]
 
 
-@check("S29", "26 29 30 31 32 34 14", "the fix patches (ipmid, bmcweb, libreimu) still in SRC_URI and present")
+@check("S29", "26 29 30 31 32 34 14 44", "the fix patches (ipmid, bmcweb, libreimu) still in SRC_URI and present")
 def s29(ctx):
     bad = []
     for bug, bb, p in PATCHES:

@@ -20,6 +20,7 @@ SRC_URI = " \
             file://Makefile \
             file://overheatd.c \
             file://overheatd.service \
+            file://phosphor-discover-overheat.conf \
           "
 
 S = "${WORKDIR}"
@@ -32,6 +33,8 @@ do_install_append() {
   install -m 755 checkalerts ${D}/usr/bin
   install -m 755 overheatd ${D}/usr/sbin
   install -m 644 overheatd.service ${D}${systemd_system_unitdir}
+  install -d ${D}${systemd_system_unitdir}/phosphor-discover-system-state@.service.d
+  install -m 644 phosphor-discover-overheat.conf ${D}${systemd_system_unitdir}/phosphor-discover-system-state@.service.d/overheat.conf
 }
 
 FILES_${PN} = "/usr/bin /usr/sbin ${systemd_system_unitdir}"

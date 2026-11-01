@@ -1,6 +1,7 @@
 import { api, h, healthBadge } from "../api.js";
 import { fanState, renderFans } from "./fans.js";
 import { hostSensorRows } from "./host.js";
+import { overheatNotes, overheatState } from "./overheat.js";
 
 let root, timer;
 let filter = "";
@@ -56,8 +57,8 @@ export async function mount(el) {
 let last = null;
 
 async function refresh() {
-  const [chassis, plat, fans, host] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState(), hostSensorRows()]);
-  const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat, fans };
+  const [chassis, plat, fans, host, overheat] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState(), hostSensorRows(), overheatState()]);
+  const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat, fans, overheat };
   await Promise.all(
     chassis.map(async (c) => {
       const [t, p] = await Promise.all([
@@ -164,6 +165,7 @@ function render(d) {
     .querySelector("#sens-body")
     .replaceChildren(
       ...[
+        ...overheatNotes(d.overheat, refresh),
         platformNote(d.platform),
         table("Температуры", d.temp, "°C", 1),
         table("Вентиляторы", d.fan, "об/мин", 0, { duty: true, hideIdle: true }),

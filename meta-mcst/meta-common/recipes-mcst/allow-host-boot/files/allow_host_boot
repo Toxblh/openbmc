@@ -12,6 +12,8 @@ spigpio=`gpio2num $GPIO_SPI_CONNECT`
 rstgpio=`gpio2num $GPIO_RST_BTN`
 gpiowrite $spigpio 0
 gpiorelease $rstgpio
+# (server_ctl may now float a reset line left driven by a killed press)
+: > /run/reimu-reset-released
 
 . /etc/auto_power_on
 echo "Auto power on is $AUTO_POWER_ON"
@@ -32,6 +34,12 @@ then
     then
         echo "Delaying power on for $POWER_ON_DELAY seconds"
         sleep $POWER_ON_DELAY
+    fi
+    # an emergency power-off of overheatd: only a power-on by hand (it clears this)
+    if [ -e /var/lib/overheatd/emergency ]
+    then
+        echo "<2>Auto power on HELD BACK: emergency power-off because of overheat: `tr '\n' ' ' < /var/lib/overheatd/emergency`"
+        exit 0
     fi
     echo "Powering on the platform"
     /usr/bin/server_pwr_on

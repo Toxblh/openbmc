@@ -1,9 +1,17 @@
 [Unit]
 Description=Start Host
 Conflicts=host-poweroff-hard.service host-poweroff.service host-reset.service
+# after the conflicting unit's press has ended (a stop is ordered before a start)
+After=host-poweroff-hard.service host-poweroff.service host-reset.service
 
 [Service]
 Type=oneshot
+# stopped by a conflicting unit: not a failure
+SuccessExitStatus=SIGTERM
+# web, Redfish, IPMI: a power-on by hand; overheatd's marker of an emergency
+# power-off goes (the automatic ones don't come here while it's there:
+# phosphor-discover-overheat.conf, allow_host_boot)
+ExecStartPre=-/bin/rm -f /var/lib/overheatd/emergency
 ExecStart=/usr/bin/env server_pwr_on
 ExecStart=/usr/bin/env server_watchdog_reset
 SyslogIdentifier=buttonscripts

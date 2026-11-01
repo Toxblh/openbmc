@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <stddef.h>
 #include <linux/i2c-dev.h>
 #include <libfdt.h>
@@ -28,6 +29,11 @@ long wait_msec = 5000;
 long blink_msec = 500;
 long pcs_bus = 5;        /* BMC I2C bus of the E8C2 PCS (CPU temperature sensors) */
 long pcs_settle_sec = 30; /* Don't touch the platform I2C while it powers up */
+int overheat_poweroff = 1;              /* OVERHEAT_POWEROFF: the power actions; off: the alarm only */
+long cpu_shutdown_temp = 90;            /* A graceful shutdown of the host */
+long cpu_poweroff_temp = 95;            /* The forced power-off */
+long graceful_timeout_sec = 60;         /* Still hot this long after the graceful request: forced */
+long blind_alarm_min = 10;              /* Blind this long: said again, every so long */
 
 #define dbg_printf if(debug) reimu_message
 
@@ -145,6 +151,14 @@ struct cpu_sensor
     long hwmon;       /* hwmon number, -1 = not found (yet) */
     int seen;         /* direct: has given a non-zero reading since the host powered on */
     int failed;       /* the last read failed (reported) */
+    /* What the power actions believe (temp_accept()) */
+    int implausible;  /* the last reading was out of range (reported) */
+    int has_last;     /* last: the last accepted reading, °C */
+    long last;
+    int pending;      /* polls of a jump from it not confirmed yet, at about pending_val */
+    long pending_val;
+    int over_shutdown, over_poweroff; /* polls in a row at or over the temperature */
+    int answered, accepted; /* this poll */
 };
 
 struct cpu_sensor s_sensors[MAX_SENSORS];
@@ -347,6 +361,40 @@ static void detect_hwmon(struct cpu_sensor *s)
     s->hwmon = hwmon;
 }
 
+/* What a power-off may be decided on. A reading glitch must never power off a
+ * working machine (the board has seen register corruption and -47 °C style
+ * garbage): out of range is ignored, a jump counts only once it has lasted,
+ * and an action takes LADDER_CONFIRM_POLLS polls in a row of LADDER_MIN_SENSORS
+ * distinct sensors (one if the CPU has only one answering). */
+#define TEMP_MIN 5
+#define TEMP_MAX 150
+#define TEMP_JUMP 30
+#define LADDER_CONFIRM_POLLS 3
+#define LADDER_MIN_SENSORS 2
+#define TTRIP_CONFIRM_POLLS 3
+#define TTRIP_HOT_TEMP 75
+#define TTRIP_HOLD_SEC 30
+
+static int temp_plausible(long temp)
+{
+    return (temp >= TEMP_MIN) && (temp <= TEMP_MAX);
+}
+
+/* A plausible reading: does it count yet? */
+static int temp_accept(struct cpu_sensor *s, long temp)
+{
+    if (s->has_last && (labs(temp - s->last) > TEMP_JUMP))
+    {
+        s->pending = (s->pending && (labs(temp - s->pending_val) <= TEMP_JUMP)) ? s->pending + 1 : 1;
+        s->pending_val = temp;
+        if (s->pending < LADDER_CONFIRM_POLLS) return 0;
+    }
+    s->pending = 0;
+    s->last = temp;
+    s->has_last = 1;
+    return 1;
+}
+
 /* Temperature in millidegrees: 0 = done, 1 = no sensor there, <0 = failure */
 static int get_temperature(struct cpu_sensor *s, int *i2c_fd, int *i2c_fd_bus, long *result)
 {
@@ -389,6 +437,373 @@ static int get_temperature(struct cpu_sensor *s, int *i2c_fd, int *i2c_fd_bus, l
     s->seen = 1;
     *result = raw * 125;
     return 0;
+}
+
+/* The power actions, the last resort when the CPU's own protection fails.
+ *
+ * Over CPU_SHUTDOWN_TEMP: a graceful shutdown, by the host agent (reimu-hostlink,
+ * OsPower) if it's there, else a short press of the power button. Over
+ * CPU_POWEROFF_TEMP, TTRIP# confirmed, or still over CPU_SHUTDOWN_TEMP after
+ * GRACEFUL_TIMEOUT_SEC: forced off, a long press, until power good goes.
+ *
+ * A forced power-off leaves a marker in the rwfs, while it is there nothing
+ * powers the host on automatically (allow_host_boot, phosphor-discover-system-
+ * state); power on by hand clears it: host-poweron.service (web, Redfish, IPMI),
+ * power good coming up without us (the front panel button, seen here), and
+ * ClearEmergency (reimu-pnsd) without a power-on.
+ *
+ * Children do the work (server_ctl may wait for the PNS lock and holds the
+ * button for 5 s: the watchdog must go on being fed), the state goes to /run so
+ * that a restart goes on where it was: GRACEFUL_TIMEOUT_SEC counts from the
+ * request, the button isn't pressed twice. It uses only what's on the rootfs:
+ * neither bmcweb nor reimu-hostlink need to be up.
+ * Without a CPLD (this board) TTRIP# doesn't exist: the temperatures stand alone. */
+#define LADDER_STATE_DIR "/run/overheatd"
+#define LADDER_STATE LADDER_STATE_DIR "/ladder"
+#define EMERGENCY_DIR "/var/lib/overheatd"
+#define EMERGENCY_FILE EMERGENCY_DIR "/emergency"
+#define ACTION_TIMEOUT_SEC 45  /* server_ctl: the PNS lock 15 s, the press 5 s */
+#define FORCE_VERIFY_SEC 3     /* power good after the press */
+#define SELF_POWER_ON_SEC 30   /* power good this soon after a forced off, the marker still there: the
+                                * platform by itself (seen once on the board after a forced off, 1 s
+                                * later, cause unknown), a CPU that hasn't cooled: off again */
+#define ACTION_SENT 100        /* exit code of a child: told the agent */
+/* Critical in the journal (SyslogLevelPrefix) */
+#define crit_printf(fmt, ...) reimu_message(stderr, "<2>(%s) " fmt "\n", reimu_gettime(), ##__VA_ARGS__)
+
+enum { LADDER_IDLE, LADDER_GRACEFUL, LADDER_FORCING };
+const char *const s_ladder_names[] = { "idle", "graceful", "forcing" };
+int s_ladder = LADDER_IDLE;
+long s_graceful_since = 0;  /* monotonic, as the state in /run: it survives a restart of the daemon */
+pid_t s_action_pid = 0;
+int s_action_force = 0;
+long s_action_since = 0;
+int s_action_rv = 0;        /* of the last child, -1: killed */
+long s_action_done = 0;
+long s_forced_off_at = 0;   /* the forced power-off seen */
+int s_skipped_graceful = 0, s_skipped_force = 0;
+int s_graceful_cooled = 0;
+int s_polls_since_start = 0;
+char s_emergency[512] = ""; /* the marker's content, one line */
+
+static void ladder_save(void)
+{
+    char buf[48];
+    mkdir(LADDER_STATE_DIR, 0755);
+    snprintf(buf, sizeof(buf), "%d %ld %ld\n", s_ladder, s_graceful_since, s_forced_off_at);
+    reimu_writefile(LADDER_STATE, buf, strlen(buf));
+}
+
+static void ladder_load(void)
+{
+    char buf[48];
+    int state;
+    long since, off_at;
+    if ((read_small_file(LADDER_STATE, buf, sizeof(buf)) > 0) && (sscanf(buf, "%d %ld %ld", &state, &since, &off_at) == 3) && (state >= LADDER_IDLE) && (state <= LADDER_FORCING))
+    {
+        s_ladder = state;
+        s_graceful_since = since;
+        s_forced_off_at = off_at;
+        if (state != LADDER_IDLE) crit_printf("Overheat: going on with the power actions after a restart (%s)", s_ladder_names[state]);
+    }
+}
+
+/* The child of an action: its own process group, for the kill */
+static void action_child(int force)
+{
+    setsid();
+    if (!force)
+    {
+        pid_t p = fork();
+        if (p == 0)
+        {
+            execl("/usr/bin/busctl", "busctl", "--timeout=10", "call", "xyz.openbmc_project.Reimu.HostLink", "/xyz/openbmc_project/reimu/hostlink",
+                  "xyz.openbmc_project.Reimu.HostLink", "OsPower", "s", "poweroff", (char *)NULL);
+            _exit(127);
+        }
+        int status;
+        if ((p > 0) && (waitpid(p, &status, 0) == p) && WIFEXITED(status) && !WEXITSTATUS(status)) _exit(ACTION_SENT);
+    }
+    /* These look at power good first: the button of a host that is off would power it on */
+    const char *cmd = force ? "/usr/bin/server_pwr_off_hard" : "/usr/bin/server_pwr_off";
+    execl(cmd, cmd, (char *)NULL);
+    _exit(127);
+}
+
+static void action_start(int force)
+{
+    pid_t p = fork();
+    if (p < 0)
+    {
+        crit_printf("Overheat: can't start the power action: %s", strerror(errno));
+        s_action_rv = -1;
+        s_action_done = monotonic_sec();
+        return;
+    }
+    if (p == 0) action_child(force);
+    s_action_pid = p;
+    s_action_force = force;
+    s_action_since = monotonic_sec();
+}
+
+/* A press killed half way leaves the button driven low, held down (a line given
+ * up keeps its direction; server_ctl floats it only at the end of the press):
+ * reading it makes it an input again, nothing is pressed any more. Busy: someone
+ * is pressing it, and that one ends it. */
+static void button_release(void)
+{
+    reimu_get_gpio_by_name("GPIO_PWR_BTN");
+}
+
+static void action_reap(int kill_it)
+{
+    if (!s_action_pid) return;
+    int status;
+    if (kill_it || (monotonic_sec() - s_action_since > ACTION_TIMEOUT_SEC))
+    {
+        kill(-s_action_pid, SIGKILL);
+        if (!kill_it) crit_printf("Overheat: the power action didn't end in %d s, killed", ACTION_TIMEOUT_SEC);
+        waitpid(s_action_pid, &status, 0);
+        s_action_rv = -1;
+    }
+    else
+    {
+        if (waitpid(s_action_pid, &status, WNOHANG) != s_action_pid) return;
+        s_action_rv = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    s_action_pid = 0;
+    s_action_done = monotonic_sec();
+    if (s_action_rv == -1) button_release();
+    if (s_action_rv == ACTION_SENT) crit_printf("Overheat: graceful shutdown requested from the host agent (OsPower)");
+    else if (!s_action_force && !s_action_rv) crit_printf("Overheat: graceful shutdown requested by the power button");
+    else if (s_action_rv) crit_printf("Overheat: the %s failed (%d)", s_action_force ? "forced power-off" : "graceful shutdown", s_action_rv);
+}
+
+/* The other alert lines can't drive a power-off, they are only said (active low):
+ * I2CM_ALERT#/ALERT_CPU# (14), I2C1_TCRIT#/TCRIT_SMBUS# (9), I2C1_ALERT#/ALERT_SMBUS# (8) */
+static void log_alert_lines(uint32_t alerts)
+{
+    static uint32_t s_old = 0xffffffff;
+    uint32_t now = alerts & 0x00004300;
+    if (now == s_old) return;
+    reimu_message(stderr, "(%s) Alert lines: ALERT_CPU# %s, TCRIT_SMBUS# %s, ALERT_SMBUS# %s (no action on these)\n", reimu_gettime(),
+                  (now & 0x4000) ? "inactive" : "ASSERTED", (now & 0x0200) ? "inactive" : "ASSERTED", (now & 0x0100) ? "inactive" : "ASSERTED");
+    s_old = now;
+}
+
+/* What we can't wait for and don't need to: a phosphor-logging entry (only the error log of the web) */
+static void log_entry(const char *msg)
+{
+    pid_t p = fork();
+    if (p == 0)
+    {
+        /* A grandchild, not ours to wait for */
+        setsid();
+        if (fork() != 0) _exit(0);
+        execl("/usr/bin/busctl", "busctl", "--timeout=10", "call", "xyz.openbmc_project.Logging", "/xyz/openbmc_project/logging", "xyz.openbmc_project.Logging.Create", "Create",
+              "ssa{ss}", msg, "xyz.openbmc_project.Logging.Entry.Level.Critical", "0", (char *)NULL);
+        _exit(127);
+    }
+    if (p > 0) waitpid(p, NULL, 0);
+}
+
+static void emergency_write(const char *reason, const char *temps)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf), "time=%s\nreason=%s\ntemps=%s\n", reimu_gettime(), reason, temps);
+    mkdir(EMERGENCY_DIR, 0755);
+    int fd = open(EMERGENCY_FILE ".new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int ok = (fd >= 0) && (write(fd, buf, strlen(buf)) == (ssize_t)strlen(buf)) && !fsync(fd);
+    if (fd >= 0) close(fd);
+    ok = ok && !rename(EMERGENCY_FILE ".new", EMERGENCY_FILE);
+    fd = open(EMERGENCY_DIR, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    /* It goes off all the same */
+    if (!ok) crit_printf("Overheat: can't write the marker %s: the host may be powered on automatically", EMERGENCY_FILE);
+}
+
+/* The marker's content, as a line of the state file; returns whether it's there */
+static int emergency_read(void)
+{
+    int n = read_small_file(EMERGENCY_FILE, s_emergency, sizeof(s_emergency));
+    if (n < 0) { s_emergency[0] = '\0'; return 0; }
+    for (char *c = s_emergency; *c; ++c)
+    {
+        if (*c == '\n') *c = ';';
+        if ((*c == '<') || (*c == '>') || (*c == '&')) *c = ' ';
+    }
+    return 1;
+}
+
+static void ladder_force(const char *reason, const char *temps)
+{
+    action_reap(1);
+    crit_printf("Overheat: FORCED POWER-OFF: %s (%s)", reason, temps);
+    emergency_write(reason, temps);
+    char msg[320];
+    snprintf(msg, sizeof(msg), "Overheat emergency power-off: %s (%s)", reason, temps);
+    log_entry(msg);
+    s_ladder = LADDER_FORCING;
+    ladder_save();
+    action_start(1);
+}
+
+/* Called on every poll; power: GPIO_POWER_IN as read, <0: unknown (no action then).
+ * shutdown, poweroff: confirmed over these temperatures; ttrip: confirmed. */
+static void ladder_step(int power, int shutdown, int poweroff, int ttrip, const char *temps)
+{
+    static int s_old_power = -1;
+    long now = monotonic_sec();
+    action_reap(0);
+    ++s_polls_since_start;
+
+    if (power < 0) return;
+
+    /* Power good came up. Anything automatic is held back while the marker is
+     * there (see above), and a power-on through host-poweron.service has removed
+     * it already: someone did it by hand (the button), unless the platform came
+     * back by itself right after the forced off: that one is pressed again */
+    if ((power == 1) && (s_old_power != 1) && s_emergency[0] && overheat_poweroff)
+    {
+        if (s_forced_off_at && (now - s_forced_off_at < SELF_POWER_ON_SEC))
+        {
+            crit_printf("Overheat: the host came back on by itself %ld s after the forced power-off: pressing again (%s)", now - s_forced_off_at, s_emergency);
+            action_reap(1);
+            s_ladder = LADDER_FORCING;
+            s_action_rv = 0;
+            s_action_done = now; /* the backoff of the FORCING state below */
+            ladder_save();
+        }
+        else if (s_old_power == 0)
+        {
+            crit_printf("Overheat: the host was powered on by hand: the emergency marker is cleared (%s)", s_emergency);
+            unlink(EMERGENCY_FILE);
+        }
+    }
+    s_old_power = power;
+
+    if (power == 0)
+    {
+        if (s_ladder == LADDER_FORCING)
+        {
+            crit_printf("Overheat: the host is off (power good is gone) after the forced power-off");
+            s_forced_off_at = now;
+        }
+        /* (the press itself goes on: not again before it ends) */
+        else if (s_ladder == LADDER_GRACEFUL) crit_printf("Overheat: the host is off after the graceful shutdown");
+        if (s_ladder != LADDER_IDLE)
+        {
+            s_ladder = LADDER_IDLE;
+            ladder_save();
+        }
+        s_skipped_graceful = s_skipped_force = s_graceful_cooled = 0;
+        return;
+    }
+
+    const char *force_reason = NULL;
+    char reason[96];
+    if (ttrip) force_reason = "I2CM_TTRIP# asserted";
+    else if (poweroff)
+    {
+        snprintf(reason, sizeof(reason), "CPU temperature at or over CPU_POWEROFF_TEMP %ld C", cpu_poweroff_temp);
+        force_reason = reason;
+    }
+
+    if (!overheat_poweroff)
+    {
+        /* Turned off on purpose: said at each action it would take */
+        if (force_reason && !s_skipped_force) crit_printf("Overheat: forced power-off SKIPPED (OVERHEAT_POWEROFF=no): %s (%s)", force_reason, temps);
+        else if (shutdown && !force_reason && !s_skipped_graceful) crit_printf("Overheat: graceful shutdown SKIPPED (OVERHEAT_POWEROFF=no): CPU temperature at or over CPU_SHUTDOWN_TEMP %ld C (%s)", cpu_shutdown_temp, temps);
+        s_skipped_force = (force_reason != NULL);
+        s_skipped_graceful = shutdown;
+        if (s_ladder != LADDER_IDLE)
+        {
+            action_reap(1);
+            s_ladder = LADDER_IDLE;
+            ladder_save();
+        }
+        return;
+    }
+    s_skipped_graceful = s_skipped_force = 0;
+
+    switch (s_ladder)
+    {
+        case LADDER_IDLE:
+            if (force_reason) ladder_force(force_reason, temps);
+            else if (shutdown)
+            {
+                crit_printf("Overheat: graceful shutdown: CPU temperature at or over CPU_SHUTDOWN_TEMP %ld C (%s)", cpu_shutdown_temp, temps);
+                s_ladder = LADDER_GRACEFUL;
+                s_graceful_since = now;
+                s_graceful_cooled = 0;
+                ladder_save();
+                action_start(0);
+            }
+            break;
+        case LADDER_GRACEFUL:
+        {
+            long elapsed = now - s_graceful_since;
+            if (force_reason) ladder_force(force_reason, temps);
+            else if (shutdown)
+            {
+                s_graceful_cooled = 0;
+                if (elapsed >= graceful_timeout_sec)
+                {
+                    snprintf(reason, sizeof(reason), "still over CPU_SHUTDOWN_TEMP %ld C after %ld s of graceful shutdown", cpu_shutdown_temp, elapsed);
+                    ladder_force(reason, temps);
+                }
+                /* Not even asked (the button's GPIO busy...): again */
+                else if (!s_action_pid && (s_action_rv != ACTION_SENT) && s_action_rv && !s_action_force && (now - s_action_done >= 5)) action_start(0);
+            }
+            else if (s_polls_since_start > LADDER_CONFIRM_POLLS * 2)
+            {
+                if (!s_graceful_cooled) crit_printf("Overheat: CPU temperature under CPU_SHUTDOWN_TEMP again (%s): no escalation (an OS shutdown already started goes on)", temps);
+                s_graceful_cooled = 1;
+                if (elapsed >= graceful_timeout_sec)
+                {
+                    s_ladder = LADDER_IDLE;
+                    ladder_save();
+                }
+            }
+            break;
+        }
+        case LADDER_FORCING:
+            /* Until it's off: verified after each press */
+            if (!s_action_pid && (now - s_action_done >= FORCE_VERIFY_SEC))
+            {
+                crit_printf("Overheat: power good still on after the forced power-off (%d): pressing again", s_action_rv);
+                action_start(1);
+            }
+            break;
+    }
+}
+
+/* What each sensor gave on this poll, for the journal of a blind state */
+static const char *sensors_blind_summary(void)
+{
+    static char buf[320];
+    int len = 0;
+    buf[0] = '\0';
+    for (int i = 0; (i < s_nsensors) && (len < (int)sizeof(buf) - 32); ++i)
+    {
+        const struct cpu_sensor *s = &s_sensors[i];
+        const char *what = s->implausible ? "implausible" : s->failed ? "read failed" : "no answer";
+        len += snprintf(buf + len, sizeof(buf) - len, "%scpu%d/%d (bus %d 0x%02x): %s", len ? ", " : "", s->cpu, s->sensor, s->bus, s->reg, what);
+    }
+    return len ? buf : "no sensors known";
+}
+
+/* The last accepted readings, for the journal and the marker */
+static const char *sensors_summary(void)
+{
+    static char buf[256];
+    int len = 0;
+    buf[0] = '\0';
+    for (int i = 0; (i < s_nsensors) && (len < (int)sizeof(buf) - 24); ++i)
+    {
+        if (s_sensors[i].accepted) len += snprintf(buf + len, sizeof(buf) - len, "%scpu%d/%d=%ldC", len ? " " : "", s_sensors[i].cpu, s_sensors[i].sensor, s_sensors[i].last);
+    }
+    return len ? buf : "no reading";
 }
 
 static const char *overheat_set_led_gpio(const char *trigger)
@@ -548,6 +963,7 @@ static uint32_t get_alerts_gpio(void)
         [31] = "GPIO_RESET_IN", [23] = "GPIO_APMDZ_LED", [21] = "GPIO_POWER_IN", [14] = "GPIO_ALERT_1",
         [12] = "GPIO_ALERT_2",  [6]  = "GPIO_ALERT_4",   [11] = "GPIO_ALERT_3",  [10] = "GPIO_ALERT_7",
         [8]  = "GPIO_ALERT_5",  [9]  = "GPIO_ALERT_6",   [4]  = "GPIO_INTRUSION",
+        [15] = "GPIO_TTRIP",
     };
     static uint32_t s_failed_gpios = 0;
 
@@ -556,6 +972,10 @@ static uint32_t get_alerts_gpio(void)
     {
         if (names[i] == NULL) continue;
         int b = reimu_get_gpio_by_name(names[i]);
+        /* I2CM_TTRIP#: boards without CPLD don't have it ("always 1" in the REIMU docs; with
+         * a CPLD it's in the TinySPI status register), read only if the gpiotab names a line
+         * for it (the QEMU test does); -2: not in the gpiotab */
+        if ((i == 15) && (b == -2)) b = 1;
         /* Unreadable (e.g. busy: exported to sysfs by checkalerts): taken as high = inactive */
         if (b < 0) { failed |= (1u << i); b = 1; }
         alerts |= ((uint32_t)(b & 1) << i);
@@ -567,7 +987,7 @@ static uint32_t get_alerts_gpio(void)
         s_failed_gpios = failed;
     }
 
-    return alerts | 0x0010a0a5;
+    return alerts | 0x001020a5; /* (bit 15, I2CM_TTRIP#, is read: GPIO_TTRIP above) */
 }
 
 volatile int s_dbg_state = 0; /* 0 = normal state; 1 = slight overheat; 2 = critical overheat */
@@ -597,7 +1017,12 @@ static void reload_config(const char *configfile)
             "DEBUG=off\n"
             "CPU_TEMP_LIMIT=85\n"
             "WAIT_MSEC=5000\n"
-            "BLINK_MSEC=500\n";
+            "BLINK_MSEC=500\n"
+            "CPU_SHUTDOWN_TEMP=90\n"
+            "CPU_POWEROFF_TEMP=95\n"
+            "GRACEFUL_TIMEOUT_SEC=60\n"
+            "OVERHEAT_POWEROFF=yes\n"
+            "BLIND_ALARM_MIN=10\n";
 
         if(reimu_writefile(configfile, defaultconfig, strlen(defaultconfig)) && !s_config_bad) reimu_message(stderr, "(%s) Can't create new config %s\n", reimu_gettime(), configfile);
     }
@@ -652,6 +1077,36 @@ static void reload_config(const char *configfile)
         s_dtb = NULL;
     }
 
+    /* The power actions: POWEROFF > SHUTDOWN >= LIMIT, or the defaults for all
+     * three; a malformed OVERHEAT_POWEROFF: they stay on */
+    static int s_ladder_bad = 0, s_old_poweroff = 1;
+    long new_shutdown = get_conf_long_opt(daemoncfg, daemoncfg_len, "CPU_SHUTDOWN_TEMP", 90);
+    long new_off      = get_conf_long_opt(daemoncfg, daemoncfg_len, "CPU_POWEROFF_TEMP", 95);
+    long new_timeout  = get_conf_long_opt(daemoncfg, daemoncfg_len, "GRACEFUL_TIMEOUT_SEC", 60);
+    int new_poweroff  = reimu_get_conf_bool(daemoncfg, daemoncfg_len, "OVERHEAT_POWEROFF");
+    long new_blind    = get_conf_long_opt(daemoncfg, daemoncfg_len, "BLIND_ALARM_MIN", 10);
+    blind_alarm_min   = ((new_blind >= 1) && (new_blind <= 1440)) ? new_blind : 10;
+    int bad = (new_shutdown < new_limit) || (new_off <= new_shutdown) || !temp_plausible(new_shutdown) || !temp_plausible(new_off) || (new_timeout < 1) || (new_timeout > 3600) || (new_poweroff == -2);
+    if (bad)
+    {
+        if (!s_ladder_bad) reimu_message(stderr, "(%s) Bad CPU_SHUTDOWN_TEMP (%ld), CPU_POWEROFF_TEMP (%ld), GRACEFUL_TIMEOUT_SEC (%ld) or OVERHEAT_POWEROFF in %s: the defaults 90, 95, 60, yes\n", reimu_gettime(), new_shutdown, new_off, new_timeout, configfile);
+        new_shutdown = 90;
+        new_off = 95;
+        new_timeout = 60;
+        if (new_poweroff == -2) new_poweroff = 1;
+    }
+    s_ladder_bad = bad;
+    cpu_shutdown_temp = new_shutdown;
+    cpu_poweroff_temp = new_off;
+    graceful_timeout_sec = new_timeout;
+    overheat_poweroff = (new_poweroff != 0);
+    if (overheat_poweroff != s_old_poweroff)
+    {
+        if (overheat_poweroff) crit_printf("Overheat: the power actions are ON again (OVERHEAT_POWEROFF)");
+        else crit_printf("Overheat: the power actions are OFF (OVERHEAT_POWEROFF=no): the BMC won't power the host off on overheat, the alarm only");
+        s_old_poweroff = overheat_poweroff;
+    }
+
     s_blink_its.it_value.tv_sec  = blink_msec / 1000L;
     s_blink_its.it_value.tv_nsec = (blink_msec % 1000L) * 1000000L;
     s_blink_its.it_interval = s_blink_its.it_value;
@@ -696,16 +1151,23 @@ int main(int argc, char *argv[])
     int overheat_cond = 0;
     int last_dbg_state = 0;
     int led_failed = 0, state_failed = 0, no_sensors = 0, was_powered_on = 0, over_limit = 0;
+    int ttrip_polls = 0, fast_poll = 0, one_sensor_said = 0;
+    long ttrip_since = 0, blind_since = 0, blind_said = 0;
     long powered_on_since = 0;
     unsigned long poll = 0;
     set_signal_handlers();
     create_pidfile();
     if (reimu_textfile_buf_alloc()) reimu_cancel(-250, "Out of memory\n");
     int tinyspi = detect_tinyspi();
+    /* (a press of the last run goes on: KillMode=process, then it's busy here) */
+    button_release();
+    ladder_load();
+    if (emergency_read()) crit_printf("Overheat: emergency marker %s: no automatic power-on of the host (%s)", EMERGENCY_FILE, s_emergency);
     notify_systemd("READY=1");
 
     for(;;)
     {
+        fast_poll = 0;
         watchdog_ping();
         reload_config("/etc/overheatd.conf");
         dbg_printf(stdout, "Reloaded config: (OVERHEATD_ENABLED = %d, DEBUG = %d; CPU_TEMP_LIMIT = %ld; WAIT_MSEC = %ld; BLINK_MSEC = %ld; PCS_BUS = %ld; PCS_SETTLE_SEC = %ld)\n", overheatd_enabled, debug, cpu_temp_limit, wait_msec, blink_msec, pcs_bus, pcs_settle_sec);
@@ -736,6 +1198,8 @@ int main(int argc, char *argv[])
                 }
                 break;
             }
+            int alerts_valid = 1;
+            int real_power = powered_on; /* <0: no power action, the button could power it on */
             if (powered_on < 0)
             {
                 /* Better check the sensors in vain than not at all */
@@ -765,6 +1229,7 @@ int main(int argc, char *argv[])
                     {
                         reimu_message(stderr, "(%s) Can't read TinySPI alerts (error %d), keeping 0x%08x\n", reimu_gettime(), rv, alerts);
                         tinyspi_alert = 2;
+                        alerts_valid = 0;
                     }
                 }
             }
@@ -777,6 +1242,10 @@ int main(int argc, char *argv[])
             dbg_printf(stdout, "Alerts: 0x%08x\n", alerts);
             if(reimu_textfile_buf_append("\t<alerts>0x%08x</alerts>\n", alerts)) reimu_cancel(-250, "Out of memory\n");
 
+            /* (before the simulated states of SIGUSR1: testing the LED must never cost the host.
+             * They only reach the LED and the status; the power actions look at real readings) */
+            int ttrip_low = alerts_valid && !(alerts & 0x00008000) && (real_power == 1);
+            if (alerts_valid) log_alert_lines(alerts);
             if (s_dbg_state == 2) { alerts &= 0xffff7fff; dbg_printf(stdout, "DEBUG MODE: alerts altered to 0x%08x\n", alerts); }
 
             /* THERMAL_SHDN# (bit 0) == 0 : overheat on */
@@ -814,11 +1283,17 @@ int main(int argc, char *argv[])
             /* Host powered off: its sensors are unpowered; read them again from scratch next time */
             if (!powered_on)
             {
-                for (int i = 0; i < s_nsensors; ++i) s_sensors[i].seen = 0;
+                for (int i = 0; i < s_nsensors; ++i)
+                {
+                    s_sensors[i].seen = s_sensors[i].has_last = s_sensors[i].pending = s_sensors[i].accepted = 0;
+                    s_sensors[i].over_shutdown = s_sensors[i].over_poweroff = 0;
+                }
             }
+            int confirmed_shutdown = 0, confirmed_poweroff = 0;
+            long hot_temp = 0;
 
-            /* We are not in critical overheat, and powered on (for a while: its power-up must not see BMC traffic on the bus), so check I2C */
-            if(!strcmp(led_trigger, "none") && powered_on && (monotonic_sec() - powered_on_since >= pcs_settle_sec))
+            /* Powered on (for a while: its power-up must not see BMC traffic on the bus), so check I2C */
+            if(powered_on && (monotonic_sec() - powered_on_since >= pcs_settle_sec))
             {
                 update_sensors();
 
@@ -835,6 +1310,8 @@ int main(int argc, char *argv[])
                     long temp;
                     int rv = get_temperature(s, &i2c_fd, &i2c_fd_bus, &temp);
                     watchdog_ping();
+                    s->answered = s->accepted = 0;
+                    if (rv != 0) s->over_shutdown = s->over_poweroff = 0;
                     if (rv < 0)
                     {
                         if (!s->failed) reimu_message(stderr, "(%s) Failure reading CPU sensor (cpu = %d, sensor = %d, error %d)\n", reimu_gettime(), s->cpu, s->sensor, rv);
@@ -848,16 +1325,68 @@ int main(int argc, char *argv[])
                     double tempdbl = temp / 1000.0;
                     temp /= 1000;
                     dbg_printf(stdout, "Temp (%d:%d): %ld (%f)\n", s->cpu, s->sensor, temp, tempdbl);
+                    s->answered = 1;
+
+                    /* Garbage: not a temperature at all */
+                    if (!temp_plausible(temp))
+                    {
+                        if (!s->implausible) reimu_message(stderr, "(%s) Warning: implausible reading of CPU sensor (cpu = %d, sensor = %d): %ld C, ignored\n", reimu_gettime(), s->cpu, s->sensor, temp);
+                        s->implausible = 1;
+                        s->pending = s->over_shutdown = s->over_poweroff = 0;
+                        if(reimu_textfile_buf_append("\t<implausible cpu=\"%d\" sensor=\"%d\">%f</implausible>\n", s->cpu, s->sensor, tempdbl)) reimu_cancel(-250, "Out of memory\n");
+                        continue;
+                    }
+                    s->implausible = 0;
+
                     if(reimu_textfile_buf_append("\t<temperature cpu=\"%d\" sensor=\"%d\">%f</temperature>\n", s->cpu, s->sensor, tempdbl)) reimu_cancel(-250, "Out of memory\n");
                     cpus[s->cpu] = 1;
                     ++monitored;
-                    if (temp > maxtemp) maxtemp = temp;
 
                     long limit = cpu_temp_limit;
                     if ((s_cpu_limit[s->cpu] >= 0) && (s_cpu_limit[s->cpu] < limit)) limit = s_cpu_limit[s->cpu];
+                    if (temp > limit) fast_poll = 1; /* Confirm it soon, whether it's real or not */
+
+                    /* A jump from the last reading counts once it has lasted */
+                    s->accepted = temp_accept(s, temp);
+                    if (!s->accepted)
+                    {
+                        s->over_shutdown = s->over_poweroff = 0;
+                        continue;
+                    }
+                    if (temp > maxtemp) maxtemp = temp;
                     if (temp - limit > maxover) maxover = temp - limit;
+                    s->over_shutdown = (temp >= cpu_shutdown_temp) ? s->over_shutdown + 1 : 0;
+                    s->over_poweroff = (temp >= cpu_poweroff_temp) ? s->over_poweroff + 1 : 0;
                 }
                 if (i2c_fd >= 0) close(i2c_fd);
+
+                /* A CPU is over a temperature when 2 of its sensors say so, polls in a row
+                 * (or its only one that answers; an answer of garbage is an answer) */
+                int any_over = 0;
+                for (int cpu = 0; cpu < MAX_CPUS; ++cpu)
+                {
+                    int answering = 0, over_s = 0, over_p = 0;
+                    for (int i = 0; i < s_nsensors; ++i)
+                    {
+                        struct cpu_sensor *s = &s_sensors[i];
+                        if (s->cpu != cpu) continue;
+                        answering += s->answered;
+                        over_s += (s->over_shutdown >= LADDER_CONFIRM_POLLS);
+                        over_p += (s->over_poweroff >= LADDER_CONFIRM_POLLS);
+                    }
+                    int need = (answering >= LADDER_MIN_SENSORS) ? LADDER_MIN_SENSORS : 1;
+                    if (over_s >= need) confirmed_shutdown = 1;
+                    if (over_p >= need) confirmed_poweroff = 1;
+                    if (over_s) any_over = 1;
+                    if (over_s && !one_sensor_said)
+                    {
+                        if ((over_s >= need) && (answering == 1)) reimu_message(stderr, "(%s) Warning: CPU %d has one sensor answering: acting on it alone\n", reimu_gettime(), cpu);
+                        if (over_s < need) reimu_message(stderr, "(%s) Warning: one sensor of CPU %d over CPU_SHUTDOWN_TEMP, the others aren't: unconfirmed, no action (%s)\n", reimu_gettime(), cpu, sensors_summary());
+                        one_sensor_said = (answering == 1) || (over_s < need);
+                    }
+                }
+                if (!any_over) one_sensor_said = 0;
+                hot_temp = maxtemp;
 
                 dbg_printf(stdout, "CPUs detected: %d, %d, %d, %d\n", cpus[0], cpus[1], cpus[2], cpus[3]);
                 if(reimu_textfile_buf_append("\t<cpus>")) reimu_cancel(-250, "Out of memory\n");
@@ -880,7 +1409,7 @@ int main(int argc, char *argv[])
                 if (maxover > 0)
                 {
                     if (!over_limit) reimu_message(stderr, "(%s) Warning: CPU temperature %ld °C is %ld °C over the limit\n", reimu_gettime(), maxtemp, maxover);
-                    led_trigger = "timer";
+                    if (!strcmp(led_trigger, "none")) led_trigger = "timer";
                     status = "over-limit";
                 }
                 else if (over_limit) reimu_message(stderr, "(%s) CPU temperatures are under the limit again (max %ld °C)\n", reimu_gettime(), maxtemp);
@@ -889,17 +1418,49 @@ int main(int argc, char *argv[])
                 /* The host runs, but no CPU temperature is known: say so loudly, and blink otherwise than for an overheat */
                 if (!monitored)
                 {
-                    if (!no_sensors) reimu_message(stderr, "(%s) Error: the host is powered on, but no CPU temperature sensor is readable: overheat protection is blind\n", reimu_gettime());
+                    long now = monotonic_sec();
+                    if (!no_sensors)
+                    {
+                        crit_printf("Overheat: the host is powered on, but no CPU temperature sensor is readable: overheat protection is blind, no power action on temperature (%s)", sensors_blind_summary());
+                        blind_since = blind_said = now;
+                    }
+                    else if (now - blind_said >= blind_alarm_min * 60)
+                    {
+                        crit_printf("Overheat: still blind after %ld min: no CPU temperature, no power action on temperature (%s)", (now - blind_since) / 60, sensors_blind_summary());
+                        blind_said = now;
+                    }
                     if(reimu_textfile_buf_append("\t<error>no CPU temperature sensor readable</error>\n")) reimu_cancel(-250, "Out of memory\n");
-                    led_trigger = "blind";
+                    if (!strcmp(led_trigger, "none")) led_trigger = "blind";
                     status = "blind";
                 }
                 else if (no_sensors) reimu_message(stderr, "(%s) CPU temperature sensors are readable again (%d)\n", reimu_gettime(), monitored);
                 no_sensors = !monitored;
+                if (!monitored && reimu_textfile_buf_append("\t<blind sec=\"%ld\" alarm=\"%d\"/>\n", monotonic_sec() - blind_since, monotonic_sec() - blind_since >= blind_alarm_min * 60)) reimu_cancel(-250, "Out of memory\n");
             }
             if (!strcmp(led_trigger, "default-on")) status = "critical";
             /* ok, over-limit, blind (no CPU temperature), critical (alert lines), host-off, settling (just powered on) */
             if(reimu_textfile_buf_append("\t<status>%s</status>\n", status)) reimu_cancel(-250, "Out of memory\n");
+
+            /* TTRIP#: some polls with a hot sensor, or held on its own */
+            int ttrip_confirmed = 0;
+            if (ttrip_low)
+            {
+                if (!ttrip_polls++)
+                {
+                    ttrip_since = monotonic_sec();
+                    crit_printf("Overheat: I2CM_TTRIP# asserted, to be confirmed (%s)", sensors_summary());
+                }
+                ttrip_confirmed = ((ttrip_polls >= TTRIP_CONFIRM_POLLS) && (hot_temp >= TTRIP_HOT_TEMP)) || (monotonic_sec() - ttrip_since >= TTRIP_HOLD_SEC);
+                fast_poll = 1;
+            }
+            else ttrip_polls = 0;
+
+            emergency_read();
+            ladder_step(real_power, confirmed_shutdown, confirmed_poweroff, ttrip_confirmed, sensors_summary());
+            emergency_read();
+            if (s_ladder != LADDER_IDLE) fast_poll = 1;
+            if(reimu_textfile_buf_append("\t<protection enabled=\"%s\" state=\"%s\" limit=\"%ld\" shutdown=\"%ld\" poweroff=\"%ld\" timeout=\"%ld\"/>\n", overheat_poweroff ? "yes" : "no", s_ladder_names[s_ladder], cpu_temp_limit, cpu_shutdown_temp, cpu_poweroff_temp, graceful_timeout_sec)) reimu_cancel(-250, "Out of memory\n");
+            if (s_emergency[0] && reimu_textfile_buf_append("\t<emergency>%s</emergency>\n", s_emergency)) reimu_cancel(-250, "Out of memory\n");
 
             /* Update LEDs, if needed */
             dbg_printf(stdout, "LED trigger: %s -> %s\n", oldledtrigger, led_trigger);
@@ -930,7 +1491,7 @@ int main(int argc, char *argv[])
 
         /* Sleep till next cycle, in slices to keep the watchdog fed whatever WAIT_MSEC is
          * (and a SIGTERM that came while working doesn't interrupt a sleep) */
-        for (long left = wait_msec; left > 0; left -= 1000)
+        for (long left = (fast_poll && (wait_msec > 1000)) ? 1000 : wait_msec; left > 0; left -= 1000)
         {
             if (s_exit_req) exit(0);
             reimu_msleep((left > 1000) ? 1000 : left, &s_exit_req);

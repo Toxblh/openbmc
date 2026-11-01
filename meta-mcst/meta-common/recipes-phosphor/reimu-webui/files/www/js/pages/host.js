@@ -29,6 +29,9 @@ function ago(s) {
 // can't come back (the agent sets power/control "on")
 const hubText = (u) =>
   !u ? undefined : !u.present ? "не виден хосту" : u.control === "on" ? `не засыпает${u.status ? ` (${u.status})` : ""}` : `засыпает (${u.control}, ${u.status || "?"}): клавиатура и мышь KVM могут пропасть`;
+// the shared buses (host i2c-0, i2c-1) are the BMC's alone: what the agent saw
+const ownerText = (o) =>
+  !o ? undefined : !o.enforced ? "хост управляет сам (bmc_owns_i2c выключен в ALLOW)" : o.clean ? "только BMC: при выключенном BMC или старой прошивке вентиляторами никто не управляет (держат последнее значение, после reimu-fand --failsafe 100 %); удаление агента возвращает управление хосту" : `агент отключает: ${o.found.join(", ")}`;
 const uptime = (s) => (s ? `${Math.floor(s / 86400)} д ${Math.floor((s % 86400) / 3600)} ч ${Math.floor((s % 3600) / 60)} мин` : "—");
 
 async function call(method, args, ok) {
@@ -137,6 +140,7 @@ function agentCard(st) {
       ["Последние данные", ag.last_seen ? `${new Date(ag.last_seen * 1000).toLocaleString("ru-RU")} (${ago(st.heartbeat.age)})` : undefined],
       ["Пульс", txt],
       ["USB-хаб BMC (KVM)", hubText((st.metrics || {}).bmc_usb_hub)],
+      ["Шины I²C платформы", ownerText((st.metrics || {}).i2c_owner)],
       ["Порт BMC", `${st.port} (TLS, ${st.iface || "все интерфейсы"})`],
       ["Сертификат", st.fingerprint ? h("span", { class: "mono small" }, `SHA-256 ${st.fingerprint.slice(0, 32)}…`) : undefined],
     ]),

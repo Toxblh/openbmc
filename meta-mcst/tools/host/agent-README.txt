@@ -13,6 +13,18 @@ TLS with the BMC's certificate pinned.
 внутренней сети платы (IPv6 link-local: без кабеля и DHCP), TLS с
 закреплённым сертификатом BMC.
 
+Once paired the BMC is the only master of the I2C buses it shares with the
+host: pwmd is disabled and the host's fan drivers kept out. With the BMC down
+or on old firmware nobody drives the fans (they hold their last duty, 100 % if
+reimu-fand --failsafe set it); removing the agent gives the host its control
+back (after a reboot of the host).
+
+После привязки шинами I²C, общими с хостом, управляет только BMC: pwmd отключён,
+драйверы вентиляторов хоста не загружаются. При выключенном BMC или старой
+прошивке вентиляторами никто не управляет (держат последнее значение, 100 %
+после reimu-fand --failsafe); удаление агента возвращает управление хосту
+(после его перезагрузки).
+
 Install / Установка (root, python3 required / нужен python3):
 
   From this disk / с этого диска (the pairing string is in PAIRING.TXT):

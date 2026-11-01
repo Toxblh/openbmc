@@ -24,6 +24,10 @@ const touch = () => (window.matchMedia && matchMedia("(pointer: coarse)").matche
 // a serial terminal. On a narrow screen the font shrinks until 80 columns
 // fit (not below MIN_PX); wider lines pan sideways.
 const MIN_COLS = 80;
+// ...and for 24 rows, what a serial tty with no size means to vim, less...: in
+// a shorter terminal their cursor addresses clamp to the last row and the
+// screen falls apart. A short window scrolls over the 24 rows instead.
+const MIN_ROWS = 24;
 const MIN_PX = 6;
 // input sent and not a byte back for this long: the host is stuck
 const NO_REPLY_MS = 5000;
@@ -49,11 +53,28 @@ function fitLog(p) {
   p.view.setFont(fitPx(width, MIN_COLS + tsCols), termFont(), narrow() ? MIN_COLS + tsCols : 0);
 }
 
+// the cursor's row in view when the terminal is taller than its window
+function followCursor(p) {
+  const wrap = p.termWrap;
+  if (wrap.scrollHeight <= wrap.clientHeight) return;
+  const rowPx = wrap.scrollHeight / p.term.rows;
+  const y = p.term.buffer.active.cursorY * rowPx;
+  if (y < wrap.scrollTop) wrap.scrollTop = y;
+  else if (y + rowPx > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = y + rowPx - wrap.clientHeight;
+}
+
 function fitTerm(p) {
   const px = fitPx(p.termWrap.clientWidth - 8, MIN_COLS);
   if (p.term.options.fontSize !== px) p.term.options.fontSize = px;
-  p.fit.fit();
-  if (narrow() && p.term.cols < MIN_COLS) p.term.resize(MIN_COLS, p.term.rows);
+  // one resize to the final size: a fit to fewer rows first would lose the
+  // rows below them on the alternate screen (a running vim)
+  const dim = p.fit.proposeDimensions();
+  if (dim && dim.cols > 0 && dim.rows > 0) {
+    const cols = narrow() ? Math.max(dim.cols, MIN_COLS) : dim.cols;
+    const rows = Math.max(dim.rows, MIN_ROWS);
+    if (cols !== p.term.cols || rows !== p.term.rows) p.term.resize(cols, rows);
+  }
+  followCursor(p);
 }
 
 // Shell prompts draw icons from Nerd Fonts (Unicode private use area). With
@@ -626,6 +647,7 @@ function createTerminal(p) {
     return true;
   });
   p.term.onData((d) => p.client.write(withMods(d)));
+  p.term.onCursorMove(() => followCursor(p));
   p.term.onBinary((d) => p.client.write(Uint8Array.from(d, (c) => c.charCodeAt(0))));
   p.resizeObs = new ResizeObserver(() => !p.termWrap.classList.contains("hidden") && fitTerm(p));
   p.resizeObs.observe(p.termWrap);

@@ -67,6 +67,15 @@ environment alone when the system was started by kexec (`reimu.ram`,
 on a fallback it points U-Boot at the rofs's slot only if that slot's kernel
 matches its digest.
 
+### If it all goes wrong
+
+There is an SPI programmer and U-Boot's console.
+`obmc-phosphor-image-reimu-5564.static.mtd`, the official release image for this
+board (`~/git/new-reimu/work/upstream/`, its U-Boot, kernel and rofs byte for byte
+the same as the board's dump in `~/git/new-reimu/backup`: `test_static.py S61`), is
+the whole flash for the programmer. Its environment and rwfs are not the board's:
+the MAC addresses are in the dump's `u-boot-env.bin`, the settings in `rwfs.bin`.
+
 ### restore-stock: the order of the writes
 
 The stock layout over the A/B one: the stock kernel (0x100000-0x680000) is
@@ -160,6 +169,13 @@ whole flash, for QEMU) and `reimu-ab-kexec.tar` (to start it from RAM).
   regressions, update, damaged kernel, damaged rofs, hang + watchdog, and the
   whole way on the stock firmware dumped from the board: restore-stock, test
   from RAM, back by kexec, first install, the new firmware from the flash.
+* `test_static.py`: the tree and the build's artifacts, no QEMU; `--red` puts each bug back.
+* `test_overheatd_qemu.py`: overheat power-off ladder, power button never left held.
+* `test_fru_sensors_qemu.py`: FRU, sensors, power cycles, reset causes.
+* `test_ipmi_redfish_qemu.py`: IPMI and Redfish over a real power cycle.
+* `test_fand_qemu.py`, `test_kvm_hid_qemu.py`, `test_usbhid_writes.py`: fans, KVM HID.
+* `test_hostlink_qemu.py`, `test_agentux_qemu.py`: host agent link and install.
+* `test_logs_qemu.py`, `test_docs_smoke_qemu.py`, `test_regressions_qemu.py`: logs, what the docs promise, one test per fixed bug.
 * `board-check.sh`: read-only checks on the real board.
 
 ## On the board

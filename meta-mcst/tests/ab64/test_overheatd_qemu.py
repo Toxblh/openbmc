@@ -32,6 +32,43 @@ GPIO O2) is set over QMP. Tests (all by default):
             SIGKILL: systemd starts it again, OOM score -1000, LimitAS,
             a hang (SIGSTOP): the watchdog restarts it, TINYSPI=yes without
             TinySPI: keeps running on the GPIOs
+  ladder    the power actions, with the power sequencer emulated (GPIO_POWER_IN
+            follows the power button, as on the board): under the shutdown
+            temperature nothing; over it a short press, once, then the long
+            one after GRACEFUL_TIMEOUT_SEC; cooling down: no escalation; over
+            the power-off temperature the long press at once; power good
+            stays: pressed again; a killed daemon goes on; a slow server_ctl
+            doesn't hold the polls; config validation
+  glitch    what must never power off: a spike, implausible values, one sensor
+            alone, a plausible jump for 2 polls, TTRIP# alone briefly, blind, the
+            documented SIGUSR1 LED test through its states (TTRIP#: GPIO_TTRIP
+            on a free pin, added to the gpiotab here: boards without CPLD,
+            like this one, don't have the signal; CPLD boards have it in
+            TinySPI, which QEMU doesn't emulate)
+  ttrip     TTRIP# with a hot sensor, and held on its own: the long press
+  press     a web power-on during a ForceOff (Conflicts= stop the press), systemctl
+            stop, SIGKILL: the power button isn't left held
+  selfon    the platform powers itself back on right after the forced off (seen
+            once on the board): pressed again, the marker stays; a user's
+            power-on in that time isn't undone
+  blind     blind for BLIND_ALARM_MIN: said again, the page told; no press
+  latch     the marker of an emergency power-off: BMC reboot with
+            AUTO_POWER_ON=on and with the AlwaysOn restore policy: the host
+            stays off; the web's power-on works and clears it; so does the
+            front panel button and the D-Bus/REST ClearEmergency
+  optout    OVERHEAT_POWEROFF=no through REST (admin only): at once, no press
+            at 96 °C, each skipped action in the journal at critical level,
+            the alarm stays; survives a reboot; on again: acts. With OH_E2E=DIR
+            (node_modules/playwright there; CHROME: the chromium) the browser
+            test ../e2e/overheat.qemu.mjs too
+  agent     the agent connected (reimu-hostd.py, needs HL_PORT and
+            AB_NETDEV_EXTRA as for test_hostlink_qemu.py): OsPower instead of
+            the button; not with HL_PORT unset
+
+A factory reset (revert-to-mfg wipes the rwfs) removes the marker with the rest.
+
+OH_BIN=file: run this overheatd instead of the image's (bind-mounted), for a
+mutant of the confirmations: the glitch tests must then fail.
 """
 import json, math, os, re, socket, subprocess, sys, time
 
@@ -45,6 +82,63 @@ MINUTES = int(os.environ.get("OH_MINUTES", 12))
 DTB = "/var/volatile/motherboard_devtree.dtb"
 STATE = "/var/volatile/systemstate.xml"
 LED = "/sys/class/leds/platform:red:overheat/trigger"
+LATCH = "/var/lib/overheatd/emergency"
+OH_BIN = os.environ.get("OH_BIN")
+OBJ = "/xyz/openbmc_project/reimu/overheat"
+TTRIP_PIN = "D5"  # free on this board, in QEMU
+# the power sequencer (test_fru_sensors_qemu.py's PLATFORM_LOOP), and an OS and
+# a sequencer that can be told not to react; the second QMP socket stays free
+SEQ_LOOP = r'''
+import json, os, socket, sys, time
+qmp, ctl, st, ttrip_pin = sys.argv[1:5]
+for i in range(100):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.connect(qmp); break
+    except OSError: time.sleep(0.2)
+f = s.makefile("rw"); f.readline()
+def cmd(c, **a):
+    f.write(json.dumps({"execute": c, "arguments": a}) + "\n"); f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if "return" in r or "error" in r: return r.get("return")
+def gpio(pin, v):
+    cmd("qom-set", path="/machine/soc/gpio", property="gpio" + pin, value=v)
+cmd("qmp_capabilities")
+c = dict(power=True, short="os", long="off", ttrip=False, selfon=0)
+pressed = off_at = on_at = None
+n = dict(short=0, long=0, ons=0, offs=0)
+was = None
+while True:
+    if os.path.exists(ctl):
+        c.update(json.load(open(ctl))); os.remove(ctl)
+    now = time.time()
+    r = cmd("human-monitor-command", **{"command-line": "xp /2wx 0x1e780078"})
+    w = r.split(":")[1].split()
+    data, dirn = int(w[0], 16), int(w[1], 16)
+    # the power button (N5): the BMC drives it low for a press
+    if dirn >> 13 & 1 and not data >> 13 & 1:
+        if pressed is None: pressed = now
+        if c["power"] and now - pressed >= 4 and c["long"] == "off":
+            c["power"] = False
+            # a platform that comes back by itself (once seen on the board)
+            if c["selfon"]: c["selfon"] -= 1; on_at = now + 2
+    elif pressed is not None:
+        held = now - pressed
+        n["long" if held >= 4 else "short"] += 1
+        if not c["power"] and held < 4: c["power"] = True
+        elif held < 4 and c["short"] == "os": off_at = now + 2
+        pressed = None
+    if off_at and now >= off_at: c["power"], off_at = False, None
+    if on_at and now >= on_at: c["power"], on_at = True, None
+    gpio("O2", c["power"])
+    gpio(ttrip_pin, not c["ttrip"])
+    if c["power"] and was is False: n["ons"] += 1
+    if not c["power"] and was is True: n["offs"] += 1
+    was = c["power"]
+    open(st + ".tmp", "w").write(json.dumps(dict(n, power=c["power"], pressed=pressed is not None)))
+    os.replace(st + ".tmp", st)
+    time.sleep(0.05)
+'''
 # the hwmon of the l_pcs_i2c device at 5-0020, once it's there
 HWMON20 = "for i in 1 2 3 4 5 6 7 8 9 10; do ls /sys/bus/i2c/devices/5-0020/hwmon 2>/dev/null | grep . && break; sleep 1; done"
 
@@ -58,12 +152,52 @@ class Bmc(T.Bmc):
             if args[0] == "qemu-system-arm":
                 for a in PCS:
                     args = args + ["-device", "tmp105,bus=aspeed.i2c.bus.5,address=0x%02x,id=pcs%02x" % (a, a)]
+                args = args + ["-qmp", "unix:%s/%s.qmp3,server,nowait" % (T.RQ, self.name)]
             return popen(args, **kw)
         subprocess.Popen = with_pcs
+        self.ctl, self.st = "%s/%s.ctl" % (T.RQ, self.name), "%s/%s.st" % (T.RQ, self.name)
+        for f in (self.ctl, self.st):
+            if os.path.exists(f):
+                os.remove(f)
         try:
-            return super().start()
+            super().start()
         finally:
             subprocess.Popen = popen
+        self.seq_p = popen([sys.executable, "-c", SEQ_LOOP, "%s/%s.qmp3" % (T.RQ, self.name), self.ctl, self.st, TTRIP_PIN],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return self
+
+    def stop(self):
+        super().stop()
+        self.seq_p.kill()
+        self.seq_p.wait()
+
+    def seq(self, **kv):
+        """tell the sequencer: power, short ("os": the OS shuts down; "ignore"),
+        long ("off"; "ignore"), ttrip (asserted)"""
+        while os.path.exists(self.ctl):
+            time.sleep(0.05)
+        with open(self.ctl + ".tmp", "w") as f:
+            json.dump(kv, f)
+        os.replace(self.ctl + ".tmp", self.ctl)
+        while os.path.exists(self.ctl):
+            time.sleep(0.05)
+        time.sleep(0.2)
+
+    def seen(self):
+        """what the sequencer saw: short, long, ons, offs, power, pressed"""
+        for i in range(20):
+            try:
+                return json.load(open(self.st))
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        return {}
+
+    def use_binary(self):
+        """OH_BIN instead of the image's overheatd"""
+        if OH_BIN:
+            T.Bmc.scp(self, OH_BIN, "/tmp/oh.bin")
+            self.ssh("chmod +x /tmp/oh.bin; mount --bind /tmp/oh.bin /usr/sbin/overheatd; systemctl restart overheatd")
 
     def qom(self, *sets):
         s = socket.socket(socket.AF_UNIX)
@@ -85,7 +219,7 @@ class Bmc(T.Bmc):
         s.close()
 
     def power(self, on):
-        self.qom(("/machine/soc/gpio", "gpioO2", bool(on)))
+        self.seq(power=bool(on))
 
     def temps(self, **by_addr):
         """temps(t20=50, ...): °C as the PCS reads it"""
@@ -233,14 +367,17 @@ def t_memory(b):
         check(b.scp(OLD, "/tmp/overheatd.old"), "control binary copied")
 
         def run_old(what):
-            b.ssh("chmod +x /tmp/overheatd.old; (/tmp/overheatd.old >/dev/null 2>&1 &)")
+            b.ssh("chmod +x /tmp/overheatd.old; (/tmp/overheatd.old >/tmp/overheatd.old.log 2>&1 &)")
             time.sleep(5)
             pid = b.out("pidof overheatd.old").strip()
+            if not pid:
+                print("    control gone: " + b.out("tail -3 /tmp/overheatd.old.log; dmesg | tail -2").strip().replace("\n", " | "))
             a = b.proc(pid)
             time.sleep(30)
             z = b.proc(pid)
             x = b.out("cat " + STATE)
-            b.ssh("kill %s" % pid)
+            # -9: it misses a SIGTERM that comes while it works (fixed since)
+            b.ssh("kill -9 %s" % pid)
             print("    control %s, %s, WAIT_MSEC=100, 30 s: RSS %d -> %d KiB, heap %d -> %d KiB"
                   % (os.path.basename(OLD), what, a["rss"], z["rss"], a["data"], z["data"]))
             return z["rss"] - a["rss"], x
@@ -466,12 +603,545 @@ def t_failures(b):
     b.ssh("cat > /var/volatile/reimu.conf && systemctl restart overheatd", input=old)
 
 
-TESTS = [("sensors", t_sensors), ("failures", t_failures), ("memory", t_memory)]
+# ------------------------------------------------------------------ the power actions
+def all_temps(b, v):
+    b.temps(**{"t%x" % a: v for a in PCS})
+
+
+def ladder_setup(b, **conf):
+    """a host on and cool, a fresh overheatd, a fast ladder; returns the sequencer's counts so far"""
+    b.ssh("systemctl stop overheatd; rm -f %s; rm -rf /run/overheatd" % LATCH)
+    b.temps(**NORMAL)
+    # a press going on ends by itself (KillMode=process)
+    wait_seen(b, lambda s: not s["pressed"], 10)
+    time.sleep(0.5)
+    b.seq(power=True, short="ignore", long="off", ttrip=False)
+    for a in PCS:
+        b.ssh("i2cset -f -y 5 0x%02x 1 0x60 && i2cset -f -y 5 0x%02x 0" % (a, a))
+    b.dtb(board_dts())
+    c = dict(WAIT_MSEC=1000, GRACEFUL_TIMEOUT_SEC=10)
+    c.update(conf)
+    b.conf(**c)
+    b.ssh("systemctl reset-failed overheatd; systemctl start overheatd")
+    b.wait_state(lambda s: s["temps"] == NORMAL_TEMPS)
+    return b.seen()
+
+
+def wait_seen(b, pred, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred(b.seen()):
+            return True
+        time.sleep(0.2)
+    return pred(b.seen())
+
+
+def crit(b, since):
+    """the journal of overheatd at critical level and above"""
+    return b.out("journalctl -u overheatd -p crit -o cat --no-pager --since @%d" % since)
+
+
+def latched(b):
+    return b.ssh("test -e " + LATCH).returncode == 0
+
+
+def no_action(b, s0, secs, what):
+    t = time.time() + secs
+    while time.time() < t:
+        time.sleep(0.5)
+    s = b.seen()
+    check(s["short"] == s0["short"] and s["long"] == s0["long"] and s["power"] and not latched(b),
+          "%s: no press in %d s (short %d, long %d), power on, no marker" % (what, secs, s["short"] - s0["short"], s["long"] - s0["long"]))
+
+
+def t_ladder(b):
+    s0 = ladder_setup(b)
+    x = b.state()["xml"]
+    since = b.now()
+    m = re.search(r'<protection enabled="(\w+)" state="(\w+)" limit="(\d+)" shutdown="(\d+)" poweroff="(\d+)" timeout="(\d+)"', x)
+    check(m and m.groups() == ("yes", "idle", "85", "90", "95", "10"), "state file: enabled, idle, 85/90/95, the timeout: %s" % (m and m.groups(),))
+
+    # (tmp105s: even values only) under the shutdown temperature: the alarm only
+    all_temps(b, 88)
+    check(b.wait_led("timer", 15) == "timer", "88 °C: the alarm (LED)")
+    no_action(b, s0, 12, "88 °C")
+
+    # over it: a graceful request, once
+    all_temps(b, 92)
+    t = time.time()
+    check(wait_seen(b, lambda s: s["short"] > s0["short"], 20), "92 °C: a short press of the power button (%.0f s)" % (time.time() - t))
+    check(b.seen()["long"] == s0["long"] and not latched(b), "... no long press, no marker yet")
+    check("92" in crit(b, since) and re.search(r"(?i)graceful", crit(b, since)), "... journal, critical level: %s" % crit(b, since).strip()[-120:])
+    check(wait_seen(b, lambda s: s["long"] > s0["long"] and not s["power"], 30), "still hot after the timeout: the long press, power off (%.0f s)" % (time.time() - t))
+    s = b.seen()
+    check(s["short"] == s0["short"] + 1, "the short press once (%d)" % (s["short"] - s0["short"]))
+    check(latched(b), "the marker %s: %s" % (LATCH, b.out("cat %s 2>/dev/null" % LATCH).strip().replace("\n", " | ")))
+    check("92" in b.out("cat %s 2>/dev/null" % LATCH), "... with the temperatures")
+    e = b.out("busctl call xyz.openbmc_project.Logging /xyz/openbmc_project/logging org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null | grep -c -i overheat").strip()
+    check(e not in ("", "0"), "a phosphor-logging entry")
+    s = b.wait_state(lambda s: "emergency" in s["xml"])
+    check("<emergency>" in s["xml"], "state file: the reason: %s" % "".join(re.findall(r"<emergency>[^<]*", s["xml"])))
+
+    # the OS obeys: no long press, no marker
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=30)
+    b.seq(short="os")
+    all_temps(b, 92)
+    check(wait_seen(b, lambda s: s["short"] > s0["short"] and not s["power"], 25), "the OS obeys the short press: off")
+    time.sleep(3)
+    check(b.seen()["long"] == s0["long"] and not latched(b), "... no long press, no marker: nothing to latch")
+
+    # cooling down before the timeout: no escalation
+    s0 = ladder_setup(b)
+    all_temps(b, 92)
+    check(wait_seen(b, lambda s: s["short"] > s0["short"], 20), "92 °C: the short press")
+    all_temps(b, 60)
+    time.sleep(16)
+    s = b.seen()
+    check(s["long"] == s0["long"] and s["power"] and not latched(b), "cooled to 60 °C: no long press after the timeout, power on, no marker")
+    check(s["short"] == s0["short"] + 1, "... and no second short press (%d)" % (s["short"] - s0["short"]))
+
+    # over the power-off temperature: at once
+    s0 = ladder_setup(b)
+    since = b.now()
+    all_temps(b, 96)
+    t = time.time()
+    check(wait_seen(b, lambda s: not s["power"], 25), "96 °C: forced off (%.0f s)" % (time.time() - t))
+    wait_seen(b, lambda s: s["long"] > s0["long"], 5)
+    s = b.seen()
+    check(s["long"] == s0["long"] + 1 and s["short"] == s0["short"] and latched(b), "the long press directly (short %d, long %d), the marker" % (s["short"] - s0["short"], s["long"] - s0["long"]))
+    check("96" in crit(b, since), "journal, critical level: %s" % crit(b, since).strip()[-120:])
+
+    # power good stays: again, loudly
+    s0 = ladder_setup(b)
+    b.seq(long="ignore")
+    since = b.now()
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: s["long"] >= s0["long"] + 2, 60), "power good stays on after the long press: pressed again")
+    check(re.search(r"(?i)power good", crit(b, since)), "... journal, critical level: %s" % crit(b, since).strip()[-120:])
+    b.seq(long="off")
+    check(wait_seen(b, lambda s: not s["power"], 40), "... until it goes")
+
+    # a killed daemon goes on, the second press isn't repeated
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=20)
+    all_temps(b, 92)
+    check(wait_seen(b, lambda s: s["short"] > s0["short"], 20), "92 °C: the short press")
+    t = time.time()
+    b.ssh("kill -9 " + b.pid())
+    check(wait_seen(b, lambda s: not s["power"], 45), "overheatd killed during the ladder: restarted, forced off all the same (%.0f s)" % (time.time() - t))
+    s = b.seen()
+    check(s["short"] == s0["short"] + 1 and latched(b), "... the short press not repeated (%d), the marker" % (s["short"] - s0["short"]))
+
+    # a press killed half way must not leave the button held down
+    s0 = ladder_setup(b)
+    b.seq(long="ignore")
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: s["pressed"], 25), "96 °C: the long press starts")
+    time.sleep(1)
+    b.ssh("killall -9 server_pwr_off_hard")
+    check(wait_seen(b, lambda s: not s["pressed"], 4), "server_ctl killed in the press: the button isn't left held")
+    b.seq(long="off")
+    check(wait_seen(b, lambda s: not s["power"], 40), "... and it presses again, off")
+    # systemctl restart in the press: the press isn't cut
+    s0 = ladder_setup(b)
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: s["pressed"], 25), "96 °C: the long press starts")
+    b.ssh("systemctl restart overheatd")
+    check(wait_seen(b, lambda s: not s["pressed"] and not s["power"], 15), "overheatd restarted in the press: it goes on to the end, off")
+
+    # a slow server_ctl: the PNS lock busy, it waits 15 s for it
+    s0 = ladder_setup(b)
+    b.ssh("mkdir -p /run/reimu-pns; (flock /run/reimu-pns/lock sleep 25 >/dev/null 2>&1 &)")
+    pid = b.pid()
+    all_temps(b, 92)
+    time.sleep(10)
+    p0 = b.state()["poll"]
+    time.sleep(5)
+    p1 = b.state()["poll"]
+    check(p1 >= p0 + 3 and b.pid() == pid, "server_ctl waiting for the PNS lock: polls go on (%d in 5 s), same pid" % (p1 - p0))
+    b.ssh("true")
+    all_temps(b, 50)
+    time.sleep(16)
+
+    # config validation
+    since = b.now()
+    b.conf(CPU_SHUTDOWN_TEMP=99, CPU_POWEROFF_TEMP=95)
+    time.sleep(3)
+    m = re.search(r'shutdown="(\d+)" poweroff="(\d+)"', b.state()["xml"])
+    check(m and m.groups() == ("90", "95"), "POWEROFF < SHUTDOWN: the defaults (%s)" % (m and m.groups(),))
+    check("CPU_SHUTDOWN_TEMP" in b.journal(since), "... said in the journal")
+    b.conf(CPU_SHUTDOWN_TEMP=abc_value(), CPU_POWEROFF_TEMP=97)
+    time.sleep(3)
+    m = re.search(r'shutdown="(\d+)" poweroff="(\d+)"', b.state()["xml"])
+    check(m and m.groups() == ("90", "95"), "a broken value: the defaults (%s)" % (m and m.groups(),))
+    b.conf(CPU_SHUTDOWN_TEMP=88, CPU_POWEROFF_TEMP=92)
+    time.sleep(3)
+    m = re.search(r'shutdown="(\d+)" poweroff="(\d+)"', b.state()["xml"])
+    check(m and m.groups() == ("88", "92"), "valid values taken at once (%s)" % (m and m.groups(),))
+
+
+RESET_URL = "/redfish/v1/Systems/system/Actions/ComputerSystem.Reset"
+
+
+def t_press(b):
+    """the units' mutual Conflicts= stop a running press: it must end by itself,
+    the button released (the line given up half way stays driven low)"""
+    def start():
+        s0 = ladder_setup(b)
+        b.ssh("systemctl stop overheatd")  # only the web's power actions here
+        b.seq(long="off", short="ignore")
+        c, _ = rest("POST", RESET_URL, {"ResetType": "ForceOff"})
+        check(c in (200, 204) and wait_seen(b, lambda s: s["pressed"], 10), "web ForceOff: the long press starts (%s)" % c)
+        time.sleep(1)
+        return s0
+
+    start()
+    c, _ = rest("POST", RESET_URL, {"ResetType": "On"})
+    t = time.time()
+    check(c in (200, 204), "web power-on during it (%s)" % c)
+    released = wait_seen(b, lambda s: not s["pressed"], 15)
+    check(released, "the button is released (%.0f s)" % (time.time() - t))
+    time.sleep(4)
+    check(not b.seen()["pressed"], "... and stays released")
+    check(wait_seen(b, lambda s: s["power"], 25), "the host ends up on (what was asked last)")
+
+    start()
+    b.ssh("systemctl stop host-poweroff-hard")
+    check(wait_seen(b, lambda s: not s["pressed"], 10), "systemctl stop in the press: released")
+
+    # SIGKILL can't be deferred: the next start of a power unit floats the line
+    start()
+    b.ssh("killall -9 server_pwr_off_hard")
+    b.seq(power=True)
+    rest("POST", RESET_URL, {"ResetType": "On"})
+    check(wait_seen(b, lambda s: not s["pressed"], 10), "server_ctl killed in the press, then a power-on: released")
+    b.ssh("systemctl start overheatd")
+
+
+def t_selfon(b):
+    # the platform comes back on by itself right after the forced off (seen once on the board)
+    s0 = ladder_setup(b)
+    since = b.now()
+    b.seq(selfon=1)
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: s["offs"] > s0["offs"], 25), "96 °C: forced off")
+    check(wait_seen(b, lambda s: s["ons"] > s0["ons"], 15), "... the platform comes back by itself")
+    check(wait_seen(b, lambda s: s["long"] >= s0["long"] + 2 and not s["power"], 25), "... pressed again, off (long %d)" % (b.seen()["long"] - s0["long"]))
+    check(latched(b), "... the marker stays")
+    check(re.search(r"(?i)by itself", crit(b, since)), "... journal, critical level")
+    time.sleep(8)
+    s = b.seen()
+    check(not s["power"] and s["long"] == s0["long"] + 2, "... stays off, no more presses")
+    # a user powers it on in that time: not pressed again
+    b.temps(**NORMAL)
+    c, _ = rest("POST", "/redfish/v1/Systems/system/Actions/ComputerSystem.Reset", {"ResetType": "On"})
+    check(c in (200, 204) and wait_seen(b, lambda s: s["power"], 20), "the web's power-on within those 30 s: on (%s)" % c)
+    s1 = b.seen()
+    time.sleep(10)
+    s = b.seen()
+    check(s["power"] and s["long"] == s1["long"] and not latched(b), "... not pressed again, the marker gone")
+
+
+
+def t_blind(b):
+    # blind for long: said again, with what each sensor gave; the page knows
+    since = b.now()
+    s0 = ladder_setup(b, PCS_BUS=9, BLIND_ALARM_MIN=1)
+    s = b.wait_state(lambda s: s["status"] == "blind", 15)
+    c = crit(b, since)
+    check("bus 9" in c, "blind: journal, critical level, what each sensor gave: %s" % c.strip()[-100:])
+    time.sleep(65)
+    c = crit(b, since)
+    check(len(re.findall(r"(?i)blind", c)) >= 2 and "still blind" in c, "blind for 1 min (BLIND_ALARM_MIN): said again: %s" % c.strip()[-100:])
+    j = overheat_json()
+    check(j and j.get("blind_sec", 0) >= 60 and j.get("blind_alarm") == 1 and j.get("status") == "blind", "REST: blind_sec %s, blind_alarm %s" % ((j or {}).get("blind_sec"), (j or {}).get("blind_alarm")))
+    check(b.seen()["long"] == s0["long"] and b.seen()["short"] == s0["short"], "... no press")
+
+
+
+def abc_value():
+    return "9x"
+
+
+def ttrip_setup(b, **conf):
+    """GPIO_TTRIP on a free pin: this board has no such line known to the firmware"""
+    b.ssh("grep -q GPIO_TTRIP /etc/gpiotab.common || echo GPIO_TTRIP=%s >> /etc/gpiotab.common" % TTRIP_PIN)
+    return ladder_setup(b, **conf)
+
+
+def t_glitch(b):
+    # each from a fresh start: a mutant that acts on one fails that one only
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    all_temps(b, 200)
+    no_action(b, s0, 12, "all sensors at an impossible 200 °C")
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    all_temps(b, 4000)
+    no_action(b, s0, 8, "garbage (4000 °C)")
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    all_temps(b, 2)
+    no_action(b, s0, 8, "all sensors at an impossible 2 °C")
+    # plausible, but a jump, for less than the 3 polls of a confirmation
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    for i in range(3):
+        all_temps(b, 130)
+        time.sleep(1.2)
+        b.temps(**NORMAL)
+        time.sleep(4)
+    no_action(b, s0, 1, "a jump to 130 °C for ~1 poll, 3 times")
+    # one sensor, the others fine
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    since = b.now()
+    b.temps(t23=120)
+    no_action(b, s0, 15, "one sensor at 120 °C, the 5 others at 50..60")
+    check("unconfirmed" in b.journal(since), "... said in the journal")
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    b.temps(t23=96)
+    no_action(b, s0, 10, "one sensor at 96 °C, the 5 others at 50..60")
+    # two sensors, but flapping: never 3 polls in a row
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    for i in range(4):
+        b.temps(t20=92, t21=92)
+        time.sleep(1.5)
+        b.temps(t20=50, t21=52)
+        time.sleep(1.5)
+    no_action(b, s0, 1, "two sensors flapping 92/50 °C every 1.5 s")
+
+    # blind
+    s0 = ladder_setup(b, PCS_BUS=9)
+    all_temps(b, 96)
+    s = b.wait_state(lambda s: s["status"] == "blind", 15)
+    check(s["status"] == "blind", "no sensor answers: blind")
+    no_action(b, s0, 15, "blind")
+
+    # TTRIP# alone, briefly
+    s0 = ttrip_setup(b)
+    b.seq(ttrip=True)
+    check(b.wait_led("default-on", 10) == "default-on", "TTRIP#: the LED")
+    no_action(b, s0, 10, "TTRIP# for 10 s, the sensors at 50..60 °C")
+    b.seq(ttrip=False)
+    b.ssh("sed -i /GPIO_TTRIP/d /etc/gpiotab.common")
+
+    # the documented LED test (SIGUSR1: simulated overheat, simulated critical, normal) must
+    # never cost the host; also with the line of the real critical state absent, as on this board
+    s0 = ladder_setup(b, GRACEFUL_TIMEOUT_SEC=5)
+    b.ssh("killall -USR1 overheatd")
+    check(b.wait_led("timer", 10) == "timer", "SIGUSR1: simulated overheat, the LED blinks")
+    no_action(b, s0, 8, "simulated overheat")
+    b.ssh("killall -USR1 overheatd")
+    check(b.wait_led("default-on", 10) == "default-on", "SIGUSR1 again: simulated critical, the LED on")
+    no_action(b, s0, 12, "simulated critical")
+    b.ssh("killall -USR1 overheatd")
+    check(b.wait_led("none", 10) == "none", "SIGUSR1 again: normal, the LED off")
+    no_action(b, s0, 3, "after the SIGUSR1 cycle")
+
+
+def t_ttrip(b):
+    s0 = ttrip_setup(b)
+    all_temps(b, 76)
+    time.sleep(8)
+    b.seq(ttrip=True)
+    t = time.time()
+    check(wait_seen(b, lambda s: not s["power"], 20), "TTRIP# with sensors at 76 °C: forced off (%.0f s)" % (time.time() - t))
+    check(latched(b) and "TTRIP" in b.out("cat %s 2>/dev/null" % LATCH), "the marker, TTRIP# as the reason")
+    s0 = ttrip_setup(b)
+    b.seq(ttrip=True)
+    t = time.time()
+    no_action(b, s0, 20, "TTRIP# for the first 20 s, the sensors cool")
+    check(wait_seen(b, lambda s: not s["power"], 25), "TTRIP# held on its own: forced off (%.0f s)" % (time.time() - t))
+    check(time.time() - t >= 28, "... after about 30 s")
+    b.seq(ttrip=False)
+    b.ssh("sed -i /GPIO_TTRIP/d /etc/gpiotab.common")
+
+
+def rest(method, path, body=None, user="root", password="0penBmc"):
+    c = ["curl", "-ks", "-u", "%s:%s" % (user, password), "-X", method, "-H", "Content-Type: application/json",
+         "-w", "\n%{http_code}", "https://127.0.0.1:%d%s" % (T.HTTPS, path)]
+    if body is not None:
+        c += ["-d", json.dumps(body)]
+    o = subprocess.run(c, capture_output=True, text=True, timeout=60).stdout
+    t, _, code = o.rpartition("\n")
+    try:
+        return int(code), json.loads(t)
+    except ValueError:
+        return int(code or 0), None
+
+
+def overheat_json():
+    s, j = rest("GET", OBJ)
+    return json.loads(j["data"]["Json"]) if s == 200 else None
+
+
+def reboot(b):
+    start = len(b.console())
+    b.ssh("sync; (sleep 1; reboot) >/dev/null 2>&1 &")
+    b.wait_console(r"Starting kernel", 120, start)
+    ok = b.wait_ssh(400)
+    b.use_binary()
+    return ok
+
+
+def t_latch(b):
+    s0 = ladder_setup(b)
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: not s["power"], 25), "96 °C: forced off")
+    check(latched(b), "the marker")
+    b.temps(**NORMAL)
+    j = overheat_json()
+    check(j is not None and j.get("emergency"), "REST: the reason: %s" % (j or {}).get("emergency"))
+
+    # automatic power-on: both ways
+    b.ssh("cp /etc/auto_power_on /tmp/apo.save; sed -i 's/^AUTO_POWER_ON=.*/AUTO_POWER_ON=on/' /etc/auto_power_on; sync")
+    b.ssh("busctl set-property xyz.openbmc_project.Settings /xyz/openbmc_project/control/host0/power_restore_policy "
+          "xyz.openbmc_project.Control.Power.RestorePolicy PowerRestorePolicy s xyz.openbmc_project.Control.Power.RestorePolicy.Policy.AlwaysOn")
+    s1 = b.seen()
+    check(reboot(b), "BMC rebooted")
+    time.sleep(15)
+    s = b.seen()
+    check(not s["power"] and s["short"] == s1["short"] and s["ons"] == s1["ons"], "AUTO_POWER_ON=on, AlwaysOn: the host stays off, nothing pressed")
+    check(latched(b), "the marker kept over the reboot")
+    j = b.out("journalctl -b -u allow_host_boot -o cat --no-pager")
+    check(re.search(r"(?i)overheat|emergency", j), "allow_host_boot says why: %s" % j.strip().split("\n")[-1])
+    f = b.out("systemctl --failed --no-legend --plain | cut -d' ' -f1").split()
+    check("phosphor-discover-system-state@0.service" not in f and "allow_host_boot.service" not in f, "no failed unit for it %s" % f)
+
+    # the web's power-on
+    for a in PCS:
+        b.ssh("i2cset -f -y 5 0x%02x 1 0x60 && i2cset -f -y 5 0x%02x 0" % (a, a))
+    s, _ = rest("POST", "/redfish/v1/Systems/system/Actions/ComputerSystem.Reset", {"ResetType": "On"})
+    check(s in (200, 204), "Redfish Reset On (the web's power on): %s" % s)
+    check(wait_seen(b, lambda s: s["power"], 25), "... the host is on")
+    check(not latched(b), "... and the marker gone")
+
+    # the front panel button clears it too
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: not s["power"], 25) and latched(b), "96 °C again: forced off, the marker")
+    all_temps(b, 50)
+    time.sleep(32)
+    b.seq(power=True)
+    end = time.time() + 15
+    while latched(b) and time.time() < end:
+        time.sleep(1)
+    check(not latched(b), "the front panel button (power good without the BMC): the marker gone")
+
+    # cleared without a power-on
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: not s["power"], 25) and latched(b), "96 °C again: forced off, the marker")
+    all_temps(b, 50)
+    check(b.ssh("busctl call xyz.openbmc_project.Reimu.Pns %s xyz.openbmc_project.Reimu.Overheat ClearEmergency" % OBJ).returncode == 0
+          and not latched(b), "D-Bus ClearEmergency: the marker gone, the host stays off (%s)" % b.seen()["power"])
+    s = b.wait_state(lambda s: "<emergency>" not in s["xml"], 10)
+    check("<emergency>" not in s["xml"], "... not in the state file any more")
+    b.ssh("cp /tmp/apo.save /etc/auto_power_on; busctl set-property xyz.openbmc_project.Settings "
+          "/xyz/openbmc_project/control/host0/power_restore_policy xyz.openbmc_project.Control.Power.RestorePolicy "
+          "PowerRestorePolicy s xyz.openbmc_project.Control.Power.RestorePolicy.Policy.AlwaysOff; sync")
+
+
+def set_poweroff(on, **kw):
+    return rest("POST", OBJ + "/action/SetPowerOff", {"data": [bool(on)]}, **kw)
+
+
+def t_optout(b):
+    s0 = ladder_setup(b)
+    pid = b.pid()
+    for role in ("ReadOnly", "Operator"):
+        name = "oh" + role.lower()
+        rest("POST", "/redfish/v1/AccountService/Accounts", {"UserName": name, "Password": "0penBmc-" + role, "RoleId": role, "Enabled": True})
+        s, _ = rest("GET", OBJ, user=name, password="0penBmc-" + role)
+        c, _ = set_poweroff(False, user=name, password="0penBmc-" + role)
+        check(s == 200 and c in (401, 403) and overheat_json().get("poweroff") is True, "%s: reads it (%s), can't change it (%s)" % (role, s, c))
+        rest("DELETE", "/redfish/v1/AccountService/Accounts/" + name)
+
+    since = b.now()
+    c, _ = set_poweroff(False)
+    check(c == 200 and overheat_json().get("poweroff") is False, "admin: SetPowerOff(false) (%s)" % c)
+    time.sleep(3)
+    check("OVERHEAT_POWEROFF=no" in b.out("cat /etc/overheatd.conf"), "in /etc/overheatd.conf")
+    check(b.pid() == pid, "no restart of the daemon")
+    check('enabled="no"' in b.state()["xml"], "state file: off, at once")
+    check(re.search(r"(?i)power actions.*off", crit(b, since)), "journal, critical level: %s" % crit(b, since).strip()[-120:])
+
+    since = b.now()
+    all_temps(b, 96)
+    no_action(b, s0, 15, "off, 96 °C")
+    check(b.wait_led("timer", 5) == "timer", "... the alarm stays (LED)")
+    check(b.state()["status"] == "over-limit", "... status over-limit")
+    check(re.search(r"(?i)skipped", crit(b, since)), "... the skipped action, critical level: %s" % crit(b, since).strip()[-120:])
+    b.temps(**NORMAL)
+    time.sleep(2)
+
+    check(reboot(b), "BMC rebooted")
+    for a in PCS:
+        b.ssh("i2cset -f -y 5 0x%02x 1 0x60 && i2cset -f -y 5 0x%02x 0" % (a, a))
+    check("OVERHEAT_POWEROFF=no" in b.out("cat /etc/overheatd.conf") and overheat_json().get("poweroff") is False, "off after the reboot")
+    s0 = b.seen()
+    all_temps(b, 96)
+    no_action(b, s0, 10, "off after the reboot, 96 °C")
+    b.temps(**NORMAL)
+    time.sleep(3)
+
+    if os.environ.get("OH_E2E"):
+        b.conf(PCS_BUS=9, OVERHEAT_POWEROFF="no")
+        b.wait_state(lambda s: s["status"] == "blind", 15)
+        e2e(b)
+        set_poweroff(False)
+        b.conf(OVERHEAT_POWEROFF="no")
+
+    c, _ = set_poweroff(True)
+    check(c == 200 and overheat_json().get("poweroff") is True, "admin: on again (%s)" % c)
+    time.sleep(2)
+    s0 = b.seen()
+    all_temps(b, 96)
+    check(wait_seen(b, lambda s: not s["power"], 25) and latched(b), "on again, 96 °C: acts")
+    b.temps(**NORMAL)
+    b.ssh("rm -f " + LATCH)
+    b.seq(power=True)
+    set_poweroff(True)
+
+
+def e2e(b):
+    import shutil
+    d = os.environ["OH_E2E"]
+    spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "e2e", "overheat.qemu.mjs")
+    if not os.path.exists(spec):
+        spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overheat.qemu.mjs")
+    shutil.copyfile(spec, os.path.join(d, ".overheat-e2e.mjs"))
+    common = os.path.join(os.path.dirname(spec), "common.mjs")
+    if not os.path.exists(os.path.join(d, "common.mjs")) and os.path.exists(common):
+        shutil.copyfile(common, os.path.join(d, "common.mjs"))
+    r = subprocess.run(["node", ".overheat-e2e.mjs"], cwd=d, capture_output=True, text=True, timeout=300,
+                       env=dict(os.environ, BASE="https://127.0.0.1:%d" % T.HTTPS, OUT=os.path.join(T.W, "overheat-shots")))
+    print("    " + (r.stdout + r.stderr).strip().replace("\n", "\n    "))
+    check(r.returncode == 0, "browser: the toggle, its warning and confirmation, the badge")
+
+
+def t_agent(b):
+    if not os.environ.get("HL_PORT"):
+        print("    not run: HL_PORT unset")
+        return
+    import test_hostlink_qemu as hl
+    h = hl.Host()
+    try:
+        check(hl.t_pair(b, h), "the agent paired")
+        h.start()
+        check(hl.wait(lambda: (hl.state() or {}).get("agent", {}).get("connected"), 60), "the agent connected")
+        s0 = ladder_setup(b)
+        all_temps(b, 92)
+        check(hl.wait(lambda: "systemctl poweroff" in h.commands(), 25), "92 °C with the agent: OsPower -> systemctl poweroff on the host")
+        check(b.seen()["short"] == s0["short"], "... no button press")
+        check(wait_seen(b, lambda s: not s["power"] and s["long"] == s0["long"] + 1, 30), "the OS doesn't go down: forced off after the timeout")
+        b.temps(**NORMAL)
+    finally:
+        h.stop()
+        h.t.cleanup()
+
+
+TESTS = [("sensors", t_sensors), ("failures", t_failures), ("ladder", t_ladder), ("glitch", t_glitch), ("ttrip", t_ttrip), ("press", t_press), ("selfon", t_selfon), ("blind", t_blind),
+         ("latch", t_latch), ("optout", t_optout), ("agent", t_agent), ("memory", t_memory)]
 
 if __name__ == "__main__":
-    b = Bmc("overheatd", fresh("overheatd")).start()
+    b = Bmc("overheatd", fresh("overheatd", os.environ.get("OH_IMG", "ab.mtd"))).start()
     try:
         check(b.wait_ssh(), "up")
+        b.use_binary()
         for name, fn in TESTS:
             if T.ONLY and name not in T.ONLY:
                 continue

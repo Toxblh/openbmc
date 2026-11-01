@@ -1,0 +1,19 @@
+#!/bin/sh
+# The SoL log: rotated by size (each minute, logrotate-sol.timer), its copy
+# current.gz on the flash refreshed only when the log has changed, at most
+# every SOL_GZ_EVERY seconds: the rwfs (jffs2, 9 MiB) would otherwise get the
+# whole gz each minute, 1440 times a day with nothing new. logrotate's state
+# (nothing here depends on it: size only) stays off the flash too.
+SOL_GZ_EVERY=${SOL_GZ_EVERY:-300}
+LOG=/usr/log/current
+GZ=/usr/log/current.gz
+
+/usr/sbin/logrotate -s /run/logrotate-sol.status /etc/logrotate.d/solrotate.conf
+
+[ -e $LOG ] || exit 0
+if [ -e $GZ ]; then
+    [ $LOG -nt $GZ ] || exit 0
+    age=$(( $(date +%s) - $(date -r $GZ +%s) ))
+    [ $age -ge 0 ] && [ $age -lt $SOL_GZ_EVERY ] && exit 0
+fi
+gzip -c $LOG > $GZ.tmp && mv $GZ.tmp $GZ

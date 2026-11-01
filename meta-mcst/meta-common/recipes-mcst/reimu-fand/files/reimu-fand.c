@@ -696,6 +696,8 @@ static int check_config(const char *file)
            c.tach_mode == 2 ? "accurate" : c.tach_mode == 3 ? "least" : "traditional", c.tach_min_rpm, c.tach_alarm_ms / 1000.0,
            c.tach_verify_ms / 1000.0);
     printf("TACH_VALID_DUTY=%g TACH_VALID_DUTY_OTHER=%g\n", c.tach_valid_duty, c.tach_valid_duty_other);
+    printf("LM96163_PWM_FREQ=0x%02x LM96163_PWM_CLOCK=%s GUARD_SEC=%g GUARD_CORRUPT_REGS=%d\n", c.pwm_freq, c.pwm_fast ? "fast" : "slow",
+           c.guard_ms / 1000.0, c.guard_corrupt_regs);
     printf("CPU_FAN_MIN_DUTY=%g CPU_FAN_MAX_DUTY=%g BOARD_FAN_MAX_DUTY=%g CASE_FAN_MAX_DUTY=%g EMC_WATCHDOG=%s HOST_PROBE=%s\n",
            c.cpu_fan_min, c.cpu_fan_max, c.board_fan_max, c.case_fan_max, c.emc_watchdog ? "yes" : "no",
            c.host_probe ? "yes" : "no");

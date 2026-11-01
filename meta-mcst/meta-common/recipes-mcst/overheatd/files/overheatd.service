@@ -9,6 +9,9 @@ Type=notify
 NotifyAccess=main
 ExecStart=/usr/sbin/overheatd
 Restart=always
+# A restart mustn't cut a press of the power button short: a process killed
+# half way leaves the line driven low, the button held. It ends by itself
+KillMode=process
 RestartSec=5
 # Pinged on every poll, sensor read and second of sleep (at most once a
 # second). A poll takes a few ms; with a dead I2C bus each of the 8 sensor

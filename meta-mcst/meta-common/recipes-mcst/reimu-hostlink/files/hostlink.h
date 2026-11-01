@@ -176,6 +176,7 @@ struct hl
     int auth_fails;
     /* the event sink (journal + Logging); default: stderr */
     void (*on_event)(struct hl *h, const struct hl_event *e);
+    void (*on_diag)(struct hl *h, const char *b64);
     int64_t now;          /* the last hl_tick/input time, ms monotonic */
 
     /* the installer's virtual USB disk (reimu-agent-disk, by the daemon) */
@@ -202,6 +203,8 @@ int hl_gpu_turbo(struct hl *h, int minutes, char *err, size_t n); /* 0 = off */
 int hl_os_power(struct hl *h, const char *action, char *err, size_t n);
 int hl_edac_load(struct hl *h, char *err, size_t n);
 int hl_request_inventory(struct hl *h, char *err, size_t n);
+/* the agent's report for the diagnostic archive: on_diag gets it (base64) */
+int hl_host_diag(struct hl *h, char *err, size_t n);
 /* fand's turbo: on (seconds left) or off (0) */
 void hl_fand_turbo(struct hl *h, int seconds_left);
 /* a new pairing token; out: JSON {token, pair (the string for the agent),

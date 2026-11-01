@@ -64,6 +64,10 @@ struct config
     int cpu_tach;     /* the CPU fan has a tachometer: check it */
     int emc_watchdog; /* EMC2305 watchdog: fans 100% when not written for 4 s */
     int host_probe;   /* host state Off/unknown: probe the platform devices */
+    int pwm_freq;     /* LM96163 0x4D, pinned: a value read from a chip can be corruption */
+    int pwm_fast;     /* LM96163 0x4A bit 3 clear (the 360 kHz clock) */
+    int guard_ms;     /* the whole setup of the chips checked this often */
+    int guard_corrupt_regs; /* this many setup registers wrong at once: corruption */
     int pcs_bus, npcs, pcs[FAND_MAX_SENS];
     int vrm_bus, nvrm, vrm[FAND_MAX_SENS];
     struct devaddr cpu_fan, board_fan, iohub;
@@ -109,7 +113,11 @@ struct output
     int raw;         /* register value written */
     double min_duty, max_duty; /* its useful range (config) */
     double duty;     /* fan duty written, % */
-    int wd_on;       /* EMC2305 watchdog enabled */
+    unsigned repairs;       /* setup registers put right */
+    int64_t guard_next;     /* next full check of its setup, 0 = at once */
+    int64_t corrupt_at;     /* the last corruption event */
+    unsigned guard_refused; /* registers that don't take their value: reported */
+    int mode_refused;       /* LM96163: doesn't take the tachometer mode */
     int has_tach;
     int tach_mode_ok;     /* the chip has TACH_MODE "accurate" (read back) */
     int tach_mode_logged; /* 1 set, 2 refused: reported */
@@ -154,6 +162,8 @@ struct fand
     unsigned tach_checks;
     int64_t tach_low_since, tach_ok_since, tach_alarm_at[3];
     int out_alarm;
+    unsigned repairs, corruptions;
+    int iohub_skip;      /* its chip's offset was just repaired: no reading this poll */
     int64_t turbo_until; /* ms, 0 = off (the daemon keeps it in /run) */
     int led;         /* LED state written, -1 = unknown */
     unsigned long ticks;

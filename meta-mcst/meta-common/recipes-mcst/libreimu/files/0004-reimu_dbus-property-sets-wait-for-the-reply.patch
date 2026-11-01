@@ -1,0 +1,26 @@
+From: REIMU A/B <reimu@localhost>
+Subject: [PATCH] reimu_dbus: property sets wait for the reply
+
+dbus_connection_send() only queues the message, and the callers exit right
+after it: server_uid on/off returned 0 and did nothing most of the time (the
+LED group stayed as it was). Wait for the reply, which also reports errors.
+
+---
+--- a/reimu_dbus.c
++++ b/reimu_dbus.c
+@@ -49,9 +49,14 @@
+         return !dbus_message_append_args(reimu_dbus_msg, DBUS_TYPE_STRING, &string1, DBUS_TYPE_STRING, &string2, DBUS_TYPE_INVALID);
+ }
+ 
++static int reimu_get_dbus_reply(void);
++
+ static int reimu_send_dbus_request(void)
+ {
+-    return !dbus_connection_send(reimu_dbus_conn, reimu_dbus_msg, NULL);
++    /* with the reply: only queued, the message is lost when the process exits
++     * (server_uid off did nothing, most times), and an error is seen */
++    reimu_get_dbus_reply();
++    return reimu_dbus_reply == NULL;
+ }
+ 
+ static int reimu_get_dbus_reply(void)

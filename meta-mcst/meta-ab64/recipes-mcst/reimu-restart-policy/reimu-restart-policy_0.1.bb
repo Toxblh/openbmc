@@ -15,7 +15,7 @@ inherit allarch
 # bmcweb's certificate), reimu-pnsd.
 #
 # Restart=always, RestartSec=5, no start limit. Socket-activated ones
-# (bmcweb, phosphor-ipmi-net@, busybox-syslog, triggerhappy) keep their
+# (bmcweb, phosphor-ipmi-net@, triggerhappy) keep their
 # socket in PID 1 the whole time; the service is started again on it.
 # Templates (name@.service) cover every instance.
 REIMU_RESTART_ALWAYS = " \
@@ -41,8 +41,6 @@ REIMU_RESTART_ALWAYS = " \
     phosphor-systemd-target-monitor.service \
     xyz.openbmc_project.FruDevice.service \
     rngd.service \
-    busybox-syslog.service \
-    busybox-klogd.service \
     triggerhappy.service \
 "
 # their own Restart= stays (on-failure), only the limit and the delay change:

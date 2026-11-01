@@ -145,7 +145,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="root-")
         self.fake = tempfile.mkdtemp(prefix="fake-")
-        for n, body in (("systemctl", 'echo "$*" >> "$REIMU_ROOT/systemctl.log"; [ "$1" = is-active ] && echo active; exit 0'),
+        for n, body in (("systemctl", 'echo "$*" >> "$REIMU_ROOT/systemctl.log"; [ "$1" = is-active ] && echo active; '
+                                      'if [ "$1" = is-enabled ]; then [ -f "$REIMU_ROOT/pwmd-state" ] || exit 1; cat "$REIMU_ROOT/pwmd-state"; fi; exit 0'),
                         ("journalctl", 'echo "connected to the BMC at 127.0.0.1:5564 (ipv4)"')):
             p = os.path.join(self.fake, n)
             open(p, "w").write("#!/bin/sh\n" + body + "\n")
@@ -351,6 +352,80 @@ class Network(Base):
         rc, out = sh(["sh", script, "--uninstall"], env=self.env)
         self.assertEqual(rc, 0, out)
         self.assertFalse(os.path.exists(rule), "removed by --uninstall")
+
+    def bus_owner_paired(self, pwmd):
+        """a host already paired (the key there), pwmd in the given state"""
+        os.makedirs(os.path.dirname(self.secret()))
+        open(self.secret(), "w").write("KEY=" + "a" * 64 + "\nFINGERPRINT=" + "b" * 64 + "\n")
+        if pwmd:
+            open(os.path.join(self.root, "pwmd-state"), "w").write(pwmd + "\n")
+        return (os.path.join(self.root, "etc/modprobe.d/reimu-bmc-owns-i2c.conf"),
+                os.path.join(self.root, "etc/reimu-hostd/bus-owner.state"))
+
+    def test_bus_owner_install_uninstall(self):
+        """the BMC the only master of the shared I2C buses: modules kept out,
+        pwmd off and its state written down; --uninstall gives both back,
+        unbinding nothing; the agent stopped first, or it would stop pwmd again"""
+        conf, state = self.bus_owner_paired("enabled")
+        cl = os.path.join(self.root, "sys/bus/i2c/devices/0-004c")
+        drv = os.path.join(self.root, "sys/bus/i2c/drivers/lm63")
+        os.makedirs(cl)
+        os.makedirs(drv)
+        open(os.path.join(drv, "unbind"), "w").close()
+        os.symlink(drv, os.path.join(cl, "driver"))
+        script = self.installed_script()
+        rc, out = sh(["sh", script, "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        text = open(conf).read()
+        for m in ("lm63", "emc2305", "pwm_fan", "pmbus", "ir38064"):
+            self.assertIn("install %s /bin/true" % m, text)
+        self.assertIn("blacklist lm63", text)
+        self.assertEqual(open(state).read().strip(), "pwmd=enabled")
+        self.assertIn("disable --now pwmd", self.systemctl())
+        self.assertEqual(open(os.path.join(drv, "unbind")).read(), "0-004c", "unbound at once")
+        self.assertIn("BMC", out)
+        self.assertLess(self.systemctl().index("disable --now pwmd"), self.systemctl().index("restart reimu-hostd.service"))
+        # an update: the original state stays
+        open(os.path.join(self.root, "pwmd-state"), "w").write("disabled\n")
+        rc, out = sh(["sh", script, "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(open(state).read().strip(), "pwmd=enabled")
+        open(os.path.join(drv, "unbind"), "w").close()
+        rc, out = sh(["sh", script, "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(conf))
+        self.assertFalse(os.path.exists(state))
+        log = self.systemctl()
+        self.assertLess(log.index("disable --now reimu-hostd.service"), log.index("enable --now pwmd"))
+        self.assertEqual(open(os.path.join(drv, "unbind")).read(), "", "unbinds nothing")
+        self.assertIn("перезагруз", out.lower(), "a reboot gives the host its drivers back")
+        self.assertFalse(os.path.exists(os.path.dirname(self.secret())), "no leftovers")
+
+    def test_bus_owner_pwmd_was_off(self):
+        conf, state = self.bus_owner_paired("disabled")
+        script = self.installed_script()
+        rc, out = sh(["sh", script, "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(open(state).read().strip(), "pwmd=disabled")
+        rc, out = sh(["sh", script, "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("enable --now pwmd", self.systemctl())
+        self.assertFalse(os.path.exists(conf))
+
+    def test_bus_owner_not_before_paired(self):
+        """not paired: no agent will watch, the host's own fan control stays"""
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "etc/modprobe.d/reimu-bmc-owns-i2c.conf")))
+        self.assertNotIn("pwmd", self.systemctl())
+
+    def test_bus_owner_config_says_no(self):
+        conf, state = self.bus_owner_paired("enabled")
+        open(self.conf(), "w").write("ALLOW=gpu_fan gpu_turbo\n")
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(conf))
+        self.assertNotIn("pwmd", self.systemctl())
 
     def test_bad_pairing_string(self):
         rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url, "--pair", "reimu1:@@;rm -rf /"], env=self.env)

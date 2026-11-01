@@ -183,6 +183,36 @@ another number, is set again (event `gpu_fan_reapplied`). No word from the BMC
 for `LINK_LOST_SEC` (60 s), the agent stopping (and `ExecStopPost` after a
 crash): the driver's automatic control again.
 
+## The shared I2C buses are the BMC's alone
+
+Host i2c-0 is BMC i2c-6 (lm96163 0-004c, ir38064 0-0044/45/46, pmbus 0-0060),
+host i2c-1 is BMC i2c-2 (lm96163 1-004c, emc2305 1-002c/2e, pmbus 1-0058/59).
+With both sides polling, lm96163 2-004c had 0x98 (its 8-bit write address) in
+every writable register after days, offset 0x11 and PWM polarity included. So
+the BMC is the only master there; host i2c-3 (FRU, RTC) and l_pcs stay the host's.
+
+* `bus-owner install` (by install.sh, once paired):
+  `/etc/modprobe.d/reimu-bmc-owns-i2c.conf` blacklists lm63, emc2305, pwm_fan,
+  pmbus, ir38064, with `install <mod> /bin/true` too (pwmd's init script runs
+  modprobe by name); `systemctl disable --now pwmd` (or `chkconfig` for an init
+  script systemd only generates a unit for), how it was written down in
+  `/etc/reimu-hostd/bus-owner.state` once. If the running kernel's initramfs has
+  those modules it says so: rebuild it (`make-initrd -k $(uname -r)`), or the
+  agent unbinds them once it is up.
+* The agent, `bmc_owns_i2c` in `ALLOW` (default on; host-local, the BMC can't
+  command it): every 2 s, linked or not, it unbinds any pwm-fan (first: it uses
+  the lm63/emc2305 PWMs), then any driver on exactly those client addresses, and
+  stops a running pwmd; an event and a log line when it acts. `i2c_owner` {enforced,
+  clean, found, modprobe_conf} in the inventory and metrics, on the page. It
+  never reads these buses' hwmon. A host without these devices is just clean.
+* **What this costs:** with the BMC down or on the old stock firmware nobody
+  drives the fans. They hold their last duty, which `reimu-fand --failsafe`
+  leaves at 100 %. `install.sh --uninstall` gives the host its own control back:
+  the file removed, pwmd as it was; it unbinds nothing, and the drivers
+  come back with the host's next reboot.
+* An x86 OS under Lintel (Windows) can't be held to this: no agent runs there and
+  its firmware or drivers may use the buses.
+
 ## Events (BMC journal; warning and critical also phosphor-logging → Redfish EventLog)
 
 | kind | level |

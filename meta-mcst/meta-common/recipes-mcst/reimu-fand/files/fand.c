@@ -263,6 +263,10 @@ void cfg_defaults(struct config *c)
     c->cpu_tach = 1;
     c->emc_watchdog = 1;
     c->host_probe = 1;
+    c->pwm_freq = 0x17;
+    c->pwm_fast = 0;
+    c->guard_ms = 5000;
+    c->guard_corrupt_regs = 4;
     c->pcs_bus = 5;
     c->npcs = 7;
     for (int i = 0; i < 7; i++) c->pcs[i] = 0x20 + i;
@@ -375,6 +379,9 @@ static const struct numkey numkeys[] = {
     { "BOARD_FAN_MAX_DUTY", OFF(board_fan_max), 0, 0, 30, 100 },
     { "CASE_FAN_MAX_DUTY", OFF(case_fan_max), 0, 0, 30, 100 },
     { "TACH_CLEAR_SEC", OFF(tach_clear_ms), 1, 1, 5, 3600 },
+    { "LM96163_PWM_FREQ", OFF(pwm_freq), 0, 1, 1, 31 },
+    { "GUARD_SEC", OFF(guard_ms), 1, 1, 1, 60 },
+    { "GUARD_CORRUPT_REGS", OFF(guard_corrupt_regs), 0, 1, 2, 20 },
     { "PCS_BUS", OFF(pcs_bus), 0, 1, 0, 15 },
     { "VRM_BUS", OFF(vrm_bus), 0, 1, 0, 15 },
 };
@@ -462,6 +469,13 @@ static void cfg_line(struct config *c, char *line, int lineno, int pass, char er
         if (!*v || !strcasecmp(v, "none")) c->gpu_file[0] = 0;
         else if (v[0] != '/' || strlen(v) >= sizeof(c->gpu_file)) add_err(err, maxerr, nerr, "%s=%s: not an absolute path", k, v);
         else snprintf(c->gpu_file, sizeof(c->gpu_file), "%s", v);
+        return;
+    }
+    if (!strcmp(k, "LM96163_PWM_CLOCK"))
+    {
+        if (!strcasecmp(v, "slow")) c->pwm_fast = 0;
+        else if (!strcasecmp(v, "fast")) c->pwm_fast = 1;
+        else add_err(err, maxerr, nerr, "%s=%s: not slow or fast", k, v);
         return;
     }
     if (!strcmp(k, "TACH_MODE"))
@@ -721,6 +735,9 @@ void fand_reconfig(struct fand *f, const struct config *c)
                     n->has_tach = tach;
                     n->min_duty = lo;
                     n->max_duty = hi;
+                    n->guard_next = 0; /* the setup against the new config */
+                    n->guard_refused = 0;
+                    n->mode_refused = 0;
                 }
             }
     }
@@ -774,6 +791,21 @@ static double read_sensor(struct fand *f, int g, struct sensor *s, const char **
         if (id <= 0)
         {
             if (id < 0) *why = "not an LM96163";
+            return NAN;
+        }
+        /* an offset is in the reading: not trusted while there is one, nor in
+         * the poll that repaired it (the chip hasn't converted since) */
+        if (f->iohub_skip)
+        {
+            f->iohub_skip = 0;
+            *why = "remote offset just repaired";
+            return NAN;
+        }
+        int om = hw_rd_byte(bus, a, 0x11), ol = om >= 0 ? hw_rd_byte(bus, a, 0x12) : -1;
+        if (ol < 0) return NAN;
+        if (om || (ol & 0xe0))
+        {
+            *why = "remote offset wrong";
             return NAN;
         }
         int st = hw_rd_byte(bus, a, 0x02);
@@ -892,37 +924,200 @@ static int lm96163_max(int b, int a, int cfg)
 }
 
 /* duty -> chip. 0: written and read back */
+/* is the chip what it should be? 1 yes, 0 no answer, -1 another chip */
+static int chip_ident(struct output *o)
+{
+    if (o->ident == 1) return 1;
+    int b = o->a.bus, a = o->a.addr, id;
+    if (o->kind == OUT_LM96163) id = lm96163_ident(b, a);
+    else
+    {
+        int p = hw_rd_byte(b, a, 0xfd), m = p >= 0 ? hw_rd_byte(b, a, 0xfe) : -1;
+        id = m < 0 ? 0 : p == 0x34 && m == 0x5d ? 1 : -1;
+    }
+    if (id < 0 && o->ident != -1)
+        fand_log(3, "fan %d-%04x: not an %s, not driven", b, a, o->kind == OUT_LM96163 ? "LM96163" : "EMC2305");
+    o->ident = id;
+    if (id == 1) o->guard_next = 0; /* (again) ours: its whole setup is checked */
+    return id;
+}
+
+/* ---- the setup of the chips, guarded. The registers that decide what a
+ * duty does: one of them changed behind our back (2-004c was found with 0x98
+ * in all it could hold: the offset made IOHUB read -47.75 °C, the polarity
+ * bit made "100 %" stop its fans). Checked before anything is read or
+ * written, the critical ones every poll, all of them every GUARD_SEC and as
+ * soon as a critical one is wrong; each repair is one journal line, old ->
+ * new. LM96163 values: as dumped from a healthy chip on the board */
+struct greg
+{
+    uint8_t rd, wr; /* the LM96163 reads 0x03 etc. at one address, writes at another */
+    uint8_t val, mask;
+    uint8_t fast;
+    const char *name;
+};
+
+#define GUARD_MAX 16
+
+static int guard_regs_lm96163(const struct fand *f, const struct output *o, struct greg *g)
+{
+    int mode = o->has_tach ? f->c.tach_mode & 3 : 3; /* no tachometer: as the platform sets it */
+    int n = 0;
+    /* 0x4A first: PWM_FREQ can only be written with PWPGM (bit 5) on */
+    g[n++] = (struct greg){ 0x4a, 0x4a, (uint8_t)((f->c.pwm_fast ? 0 : 0x08) | 0x20 | mode), o->mode_refused ? 0x3c : 0x3f, 1,
+                            "PWM polarity, manual, clock, tachometer mode" };
+    g[n++] = (struct greg){ 0x4d, 0x4d, (uint8_t)f->c.pwm_freq, 0x1f, 1, "PWM frequency" };
+    g[n++] = (struct greg){ 0x11, 0x11, 0x00, 0xff, 1, "remote offset" };
+    g[n++] = (struct greg){ 0x12, 0x12, 0x00, 0xe0, 1, "remote offset, low" };
+    g[n++] = (struct greg){ 0x03, 0x09, 0x06, 0xff, 0, "config" };
+    g[n++] = (struct greg){ 0x04, 0x0a, 0x08, 0x0f, 0, "conversion rate" };
+    g[n++] = (struct greg){ 0x05, 0x0b, 0x46, 0xff, 0, "local high limit" };
+    g[n++] = (struct greg){ 0x07, 0x0d, 0x69, 0xff, 0, "remote high limit" };
+    g[n++] = (struct greg){ 0x08, 0x0e, 0x00, 0xff, 0, "remote low limit" };
+    g[n++] = (struct greg){ 0x13, 0x13, 0x00, 0xe0, 0, "remote high limit, low" };
+    g[n++] = (struct greg){ 0x14, 0x14, 0x00, 0xe0, 0, "remote low limit, low" };
+    g[n++] = (struct greg){ 0x19, 0x19, 0x6e, 0xff, 0, "T_CRIT" };
+    g[n++] = (struct greg){ 0x21, 0x21, 0x0a, 0xff, 0, "T_CRIT hysteresis" };
+    return n;
+}
+
+static int guard_regs_emc2305(const struct fand *f, struct greg *g)
+{
+    int n = 0;
+    g[n++] = (struct greg){ 0x2a, 0x2a, 0x00, 0xff, 0, "PWM polarity" };
+    g[n++] = (struct greg){ 0x2b, 0x2b, 0x00, 0xff, 0, "PWM output type" };
+    /* WD_EN: every fan to full drive when no fan setting is written for 4 s */
+    if (f->c.emc_watchdog) g[n++] = (struct greg){ 0x20, 0x20, 0x20, 0x20, 0, "watchdog" };
+    /* direct setting mode: with the RPM algorithm on, the drive isn't the drive */
+    for (int i = 0; i < 5; i++)
+    {
+        uint8_t r = 0x32 + 0x10 * i;
+        g[n++] = (struct greg){ r, r, 0x00, 0x80, 0, "direct drive" };
+    }
+    return n;
+}
+
+static void chip_dump(const struct output *o)
+{
+    for (int row = 0; row < 256; row += 16)
+    {
+        char line[64];
+        int len = snprintf(line, sizeof(line), "  %02x:", row);
+        for (int i = 0; i < 16; i++)
+        {
+            int v = hw_rd_byte(o->a.bus, o->a.addr, row + i);
+            len += v < 0 ? snprintf(line + len, sizeof(line) - len, " --") : snprintf(line + len, sizeof(line) - len, " %02x", v);
+        }
+        fand_log(3, "%s", line);
+    }
+}
+
+static void chip_guard(struct fand *f, struct output *o)
+{
+    if (chip_ident(o) != 1) return;
+    int b = o->a.bus, a = o->a.addr;
+    int first = !o->guard_next, full = first || f->now >= o->guard_next;
+    struct greg g[GUARD_MAX];
+    int cur[GUARD_MAX], n = o->kind == OUT_LM96163 ? guard_regs_lm96163(f, o, g) : guard_regs_emc2305(f, g);
+    for (int pass = 0; pass < 2; pass++)
+    {
+        int wrong = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (pass ? g[i].fast : !g[i].fast && !full) continue;
+            if ((cur[i] = hw_rd_byte(b, a, g[i].rd)) < 0) return; /* the write path sees to a chip not answering */
+            if ((cur[i] ^ g[i].val) & g[i].mask) wrong = 1;
+        }
+        if (full && !pass) break; /* all read */
+        if (pass) break;
+        if (!wrong) return; /* the critical ones are right, and it's not time for the rest */
+        full = 1;
+    }
+    o->guard_next = f->now + f->c.guard_ms;
+
+    /* what's wrong, without what's known not to take its value and what a
+     * takeover sets every time anyway: the tachometer mode (the platform's
+     * is 11), the EMC2305 watchdog (off after power-on) */
+    int count = 0;
+    unsigned todo = 0, silent = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int diff = (cur[i] ^ g[i].val) & g[i].mask;
+        if (!diff) continue;
+        todo |= 1u << i;
+        if (first && ((o->has_tach && g[i].rd == 0x4a && !(diff & ~3)) || (o->kind == OUT_EMC2305 && g[i].rd == 0x20))) silent |= 1u << i;
+        else if (!(o->guard_refused & (1u << i))) count++;
+    }
+    if (!todo) return;
+    if (count >= f->c.guard_corrupt_regs && (!o->corrupt_at || f->now - o->corrupt_at >= 60000))
+    {
+        o->corrupt_at = f->now;
+        f->corruptions++;
+        f->gen++;
+        fand_log(2, "CHIP CORRUPTION: fan %d-%04x: %d setup registers wrong at once (%s), its registers before the repair:", b, a,
+                 count, first ? "found at takeover" : "while running");
+        chip_dump(o);
+    }
+    for (int i = 0; i < n; i++)
+    {
+        unsigned bit = 1u << i;
+        if (!(todo & bit)) continue;
+        int val = (cur[i] & ~g[i].mask & 0xff) | (g[i].val & g[i].mask);
+        if (fand_observe)
+        {
+            if (!(o->guard_refused & bit))
+                fand_log(4, "fan %d-%04x: 0x%02x 0x%02x, should be 0x%02x (%s): not repaired, observing", b, a, g[i].rd, cur[i], val, g[i].name);
+            o->guard_refused |= bit;
+            continue;
+        }
+        hw_wr_byte(b, a, g[i].wr, val);
+        int rb = hw_rd_byte(b, a, g[i].rd);
+        if ((rb < 0 || ((rb ^ val) & g[i].mask)) && g[i].wr != g[i].rd)
+        {
+            /* a chip that takes it at the read address */
+            hw_wr_byte(b, a, g[i].rd, val);
+            rb = hw_rd_byte(b, a, g[i].rd);
+        }
+        int left = rb < 0 ? 0xff : (rb ^ val) & g[i].mask;
+        if (g[i].rd == 0x4a && o->has_tach && left && !(left & ~3))
+        {
+            /* only the tachometer mode not taken: the write path reports it */
+            o->mode_refused = 1;
+            left = 0;
+        }
+        if (left)
+        {
+            if (!(o->guard_refused & bit))
+                fand_log(3, "fan %d-%04x: 0x%02x reads 0x%02x and doesn't take 0x%02x (%s)", b, a, g[i].rd, rb, val, g[i].name);
+            o->guard_refused |= bit;
+            continue;
+        }
+        o->guard_refused &= ~bit;
+        if (silent & bit) continue;
+        fand_log(4, "fan %d-%04x: 0x%02x 0x%02x -> 0x%02x (%s) repaired", b, a, g[i].rd, cur[i], rb, g[i].name);
+        o->repairs++;
+        f->repairs++;
+        f->gen++;
+        if (o->kind == OUT_LM96163)
+        {
+            if ((g[i].rd == 0x11 || g[i].rd == 0x12 || g[i].rd == 0x03) && b == f->c.iohub.bus && a == f->c.iohub.addr) f->iohub_skip = 1;
+            /* what the tachometer said under a wrong PWM doesn't count */
+            if (o->has_tach && (g[i].rd == 0x4d || (g[i].rd == 0x4a && ((cur[i] ^ val) & 0x3c))))
+            {
+                o->sn = o->sp = 0;
+                o->tach_since = f->now;
+                f->tach_verify = 0;
+            }
+        }
+    }
+}
+
 static int write_lm96163(struct fand *f, struct output *o, double duty)
 {
     int b = o->a.bus, a = o->a.addr;
-    if (o->ident != 1)
-    {
-        int id = lm96163_ident(b, a);
-        if (id < 0 && o->ident != -1) fand_log(3, "fan %d-%04x: not an LM96163, not driven", b, a);
-        o->ident = id;
-        if (id != 1) return -1;
-        if (o->has_tach)
-        {
-            int cfg1 = hw_rd_byte(b, a, 0x03);
-            if (cfg1 >= 0 && !(cfg1 & 0x04)) fand_log(3, "fan %d-%04x: its tachometer input is off (CONFIG 0x%02x)", b, a, cfg1);
-        }
-    }
+    if (chip_ident(o) != 1) return -1;
     int cfg = hw_rd_byte(b, a, 0x4a);
     if (cfg < 0) return -1;
-    /* bit 5 PWPGM off: the chip runs its lookup table; on: the PWM value
-     * register. Bits 1:0, a fan with a tachometer: its TACH_MODE (the chip
-     * forgets it when the platform powers off). Bits 3 (PWM clock), 4
-     * (polarity) and PWM_FREQ are never touched */
-    int want = cfg | 0x20;
-    if (o->has_tach) want = (want & ~0x03) | (f->c.tach_mode & 0x03);
-    if (want != cfg)
-    {
-        if (!(cfg & 0x20)) fand_log(4, "fan %d-%04x was in its automatic (lookup table) mode: set to manual", b, a);
-        if (hw_wr_byte(b, a, 0x4a, want)) return -1;
-        int rb = hw_rd_byte(b, a, 0x4a);
-        if (rb < 0) return -1;
-        cfg = rb;
-    }
     if (o->has_tach)
     {
         static const char *const names[4] = { "traditional", "?", "accurate", "least" };
@@ -935,7 +1130,9 @@ static int write_lm96163(struct fand *f, struct output *o, double duty)
                      b, a, names[f->c.tach_mode & 3], cfg, f->c.tach_valid_duty_other);
         o->tach_mode_logged = ok ? 1 : 2;
     }
-    if (!(cfg & 0x20)) return -1;
+    /* chip_guard() has seen to these: manual (else the chip runs its lookup
+     * table) and the PWM not inverted (else "100 %" stops the fan) */
+    if ((cfg & 0x30) != 0x20) return -1;
     int max = lm96163_max(b, a, cfg);
     if (max < 0) return -1;
     int raw = duty >= 100 ? max : (int)lround(duty * max / 100);
@@ -949,35 +1146,7 @@ static int write_lm96163(struct fand *f, struct output *o, double duty)
 static int write_emc2305(struct fand *f, struct output *o, double duty)
 {
     int b = o->a.bus, a = o->a.addr;
-    if (o->ident != 1)
-    {
-        int p = hw_rd_byte(b, a, 0xfd), m = p >= 0 ? hw_rd_byte(b, a, 0xfe) : -1;
-        int id = m < 0 ? 0 : p == 0x34 && m == 0x5d ? 1 : -1;
-        if (id < 0 && o->ident != -1) fand_log(3, "fan %d-%04x: not an EMC2305 (0x%02x 0x%02x), not driven", b, a, p, m);
-        o->ident = id;
-        if (id != 1) return -1;
-        o->wd_on = 0;
-        /* direct setting mode on every channel: with the RPM algorithm on,
-         * the drive register isn't the drive */
-        for (int n = 0; n < 5; n++)
-        {
-            int c1 = hw_rd_byte(b, a, 0x32 + 0x10 * n);
-            if (c1 < 0) return -1;
-            if (c1 & 0x80)
-            {
-                fand_log(4, "fan %d-%04x channel %d was in RPM mode: set to direct drive", b, a, n);
-                if (hw_wr_byte(b, a, 0x32 + 0x10 * n, c1 & 0x7f)) return -1;
-            }
-        }
-    }
-    if (f->c.emc_watchdog && !o->wd_on)
-    {
-        /* CONFIGURATION WD_EN: watchdog in continuous mode, every fan to
-         * full drive when no fan setting is written for 4 s */
-        int cf = hw_rd_byte(b, a, 0x20);
-        if (cf < 0 || (!(cf & 0x20) && hw_wr_byte(b, a, 0x20, cf | 0x20))) return -1;
-        o->wd_on = 1;
-    }
+    if (chip_ident(o) != 1) return -1;
     int raw = duty >= 100 ? 0xff : (int)lround(duty * 255 / 100);
     if (raw < 1) raw = 1;
     int bad = 0;
@@ -1185,7 +1354,8 @@ void fand_failsafe(const struct config *c)
         if (ident3(OUT_LM96163, b, a) != 1) continue;
         int cfg = -1, max = -1;
         for (int k = 0; k < 3 && cfg < 0; k++) cfg = hw_rd_byte(b, a, 0x4a);
-        if (cfg >= 0 && !(cfg & 0x20)) hw_wr_byte(b, a, 0x4a, cfg | 0x20);
+        /* manual, and not inverted: with bit 4, full scale would stop the fan */
+        if (cfg >= 0 && (cfg & 0x30) != 0x20) hw_wr_byte(b, a, 0x4a, (cfg | 0x20) & ~0x10);
         for (int k = 0; k < 3 && max < 0 && cfg >= 0; k++) max = lm96163_max(b, a, cfg);
         /* scale unknown: 0x3f is full scale of the 6-bit register (100 % with
          * any PWM_FREQ); the 8-bit mode needs its read 0x4D */
@@ -1373,7 +1543,9 @@ static void enter_run(struct fand *f)
             o->ok = 0;
             o->last_ok = 0;
             o->failing = 0;
-            o->wd_on = 0;
+            o->guard_next = 0;
+            o->guard_refused = 0;
+            o->mode_refused = 0;
             o->sn = o->sp = 0;
             o->tach_mode_ok = 0;
             o->rpm = o->rpm_last = NAN;
@@ -1432,7 +1604,10 @@ void fand_step(struct fand *f, int64_t now, int host)
         enter_run(f);
     }
 
-    /* PH_RUN */
+    /* PH_RUN: the chips' setup first: nothing is read or concluded from a chip
+     * that's set up wrong */
+    for (int zi = 0; zi < NZONES; zi++)
+        for (int i = 0; i < f->z[zi].nout; i++) chip_guard(f, &f->z[zi].out[i]);
     read_groups(f);
     struct output *cpu = &f->z[Z_CPU].out[0];
     /* the tachometer whatever became of the last write: only not on a chip
@@ -1648,6 +1823,7 @@ void fand_json(const struct fand *f, struct buf *b)
         buf_printf(b, "\"settle_left\":%lld,", (long long)((c->settle_ms - (f->now - f->on_since) + 999) / 1000));
     if (f->phase == PH_RUN && f->now < f->full_until)
         buf_printf(b, "\"full_left\":%lld,", (long long)((f->full_until - f->now + 999) / 1000));
+    buf_printf(b, "\"repairs\":%u,\"corruptions\":%u,", f->repairs, f->corruptions);
     buf_printf(b, "\"turbo\":%s,\"turbo_left\":%d,\"turbo_max_min\":%d,", fand_turbo_left(f) ? "true" : "false",
                fand_turbo_left(f), FAND_TURBO_MAX_MIN);
     buf_printf(b, "\"floor\":%g,\"hysteresis\":%g,\"slew_up\":%g,\"slew_down\":%g,\"manual_timeout\":%d,", c->floor, c->hyst,
@@ -1729,7 +1905,7 @@ void fand_json(const struct fand *f, struct buf *b)
             const struct output *o = &z->out[i];
             buf_printf(b, "%s{\"dev\":\"%d-%04x\",\"chip\":\"%s\",\"ok\":%s,\"raw\":%d", i ? "," : "", o->a.bus, o->a.addr,
                        o->kind == OUT_LM96163 ? "lm96163" : "emc2305", run && o->ok ? "true" : "false", o->raw);
-            buf_printf(b, ",\"duty\":");
+            buf_printf(b, ",\"repairs\":%u,\"duty\":", o->repairs);
             buf_num(b, run ? o->duty : NAN, 1);
             buf_printf(b, ",\"range\":[%g,%g]", fmax(o->min_duty, c->floor), o->max_duty);
             if (o->has_tach)

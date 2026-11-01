@@ -1,0 +1,17 @@
+[Unit]
+Description=BMC event log (warnings and worse on the rwfs) and the diagnostic archive
+After=systemd-journald.service dbus.service local-fs.target
+# the boot record's clean stop: stopped late, what's pending written
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/reimu-logd
+Restart=always
+RestartSec=5
+WatchdogSec=60
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

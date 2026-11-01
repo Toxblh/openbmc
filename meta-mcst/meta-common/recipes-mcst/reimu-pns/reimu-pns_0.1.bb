@@ -22,6 +22,8 @@ SRC_URI = " \
             file://reimu-sensors.h \
             file://reimu-pnsflash.c \
             file://reimu-pnsflash.h \
+            file://reimu-overheat.c \
+            file://reimu-overheat.h \
             file://reimu-pns-scan \
             file://reimu-pnsd.service \
             file://xyz.openbmc_project.Reimu.Pns.conf \

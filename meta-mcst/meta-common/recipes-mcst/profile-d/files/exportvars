@@ -1,3 +1,6 @@
 export LANG=ru_RU.UTF-8
-export TERM=putty
+# the client's TERM if this image has its terminfo entry (it has few: tmux, on
+# port 2022 and "tmux attach", and others refuse a terminal they can't look
+# up); else xterm-256color, which every terminal in use, PuTTY too, can do
+[ -z "$TERM" ] || [ -e "/etc/terminfo/${TERM%"${TERM#?}"}/$TERM" ] || [ -e "/usr/share/terminfo/${TERM%"${TERM#?}"}/$TERM" ] || export TERM=xterm-256color
 export BASH=/bin/sh

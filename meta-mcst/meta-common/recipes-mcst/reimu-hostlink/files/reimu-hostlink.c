@@ -36,6 +36,7 @@
  *   reimu-hostlink --check-config [FILE]
  *   reimu-hostlink --ctl 'state' | 'fan manual 40' | 'turbo 5' | 'power reboot'
  *                  | 'edac' | 'inventory' | 'pair' | 'unpair' | 'disk' | 'diskoff'
+ *                  | 'diag' (the agent's report into RUN/host-diag.b64, for reimu-diag)
  * REIMU_HOSTLINK_CONF, REIMU_HOSTLINK_DIR, REIMU_HOSTLINK_RUN: other paths
  * (tests). Built without HL_DBUS (the native tests) it has no D-Bus, writes
  * its state to RUN/state.json and takes "fandturbo SECS" on ctl.
@@ -119,6 +120,15 @@ static void put_run(const char *name, const char *text)
     close(fd);
     if (ok) rename(tmp, p);
     else unlink(tmp);
+}
+
+/* the agent's report for reimu-diag (--ctl diag): root's only */
+static void on_diag(struct hl *h, const char *b64)
+{
+    char p[300];
+    put_run("host-diag.b64", b64);
+    snprintf(p, sizeof(p), "%s/host-diag.b64", s_run);
+    chmod(p, 0600);
 }
 
 /* ------------------------------------------------------------------ the installer's USB disk */
@@ -250,6 +260,7 @@ static void ctl_command(int fd, char *cmd)
     else if (IS("power") && sscanf(cmd + 6, "%15s", a) == 1) r = hl_os_power(&H, a, err, sizeof(err));
     else if (!strcmp(cmd, "edac")) r = hl_edac_load(&H, err, sizeof(err));
     else if (!strcmp(cmd, "inventory")) r = hl_request_inventory(&H, err, sizeof(err));
+    else if (!strcmp(cmd, "diag")) r = hl_host_diag(&H, err, sizeof(err));
     else if (!strcmp(cmd, "pair")) r = hl_pair_begin(&H, &out, err, sizeof(err));
     else if (!strcmp(cmd, "unpair")) hl_unpair(&H);
     else if (!strcmp(cmd, "disk")) r = daemon_disk_start(&H, &out, err, sizeof(err));
@@ -367,6 +378,7 @@ static int run(void)
     struct hl_config c;
     load_config(&c, s_conf, 0);
     hl_init(&H, &c, dir);
+    H.on_diag = on_diag;
     char cert[200], err[200];
     snprintf(cert, sizeof(cert), "%s/cert.pem", dir);
     s_net = net_new(&H, cert, err, sizeof(err));

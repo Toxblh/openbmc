@@ -69,7 +69,13 @@ static int fake_open(int bus, int addr, int wr)
  *   0x4C (PWM value) and the LUT PWM entries keep 6 bits (8 in the
  *   high-resolution mode, see fand.c)
  *   tachometer: the count is the "live" bytes 0x46/0x47; reading 0x46
- *   latches the MSB, which 0x47 returns (0xff until latched) */
+ *   latches the MSB, which 0x47 returns (0xff until latched)
+ *   0x03, 0x04, 0x05, 0x07, 0x08 are written at 0x09, 0x0a, 0x0b, 0x0d, 0x0e
+ *   (both then read the value), a write to the read address is ignored;
+ *   <dev>.noalias: plain registers (an EEPROM in QEMU)
+ *   0x4A keeps 6 bits, 0x4D 5 bits, 0x4A bit 4 inverts the PWM (.fan)
+ *   the remote offset 0x11 is in the reading 0x01
+ *   <dev>.no-polarity: 0x4A bit 4 can't be changed */
 static int fake_is_lm96163(int bus, int addr)
 {
     char p[512];
@@ -141,7 +147,8 @@ static void fake_fan(int fd, int bus, int addr)
     if (pread(fd, &pwm, 1, 0x4c) != 1 || pread(fd, &cfg, 1, 0x4a) != 1 || pread(fd, &freq, 1, 0x4d) != 1) return;
     int max = fake_pwm_mask(fd) == 0xff ? 255 : 2 * (freq & 0x1f ? freq & 0x1f : 1);
     int duty = pwm >= max ? 100 : pwm * 100 / max;
-    double rpm = fake_fan_rpm(duty, k++, !strncmp(s, "stall", 5), cfg & 3);
+    if (cfg & 0x10) duty = 100 - duty; /* inverted PWM: full scale stops it */
+    double rpm = duty < 10 ? 0 : fake_fan_rpm(duty, k++, !strncmp(s, "stall", 5), cfg & 3);
     int count = rpm <= 0 ? 0xfffc : ((int)(5400000 / rpm) & 0xfffc);
     uint8_t c2[2] = { count & 0xff, count >> 8 };
     if (pwrite(fd, c2, 2, 0x46) != 2) return;
@@ -184,6 +191,32 @@ static int fake_wr(int bus, int addr, int reg, int val)
         return 0;
     }
     uint8_t b = val;
+    if (fake_is_lm96163(bus, addr))
+    {
+        static const uint8_t rd[] = { 0x03, 0x04, 0x05, 0x07, 0x08 }, wr[] = { 0x09, 0x0a, 0x0b, 0x0d, 0x0e };
+        snprintf(p, sizeof(p), "%s/i2c-%d/%02x.noalias", s_fake, bus, addr);
+        int alias = access(p, F_OK) != 0;
+        for (int i = 0; alias && i < 5; i++)
+        {
+            if (reg == rd[i])
+            {
+                close(fd);
+                return 0;
+            }
+            if (reg == wr[i] && pwrite(fd, &b, 1, rd[i]) != 1) break;
+        }
+        if (reg == 0x4a) b &= 0x3f;
+        if (reg == 0x4d) b &= 0x1f;
+        uint8_t was;
+        snprintf(p, sizeof(p), "%s/i2c-%d/%02x.no-polarity", s_fake, bus, addr);
+        if (reg == 0x4a && !access(p, F_OK) && pread(fd, &was, 1, 0x4a) == 1) b = (b & ~0x10) | (was & 0x10);
+        uint8_t off, temp;
+        if (reg == 0x11 && pread(fd, &off, 1, 0x11) == 1 && pread(fd, &temp, 1, 0x01) == 1)
+        {
+            temp = (uint8_t)((int8_t)temp + (int8_t)b - (int8_t)off);
+            if (pwrite(fd, &temp, 1, 0x01) != 1) errno = EIO;
+        }
+    }
     if (fake_is_lm96163(bus, addr) && (reg == 0x4c || (reg >= 0x51 && reg <= 0x67 && (reg & 1)))) b &= fake_pwm_mask(fd);
     /* <dev>.no-tachmode: a chip that doesn't take 0x4A bits 1:0 */
     snprintf(p, sizeof(p), "%s/i2c-%d/%02x.no-tachmode", s_fake, bus, addr);

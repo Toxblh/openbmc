@@ -8,8 +8,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/logrotate /etc/logrotate.d/solrotate.conf
-ExecStart=/bin/gzip -kf /usr/log/current
+ExecStart=/libexec/logrotate-sol
 Nice=19
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

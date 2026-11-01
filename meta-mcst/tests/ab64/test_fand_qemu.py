@@ -23,6 +23,8 @@ FAND_MINUTES: length of the memory run (default 4). Tests (all by default):
          HOST_PROBE: off but devices answer -> controlled; Турбо over
          D-Bus: every fan full scale, kept over a SIGKILL, back to the
          curves when it expires (and the web card / top bar chip, FAND_E2E);
+         the register image found on the board written while running:
+         repaired, a line per repair, a corruption event with a dump;
          memory flat
 """
 import json, math, os, re, socket, subprocess, sys, time
@@ -48,6 +50,8 @@ def lm96163_regs(remote):
     r = bytearray(256)
     r[0xfe], r[0xff] = 0x01, 0x49        # National, LM96163
     r[0x4a], r[0x4d], r[0x03] = 0x2b, 0x17, 0x06  # manual, PWM_FREQ 23, tach on
+    # the rest of the setup reimu-fand guards, as on a healthy chip of the board
+    r[0x04], r[0x05], r[0x07], r[0x19], r[0x21] = 0x08, 0x46, 0x69, 0x6e, 0x0a
     r[0x4c] = 0x2e
     r[0x01] = remote
     r[0x46], r[0x47] = 0x8c, 0x0a        # 2700 counts: 2000 rpm
@@ -436,6 +440,35 @@ def t_board():
         b.power(True)
         s = b.wait_state(lambda s: s["host"] == "on", 20)
         check(s.get("host") == "on", "on again")
+
+        # the setup of the chips guarded: the image found on the board
+        s = b.state()
+        check(s.get("repairs") == 0 and s.get("corruptions") == 0, "healthy chips: no repairs so far (%s)" % s.get("repairs"))
+        t1 = b.now()
+        img = {0x11: 0x98, 0x12: 0x80, 0x03: 0x80, 0x05: 0x98, 0x08: 0x98, 0x19: 0x98, 0x21: 0x98, 0x4d: 0x18, 0x4a: 0x38}
+        b.ssh(" ; ".join("i2cset -f -y 2 0x4c 0x%02x 0x%02x" % x for x in img.items()))
+        s = b.wait_state(lambda s: s["corruptions"] >= 1 and s["repairs"] >= 9, 20)
+        got = [b.reg(2, 0x4c, r) for r in (0x11, 0x12, 0x03, 0x05, 0x08, 0x19, 0x21, 0x4d, 0x4a)]
+        check(got == [0, 0, 0x06, 0x46, 0, 0x6e, 0x0a, 0x17, 0x2b], "2-004c corrupted while running: repaired %s" % got)
+        check(s.get("corruptions") == 1 and s.get("repairs", 0) >= 9, "JSON: corruptions %s, repairs %s" % (s.get("corruptions"), s.get("repairs")))
+        j = b.journal(t1)
+        check("CHIP CORRUPTION" in j and "0x4a 0x38 -> 0x2b" in j and "0x11 0x98 -> 0x00" in j, "journal: the event, a line per repair")
+        check(re.search(r"^\s*40: (.. ){10}38", j, re.M) is not None, "journal: the register dump, from before the repair")
+        time.sleep(3)
+        s = b.state()
+        check(not s.get("alarm") and not zone(s, "board")["failsafe"], "no alarm after the repair (%s)" % s.get("alarm_text"))
+        # polarity on the CPU fan chip: repaired by the next poll, no fan alarm
+        b.setreg(6, 0x4c, 0x4a, 0x3a)
+        time.sleep(1.5)
+        check(b.reg(6, 0x4c, 0x4a) == 0x2a and not b.state().get("tach_alarm"), "CPU fan chip: polarity repaired")
+        # --failsafe over an inverted PWM (the daemon stopped, it would repair it itself)
+        b.ssh("systemctl stop reimu-fand")
+        b.setreg(2, 0x4c, 0x4a, 0x38)
+        b.ssh("reimu-fand --failsafe")
+        check(not b.reg(2, 0x4c, 0x4a) & 0x10 and b.reg(2, 0x4c, 0x4c) > 0, "--failsafe clears the polarity")
+        b.ssh("systemctl start reimu-fand")
+        b.wait_state(lambda s: s["host"] == "on" and zone(s, "cpu")["duty"] < 100, 30)
+        b.setreg(2, 0x4c, 0x4d, 0x17)
 
         # the host's GPU temperature (reimu-hostlink's file; a file of our own
         # here: reimu-hostlink manages /run/reimu-hostlink/gpu-temp)

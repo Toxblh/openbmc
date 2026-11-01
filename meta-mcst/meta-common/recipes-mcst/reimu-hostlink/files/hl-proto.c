@@ -743,6 +743,14 @@ static void on_result(struct hl *h, const char *s, const struct jtok *t)
         r->done = 1;
         r->ok = ok;
         snprintf(r->text, sizeof(r->text), "%s", txt);
+        if (ok && !strcmp(r->op, "diag") && h->on_diag)
+        {
+            /* its report: base64, nothing else goes through */
+            char *z = malloc(HL_MAX_LINE);
+            if (z && !sfield(s, t, "gz", z, HL_MAX_LINE) && z[strspn(z, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")] == 0)
+                h->on_diag(h, z);
+            free(z);
+        }
         hl_event(h, ok ? 6 : 4, "control", "host: %s %s%s%s", r->op, ok ? "done" : "failed", txt[0] ? ": " : "", txt);
         return;
     }
@@ -1000,6 +1008,11 @@ int hl_os_power(struct hl *h, const char *action, char *err, size_t n)
 int hl_edac_load(struct hl *h, char *err, size_t n)
 {
     return control(h, "edac_load", "", err, n);
+}
+
+int hl_host_diag(struct hl *h, char *err, size_t n)
+{
+    return control(h, "diag", "", err, n);
 }
 
 int hl_request_inventory(struct hl *h, char *err, size_t n)

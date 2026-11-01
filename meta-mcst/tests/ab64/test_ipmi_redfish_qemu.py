@@ -768,8 +768,8 @@ RESTART_UNITS = [
     "xyz.openbmc_project.Logging.IPMI", "xyz.openbmc_project.Inventory.Manager", "xyz.openbmc_project.Time.Manager",
     "xyz.openbmc_project.LED.GroupManager", "xyz.openbmc_project.led.controller@sys-class-leds-platform:blue:uid",
     "xyz.openbmc_project.Chassis.Buttons", "phosphor-button-handler", "obmc-fru-fault-monitor",
-    "phosphor-systemd-target-monitor", "xyz.openbmc_project.FruDevice", "rngd", "busybox-syslog",
-    "busybox-klogd", "triggerhappy", "systemd-networkd"]
+    "phosphor-systemd-target-monitor", "xyz.openbmc_project.FruDevice", "rngd",
+    "triggerhappy", "systemd-networkd"]
 KILL3 = r"""u="$1"; for i in 1 2 3; do p=$(systemctl show -p MainPID --value "$u"); [ "$p" -gt 0 ] && kill -9 $p
 t=0; while [ $t -lt 25 ]; do sleep 1; t=$((t+1)); q=$(systemctl show -p MainPID --value "$u"); [ "$q" -gt 0 ] && [ "$q" != "$p" ] && break; done; done
 t=0; while [ $t -lt 60 ] && [ "$(systemctl is-active "$u")" != active ]; do sleep 1; t=$((t+1)); done

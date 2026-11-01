@@ -15,6 +15,9 @@ OBMC_IMAGE_EXTRA_INSTALL_append = " phosphor-nslcd-authority-cert-config"
 # the BMC's daemons restarted after any crash, without the start limit
 # (reimu-restart-policy: which ones and why)
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-restart-policy"
+# the logs: a week of journal in RAM, the event log on the rwfs, the boot
+# record, the diagnostic archive
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-logd"
 # systemd-networkd keeps the DHCP address over the restarts phosphor-networkd
 # does (networkd 247 aborted in address_is_ready() otherwise)
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-networkd-keep-dhcp"
@@ -40,7 +43,8 @@ IMAGE_FEATURES_remove = "obmc-software"
 # the PNS flash: checked, backed up, verified writes (update-host-flash, web UI)
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-pns-flash"
 # the fan control: the BMC is the only controller of this board's fans; phosphor-fan-control
-# (and its monitor, presence-tach) out: reimu-fand owns them
+# and its monitor out (presence-tach: packagegroups/packagegroup-obmc-apps.bbappend):
+# reimu-fand owns them
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-fand"
 IMAGE_FEATURES_remove = "obmc-fan-control"
 # the host agent's link (reimu-hostd on the host, meta-mcst/tools/host):

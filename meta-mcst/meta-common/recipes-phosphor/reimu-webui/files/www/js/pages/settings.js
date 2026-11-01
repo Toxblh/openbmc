@@ -1,5 +1,6 @@
 import { api, h, toast } from "../api.js";
 import { firmwareCard } from "./firmware.js";
+import { overheatCard, overheatState } from "./overheat.js";
 
 let root, fwCard;
 
@@ -12,16 +13,17 @@ export async function mount(el) {
 }
 
 async function render() {
-  const [mgr, proto, ifaces, accounts] = await Promise.all([
+  const [mgr, proto, ifaces, accounts, overheat] = await Promise.all([
     api.get("/redfish/v1/Managers/bmc").catch(() => null),
     api.get("/redfish/v1/Managers/bmc/NetworkProtocol").catch(() => null),
     api.collection("/redfish/v1/Managers/bmc/EthernetInterfaces").catch(() => []),
     api.collection("/redfish/v1/AccountService/Accounts").catch(() => []),
+    overheatState(),
   ]);
   if (!root) return;
   if (fwCard) fwCard.stop();
   fwCard = firmwareCard(mgr, rebootBmc);
-  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), bmcCard(mgr), fwCard);
+  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), overheatCard(overheat, render), bmcCard(mgr), fwCard);
 }
 
 function networkCard(proto, ifaces) {

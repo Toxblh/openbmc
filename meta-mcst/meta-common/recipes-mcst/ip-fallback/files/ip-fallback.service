@@ -4,9 +4,10 @@ After=network.target
 
 [Service]
 ExecStart=/libexec/ip-fallback
-Type=oneshot
-RemainAfterExit=yes
+# it counts FallbackTimeout seconds: nothing waits for it
+Type=simple
 StandardError=journal+console
 
 [Install]
-WantedBy=network-online.target
+# (not network-online.target: nothing pulls that in on this image)
+WantedBy=multi-user.target

@@ -16,6 +16,7 @@ SRC_URI = "file://sol.conf \
            file://minirc.dfl \
            file://solrotate.conf \
            file://start-tmux \
+           file://logrotate-sol \
            file://tmux-logger.service \
            file://logrotate-sol.service \
            file://logrotate-sol.timer \
@@ -35,7 +36,7 @@ do_install() {
   install -m 644 sol.conf ${D}/etc
   install -m 644 minirc.dfl ${D}/etc
   install -m 644 solrotate.conf ${D}/etc/logrotate.d
-  install -m 755 start-tmux ${D}/libexec
+  install -m 755 start-tmux logrotate-sol ${D}/libexec
   install -m 644 tmux-logger.service ${D}${systemd_system_unitdir}
   install -m 644 logrotate-sol.service ${D}${systemd_system_unitdir}
   install -m 644 logrotate-sol.timer ${D}${systemd_system_unitdir}

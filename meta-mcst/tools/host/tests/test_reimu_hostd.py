@@ -6,6 +6,8 @@
 Nothing of the machine it runs on is read or written: every path goes through
 the agent's Fs(root) and every command through a recording fake runner.
 """
+import gzip
+import base64
 import time, importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -682,6 +684,45 @@ class TestControl(Base):
     def alt_modprobe(self, argv):
         return (0, "") if argv[1] == "e2k_edac" else (1, "modprobe: FATAL: Module %s not found" % argv[1])
 
+    def diag_ctl(self):
+        c = self.ctl()
+        c.col = hd.Collector(self.fs, self.run, self.cfg)
+        self.run.table["dmesg"] = lambda argv: (0, "kernel line one\n" + "x" * 2000 + "\nkernel line last\n")
+        return c
+
+    def report(self, r):
+        return json.loads(gzip.decompress(base64.b64decode(r["gz"])).decode())
+
+    def test_diag_report_fixed_set(self):
+        r = self.diag_ctl().handle({"t": "control", "id": 8, "op": "diag"}, 0)
+        self.assertTrue(r["ok"], r)
+        d = self.report(r)
+        self.assertEqual(set(d), {"inventory", "kernel_log", "edac", "gpu", "temps", "mem", "uptime", "bmc_usb_hub", "i2c_owner", "agent"})
+        self.assertIn("kernel line last", d["kernel_log"])
+        self.assertNotIn("gz", r["text"])
+
+    def test_diag_reads_no_shared_bus_and_runs_only_dmesg_and_inventory_tools(self):
+        c = self.diag_ctl()
+        self.run.calls.clear()
+        c.handle({"t": "control", "id": 8, "op": "diag"}, 0)
+        self.assertNotIn(["i2cdump"], [x[:1] for x in self.run.calls])
+        for argv in self.run.calls:
+            self.assertFalse(argv[0].startswith("i2c"), argv)
+
+    def test_diag_size_capped(self):
+        c = self.diag_ctl()
+        rnd = "".join(chr(33 + (i * 7919) % 90) + str(i) for i in range(400000))
+        self.run.table["dmesg"] = lambda argv: (0, rnd)
+        r = c.handle({"t": "control", "id": 8, "op": "diag"}, 0)
+        self.assertTrue(r["ok"], r)
+        self.assertLessEqual(len(r["gz"]), hd.DIAG_MAX_B64)
+
+    def test_diag_disabled_by_allow(self):
+        c = self.ctl("ALLOW=gpu_fan")
+        r = c.handle({"t": "control", "id": 8, "op": "diag"}, 0)
+        self.assertFalse(r["ok"])
+        self.assertIn("disabled", r["err"])
+
     def test_edac_load_real_module_name(self):
         c = self.ctl()
         self.run.table["modprobe"] = self.alt_modprobe
@@ -762,6 +803,27 @@ class TestControl(Base):
 
 
 # ------------------------------------------------------------------ transport
+class TestStopRightAfterConnect(Base):
+    def test_policy_applied_before_a_stop_is_seen(self):
+        """the agent killed left manual 40 on the card; the new one connects and
+        gets SIGTERM before its first loop: the fan must still go back to the driver"""
+        hw = GPU_DEV + "/hwmon/hwmon2"
+        self.t.put(hw + "/pwm1_enable", "1")
+        self.t.put(hw + "/pwm1", "102")
+        ag = hd.Agent(hd.parse_config(""), {}, self.fs, self.run)
+        ag.handshake = lambda link, cand: {"policy": {"gpu_fan": {"mode": "manual", "duty": 40}, "turbo_left": 0}}
+        ag.send_inventory = lambda link, force=False: None
+        ag.stop = True  # the signal came during the handshake
+
+        class Link:
+            def send(self, m):
+                pass
+
+        ag.session(Link(), {"addr": "127.0.0.1", "scope": None, "port": 5564, "transport": "ipv4"})
+        ag.fan.restore_auto("agent stopped")
+        self.assertEqual(self.t.get(hw + "/pwm1_enable"), "2")
+
+
 class TestCredentials(Base):
     def test_pair_while_running_new_key_used(self):
         """review: a re-pair while the service runs left it on the revoked key"""
@@ -864,6 +926,290 @@ class TestUsbHub(Base):
         self.assertNotIn("ATTR{power/control}", text)
         self.assertIn("reimu-hostd.py\" hub-rule install", text)
         self.assertIn("reimu-hostd.py\" hub-rule remove", text)
+
+
+class KernelFs(hd.Fs):
+    """what the kernel does on a write to .../driver/unbind: the device loses
+    its driver link; every unbind written down, in order"""
+
+    def __init__(self, root, fail=()):
+        super().__init__(root)
+        self.unbinds, self.fail = [], set(fail)
+
+    def write(self, path, value):
+        if path.endswith("/driver/unbind"):
+            if value in self.fail:
+                raise OSError(16, "EBUSY")
+            self.unbinds.append(value)
+            os.remove(self.p(path[:-len("/unbind")]))
+            return
+        super().write(path, value)
+
+
+def i2c_client(t, name, driver=None):
+    bus = name.split("-")[0]
+    d = "/sys/devices/platform/l_i2c/i2c-%s/%s" % (bus, name)
+    t.put(d + "/name", driver or "x")
+    if driver:
+        t.put("/sys/bus/i2c/drivers/%s/unbind" % driver, "")
+        t.link(d + "/driver", "/sys/bus/i2c/drivers/" + driver)
+    t.link("/sys/bus/i2c/devices/" + name, d)
+    return d
+
+
+def pwm_fan(t, name):
+    d = "/sys/devices/platform/" + name
+    t.put(d + "/modalias", "platform:pwm-fan")
+    t.put("/sys/bus/platform/drivers/pwm-fan/unbind", "")
+    t.link(d + "/driver", "/sys/bus/platform/drivers/pwm-fan")
+    t.link("/sys/bus/platform/devices/" + name, d)
+    return d
+
+
+def shared_hwmon(t, client, n, chip):
+    """a hwmon of an I2C client, in /sys/class/hwmon as the kernel has it"""
+    h = client + "/hwmon/hwmon%d" % n
+    t.put(h + "/name", chip)
+    t.put(h + "/temp1_input", "47000")
+    t.link(h + "/device", client)
+    t.link("/sys/class/hwmon/hwmon%d" % n, h)
+
+
+OWNED = ["0-004c", "0-0044", "0-0045", "0-0046", "0-0060", "1-004c", "1-002c", "1-002e", "1-0058", "1-0059"]
+DRIVER = {"0-004c": "lm63", "1-004c": "lm63", "1-002c": "emc2305", "1-002e": "emc2305", "0-0060": "pmbus", "1-0058": "pmbus",
+          "1-0059": "pmbus", "0-0044": "ir38064", "0-0045": "ir38064", "0-0046": "ir38064"}
+
+
+class TestBusOwner(Base):
+    """the BMC is the only master on the platform I2C buses the host shares:
+    both polling put 0x98 in every writable register of lm96163 2-004c"""
+
+    def setUp(self):
+        super().setUp()
+        self.kfs = KernelFs(self.t.root)
+        for n in OWNED:
+            i2c_client(self.t, n, DRIVER[n])
+        pwm_fan(self.t, "pwm-fan0")
+        pwm_fan(self.t, "pwm-fan1")
+        self.fru = i2c_client(self.t, "3-0054", "at24")
+        self.rtc = i2c_client(self.t, "3-006f", "rtc-ds1307")
+
+    def owner(self, cfg=""):
+        return hd.BusOwner(self.kfs, self.run, hd.parse_config(cfg))
+
+    def bound(self, name):
+        return os.path.lexists(self.t.p("/sys/bus/i2c/devices/%s/driver" % name))
+
+    def test_unbound_pwm_fan_first(self):
+        ev = self.owner().tick()
+        self.assertEqual(self.kfs.unbinds[:2], ["pwm-fan0", "pwm-fan1"], "pwm-fan uses the lm63/emc2305 PWMs: first")
+        self.assertEqual(sorted(self.kfs.unbinds[2:]), sorted(OWNED))
+        self.assertFalse(any(self.bound(n) for n in OWNED))
+        self.assertTrue(all(e["kind"] == "bmc_owns_i2c" for e in ev))
+        self.assertEqual(len(ev), 12)
+        self.assertTrue(any("0-004c" in e["text"] and "lm63" in e["text"] for e in ev))
+
+    def test_nothing_to_do_then_silent(self):
+        o = self.owner()
+        o.tick()
+        n = len(self.kfs.unbinds)
+        self.assertEqual(o.tick(), [])
+        self.assertEqual(len(self.kfs.unbinds), n)
+
+    def test_other_clients_untouched(self):
+        i2c_client(self.t, "0-0050", "at24")  # the same bus, not on the list
+        self.owner().tick()
+        self.assertTrue(self.bound("3-0054") and self.bound("3-006f") and self.bound("0-0050"))
+        self.assertNotIn("3-0054", self.kfs.unbinds)
+
+    def test_not_in_allow(self):
+        self.t.put("/proc/4242/comm", "pwmd")
+        self.assertEqual(self.owner("ALLOW=gpu_fan usb_hub").tick(), [])
+        self.assertEqual(self.kfs.unbinds, [])
+        self.assertEqual(self.run.calls, [])
+
+    def test_not_a_bmc_command(self):
+        r = hd.Controller(hd.parse_config(""), hd.GpuFan(self.fs), self.run).handle({"t": "control", "id": 1, "op": "bmc_owns_i2c"}, 0)
+        self.assertFalse(r["ok"])
+        self.assertIn("not allowed", r["err"])
+
+    def test_pwmd_stopped(self):
+        self.t.put("/proc/4242/comm", "pwmd")
+        self.t.put("/proc/1/comm", "systemd")
+        self.run.table["systemctl"] = (0, "")
+        ev = self.owner().tick()
+        self.assertIn(["systemctl", "stop", "pwmd"], self.run.calls)
+        self.assertTrue(any("pwmd" in e["text"] for e in ev))
+
+    def test_pwmd_not_stopping_is_killed_and_told_once(self):
+        self.t.put("/proc/4242/comm", "pwmd")
+        self.run.table["systemctl"] = (1, "Failed to stop")
+        self.run.table["pkill"] = (0, "")
+        o = self.owner()
+        ev = o.tick()
+        self.assertIn(["pkill", "-x", "pwmd"], self.run.calls)
+        self.assertEqual(len([e for e in ev if "pwmd" in e["text"]]), 1)
+        self.assertEqual([e for e in o.tick() if "pwmd" in e["text"]], [], "still there: no event flood")
+
+    def test_no_pwmd_no_command(self):
+        self.owner().tick()
+        self.assertEqual(self.run.calls, [])
+
+    def test_host_without_the_devices(self):
+        self.t.rm("/sys/bus/i2c")
+        self.t.rm("/sys/bus/platform/devices")
+        self.assertEqual(self.owner().tick(), [])
+        st = hd.bus_owner_state(self.fs, hd.parse_config(""))
+        self.assertEqual((st["clean"], st["found"]), (True, []))
+
+    def test_unbind_failure_retried_logged_once(self):
+        self.kfs.fail = {"0-004c"}
+        msgs = []
+        hd.set_logger(msgs.append)
+        try:
+            o = self.owner()
+            o.tick()
+            o.tick()
+            self.assertEqual(len([m for m in msgs if "0-004c" in m]), 1)
+            self.assertTrue(self.bound("0-004c"))
+            self.kfs.fail = set()
+            ev = o.tick()
+            self.assertFalse(self.bound("0-004c"), "tried again")
+            self.assertEqual(len(ev), 1)
+        finally:
+            hd.set_logger(None)
+
+    def test_state_in_inventory_and_metrics(self):
+        self.t.put("/proc/4242/comm", "pwmd")
+        c = hd.Collector(self.fs, self.run, hd.parse_config(""))
+        st = c.metrics(0)["i2c_owner"]
+        self.assertFalse(st["clean"])
+        self.assertTrue(st["enforced"])
+        for x in ("pwm-fan0", "0-004c (lm63)", "1-002e (emc2305)", "pwmd"):
+            self.assertIn(x, st["found"])
+        self.assertEqual(c.inventory()["i2c_owner"]["clean"], False)
+        self.t.rm("/proc/4242")
+        self.owner().tick()
+        st = c.metrics(1)["i2c_owner"]
+        self.assertEqual((st["clean"], st["found"]), (True, []))
+        self.assertFalse(hd.bus_owner_state(self.fs, hd.parse_config("ALLOW=gpu_fan"))["enforced"])
+
+    def test_agent_tick_with_the_link_down(self):
+        ag = hd.Agent(hd.parse_config(""), {}, self.kfs, self.run)
+        ev = ag.local_tick(0, False)
+        self.assertEqual(len(self.kfs.unbinds), 12)
+        self.assertTrue(any(e["kind"] == "bmc_owns_i2c" for e in ev))
+
+    def test_metrics_do_not_read_the_shared_buses(self):
+        d = "/sys/devices/platform/l_i2c/i2c-"
+        shared_hwmon(self.t, d + "0/0-004c", 10, "lm63")
+        shared_hwmon(self.t, d + "1/1-0058", 11, "pmbus")
+        shared_hwmon(self.t, d + "3/3-006f", 12, "rtc")
+        chips = {x["chip"] for x in hd.Collector(self.fs, self.run, hd.parse_config("")).temps()}
+        self.assertNotIn("lm63", chips)
+        self.assertNotIn("pmbus", chips)
+        self.assertIn("rtc", chips, "i2c-3 is the host's")
+        self.assertIn("amdgpu", chips)
+        self.assertIn("nvme", chips)
+
+    # ---- bus-owner install|remove
+    CONF = "/etc/modprobe.d/reimu-bmc-owns-i2c.conf"
+    STATE = "/etc/reimu-hostd/bus-owner.state"
+
+    def systemd(self, was):
+        calls = self.run.table
+        calls["systemctl"] = lambda argv: (0 if was == "enabled" else 1, was + "\n") if argv[1] == "is-enabled" else (0, "")
+        calls["chkconfig"] = (0, "")
+
+    def test_install_and_remove_enabled(self):
+        self.systemd("enabled")
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        conf = self.t.get(self.CONF)
+        for m in ("lm63", "emc2305", "pwm_fan", "pmbus", "ir38064"):
+            self.assertIn("blacklist %s\n" % m, conf + "\n")
+            self.assertIn("install %s /bin/true\n" % m, conf + "\n")
+        self.assertIn(["systemctl", "disable", "--now", "pwmd"], self.run.calls)
+        self.assertEqual(self.t.get(self.STATE), "pwmd=enabled")
+        self.assertEqual(len(self.kfs.unbinds), 12, "at once, too")
+        # again (an update), pwmd now disabled: the original state is kept
+        self.systemd("disabled")
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        self.assertEqual(self.t.get(self.STATE), "pwmd=enabled")
+        n = len(self.kfs.unbinds)
+        self.run.calls.clear()
+        hd.bus_owner(self.kfs, self.run, "remove", hd.parse_config(""))
+        self.assertFalse(os.path.exists(self.t.p(self.CONF)))
+        self.assertFalse(os.path.exists(self.t.p(self.STATE)))
+        self.assertIn(["systemctl", "enable", "--now", "pwmd"], self.run.calls)
+        self.assertEqual(len(self.kfs.unbinds), n, "remove unbinds nothing")
+
+    def test_remove_leaves_pwmd_off_when_it_was_off(self):
+        self.systemd("disabled")
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        self.assertEqual(self.t.get(self.STATE), "pwmd=disabled")
+        self.run.calls.clear()
+        hd.bus_owner(self.kfs, self.run, "remove", hd.parse_config(""))
+        self.assertFalse([c for c in self.run.calls if "enable" in c])
+
+    def test_install_no_pwmd(self):
+        self.run.table["systemctl"] = (1, "Failed to get unit file state for pwmd.service: No such file or directory\n")
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        self.assertEqual(self.t.get(self.STATE), "pwmd=absent")
+        self.assertFalse([c for c in self.run.calls if "disable" in c])
+        self.assertTrue(os.path.exists(self.t.p(self.CONF)))
+
+    def test_install_init_script_service(self):
+        """a SysV script systemd only generates a unit for: chkconfig has the state"""
+        self.systemd("generated")
+        self.run.table["chkconfig"] = (0, "")
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        self.assertEqual(self.t.get(self.STATE), "pwmd=generated")
+        self.assertIn(["chkconfig", "pwmd", "off"], self.run.calls)
+        self.assertIn(["systemctl", "stop", "pwmd"], self.run.calls)
+        self.run.calls.clear()
+        hd.bus_owner(self.kfs, self.run, "remove", hd.parse_config(""))
+        self.assertIn(["chkconfig", "pwmd", "on"], self.run.calls)
+        self.assertIn(["systemctl", "start", "pwmd"], self.run.calls)
+
+    def test_install_not_in_allow(self):
+        hd.bus_owner(self.kfs, self.run, "install", hd.parse_config("ALLOW=gpu_fan"))
+        self.assertFalse(os.path.exists(self.t.p(self.CONF)))
+        self.assertEqual(self.kfs.unbinds, [])
+        self.assertEqual(self.run.calls, [])
+
+    def test_initramfs_check(self):
+        import gzip
+        self.t.put("/proc/sys/kernel/osrelease", "6.1.0-e8c2")
+        os.makedirs(self.t.p("/boot"))
+        with open(self.t.p("/boot/initrd-6.1.0-e8c2.img"), "wb") as f:
+            f.write(gzip.compress(b"\0" * 100 + b"lib/modules/6.1.0-e8c2/kernel/drivers/hwmon/lm63.ko.xz\0" + b"ext4.ko\0"))
+        r = hd.initramfs_check(self.fs)
+        self.assertEqual(r["found"], ["lm63"])
+        self.assertIn("initrd-6.1.0-e8c2.img", r["file"])
+        with open(self.t.p("/boot/initrd-6.1.0-e8c2.img"), "wb") as f:
+            f.write(gzip.compress(b"ext4.ko\0"))
+        self.assertEqual(hd.initramfs_check(self.fs)["found"], [])
+        with open(self.t.p("/boot/initrd-6.1.0-e8c2.img"), "wb") as f:
+            f.write(b"\x28\xb5\x2f\xfd not readable here")  # zstd
+        self.assertIsNone(hd.initramfs_check(self.fs)["found"], "unknown, not clean")
+        self.t.rm("/boot/initrd-6.1.0-e8c2.img")
+        self.assertIsNone(hd.initramfs_check(self.fs)["file"])
+
+    def test_install_says_what_to_do_about_the_initramfs(self):
+        import gzip
+        self.t.put("/proc/sys/kernel/osrelease", "6.1.0-e8c2")
+        os.makedirs(self.t.p("/boot"))
+        with open(self.t.p("/boot/initrd-6.1.0-e8c2.img"), "wb") as f:
+            f.write(gzip.compress(b"kernel/drivers/hwmon/pmbus/ir38064.ko\0"))
+        msgs = []
+        hd.set_logger(msgs.append)
+        try:
+            hd.bus_owner(self.kfs, self.run, "install", hd.parse_config(""))
+        finally:
+            hd.set_logger(None)
+        text = "\n".join(msgs)
+        self.assertIn("ir38064", text)
+        self.assertIn("make-initrd", text)
 
 
 class TestTransport(Base):
@@ -995,7 +1341,7 @@ class TestProtocol(unittest.TestCase):
     def test_config_defaults(self):
         c = hd.parse_config("# nothing\nUNKNOWN_KEY=1\n")
         self.assertEqual((c["INTERVAL"], c["GPU_FAN_FLOOR"], c["LINK_LOST_SEC"], c["BMC_PORT"]), (10, 30, 60, 5564))
-        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load", "usb_hub"})
+        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load", "diag", "usb_hub", "bmc_owns_i2c"})
         self.assertEqual(hd.parse_config("INTERVAL=0")["INTERVAL"], 2)
 
 

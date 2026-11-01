@@ -106,7 +106,12 @@ RTC_STRING_P=`detect_rtc platform`
 # ordered after this) of a powered platform. Off, it doesn't answer and the
 # bus stalls trying; after a kexec the platform may be running (and the
 # time survived the kexec anyway)
-if [ "$FRUID_SOURCE" != "module" ]
+# ("rtcread power-on": reimu-fru at platform power-on, a clock before 2010: the
+# platform is powered and has run a while, its RTC answers)
+if [ "$1" = "power-on" ]
+then
+    time_is_incorrect `date +%s` || exit_ok "The clock is right, the RTC is left alone."
+elif [ "$FRUID_SOURCE" != "module" ]
 then
     [ -e /dev/mtd/sys ] || exit_ok "Not a cold boot (no PNS flash): the platform may be running, its RTC is left alone."
     powered=`( . /libexec/gpio-funcs; n=\`gpio2num $GPIO_POWER_IN\` && gpioread $n && gpiounexport $n ) 2>/dev/null`

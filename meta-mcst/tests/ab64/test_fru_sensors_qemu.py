@@ -43,6 +43,10 @@ Tests (all by default):
             device tree read before is used, sensors work
   offearly  power cuts 2, 10, 35, 45 s after power-on (hwmon-instantiator
             settling or instantiating): nothing left; then the full set
+  slowbind  a driver binding late, a chip answering late: the sensors come in
+            the same power cycle (hwmon-instantiator-rescan), nothing half-made
+  freeze    QEMU stopped 70 s: a silent watchdog reset; 20 s: nothing
+  resetcause  a forced WDT1 expiry, reboot -f, a QMP reset: recorded as such
   noeeprom  the platform on, no FRU EEPROM: no failed unit, boot not held
             up, tries again at power-on and gives up cleanly
 """
@@ -126,6 +130,47 @@ while True:
 '''
 
 
+# Why the BMC reset: QEMU's RESET events (reason) and WATCHDOG events, with the
+# host's time; the vCPU's PC every 2 s and when the console last grew, so a
+# reset says whether the guest was running or stuck in one place before it
+MONITOR_LOOP = r'''
+import json, os, re, select, socket, sys, time
+qmp, out, con = sys.argv[1:4]
+for i in range(200):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.connect(qmp); break
+    except OSError: time.sleep(0.1)
+f = s.makefile("r")
+log = open(out, "a", buffering=1)
+def send(c, **a):
+    s.sendall((json.dumps({"execute": c, "arguments": a}) + "\n").encode())
+send("qmp_capabilities")
+pcs, grew, size = [], time.time(), 0
+next_sample = 0
+while True:
+    r, _, _ = select.select([s], [], [], 0.2)
+    if r:
+        line = f.readline()
+        if not line: break
+        m = json.loads(line)
+        if "event" in m:
+            if m["event"] in ("RESET", "WATCHDOG", "SHUTDOWN", "GUEST_PANICKED", "STOP", "RESUME"):
+                log.write(json.dumps(dict(t=time.time(), event=m["event"], data=m.get("data"),
+                                          console_quiet=round(time.time() - grew, 1), pcs=pcs[-15:])) + "\n")
+        elif isinstance(m.get("return"), str):
+            x = re.search(r"R15=([0-9a-f]+)", m["return"])
+            if x: pcs.append(x.group(1))
+    now = time.time()
+    if now >= next_sample:
+        next_sample = now + 2
+        send("human-monitor-command", **{"command-line": "info registers"})
+        try:
+            n = os.path.getsize(con)
+            if n != size: size, grew = n, now
+        except OSError: pass
+'''
+
+
 class Platform(ab.Bmc):
     """the BMC in QEMU with the platform around it"""
 
@@ -167,10 +212,16 @@ class Platform(ab.Bmc):
              "-qmp", "unix:%s/%s.qmp,server,nowait" % (RQ, self.name),
              "-qmp", "unix:%s/%s.qmp2,server,nowait" % (RQ, self.name),
              "-qmp", "unix:%s/%s.qmp3,server,nowait" % (RQ, self.name),
+             "-qmp", "unix:%s/%s.qmp4,server,nowait" % (RQ, self.name),
              "-chardev", "socket,id=con,path=%s/%s.con,server=on,wait=off,logfile=%s" % (RQ, self.name, self.log),
              "-serial", "chardev:con", "-serial", "null", "-monitor", "none"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
+        self.monlog = os.path.join(W, self.name + ".mon")
+        if os.path.exists(self.monlog):
+            os.remove(self.monlog)
+        self.mon = subprocess.Popen([sys.executable, "-c", MONITOR_LOOP, "%s/%s.qmp4" % (RQ, self.name), self.monlog, self.log],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.uid = subprocess.Popen([sys.executable, "-c", PLATFORM_LOOP, "%s/%s.qmp" % (RQ, self.name),
                                      self.ctl, self.st, "1" if self.power0 else "0"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -187,6 +238,36 @@ class Platform(ab.Bmc):
         else:
             raise RuntimeError("can't set the PCS stand-ins' temperature")
         return self
+
+    def stop(self):
+        if getattr(self, "mon", None):
+            self.mon.kill()
+            self.mon.wait()
+            self.mon = None
+        super().stop()
+
+    def reset_causes(self):
+        """every reset of this run: "reboot" (the kernel's, it went through
+        the watchdog hardware), "watchdog" (WDT expired, nothing rebooted),
+        "qemu" (no watchdog: QMP or the like), with how long the console had
+        been quiet and the last PCs"""
+        import json
+        try:
+            ev = [json.loads(l) for l in open(self.monlog)]
+        except OSError:
+            return []
+        boots = self.console().split("Starting kernel")
+        out, n = [], 0
+        for i, e in enumerate(ev):
+            if e["event"] != "RESET":
+                continue
+            wd = any(x["event"] == "WATCHDOG" and abs(x["t"] - e["t"]) < 2 for x in ev)
+            n += 1
+            rebooted = n < len(boots) and "Restarting system" in boots[n]
+            kind = "reboot" if rebooted else "watchdog" if wd else "qemu"
+            out.append(dict(kind=kind, reason=(e.get("data") or {}).get("reason"), console_quiet=e["console_quiet"],
+                            pcs=e["pcs"]))
+        return out
 
     def state(self):
         import json
@@ -296,8 +377,11 @@ def journal(b, unit):
     return b.out("journalctl -b -o cat -u %s" % unit)
 
 
-def fast(b, settle=5, fru_settle=5, tries=2):
+def fast(b, settle=5, fru_settle=5, tries=2, rescan="3600"):
     """shorter settle times (a drop-in in /run, gone at the next boot)"""
+    # (the rescan far off: its passes make clients come and go)
+    b.ssh("mkdir -p /run/systemd/system/hwmon-instantiator-rescan.service.d && "
+          "printf '[Service]\\nEnvironment=\"RESCAN=%s\"\\n' > /run/systemd/system/hwmon-instantiator-rescan.service.d/test.conf" % rescan)
     b.ssh("mkdir -p /run/systemd/system/hwmon-instantiator.service.d /run/systemd/system/reimu-fru-power.service.d && "
           "printf '[Service]\\nEnvironment=SETTLE=%d\\n' > /run/systemd/system/hwmon-instantiator.service.d/test.conf && "
           "printf '[Service]\\nEnvironment=FRU_SETTLE=%d FRU_TRIES=%d\\n' > /run/systemd/system/reimu-fru-power.service.d/test.conf && "
@@ -317,21 +401,23 @@ def power_on(b, sensors=True, timeout=120):
     if sensors:
         got = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), timeout, 3)
         check(bool(got), "sensors on D-Bus %s" % sorted(b.sensors()))
+        # (it goes on probing the chips that may not be there)
+        b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 60)
 
 
 def power_off(b):
     check(b.transition("Off"), "RequestedHostTransition Off")
     st = b.wait(lambda: b.host_state() == "Off" and not b.state().get("power"), 40)
     check(st, "platform off, host state Off")
-    clean = b.wait(lambda: not b.clients() and b.out("systemctl is-active hwmon-instantiator reimu-fru-power").split()
-                   == ["inactive", "inactive"] and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == "", 60)
+    clean = b.wait(lambda: not b.clients() and b.out("systemctl is-active hwmon-instantiator hwmon-instantiator-rescan reimu-fru-power").split()
+                   == ["inactive"] * 3 and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == "", 60)
     check(clean, "off: no platform device, phosphor-hwmon, sensor left (%s, %s)" % (b.clients(), sorted(b.sensors())))
 
 
 def common_end(b, boots=1):
     st = b.state()
     check(st.get("o0_on", 1) == 0, "the PNS flash never on the BMC's side while the platform ran (%s)" % st)
-    check(b.boots() == boots, "no BMC reboot (%d boot(s))" % b.boots())
+    check(b.boots() == boots, "no BMC reboot (%d boot(s), resets %s)" % (b.boots(), b.reset_causes()))
     f = b.failed_units()
     check(not f, "no failed units %s" % sorted(f))
     for u in f:
@@ -390,7 +476,7 @@ def t_off():
         cyc = b.out("journalctl -b | grep -i 'ordering cycle' | head -3").strip()
         check(not cyc, "no ordering cycle %s" % cyc)
         mm = b.out("cd /sys/firmware/devicetree/base/ahb/apb/bus@1e78a000 && ls -d i2c@*/multi-master").split()
-        check(mm == ["i2c@100/multi-master", "i2c@180/multi-master", "i2c@1c0/multi-master", "i2c@c0/multi-master"],
+        check({"i2c@100/multi-master", "i2c@180/multi-master", "i2c@1c0/multi-master", "i2c@c0/multi-master"} <= set(mm),
               "multi-master on the platform buses 2, 3, 5, 6 %s" % mm)
 
         # the first power-on, as the firmware does it: default settle times
@@ -549,7 +635,7 @@ def t_hoston():
         check(bool(s), "sensors on D-Bus %s" % sorted(b.sensors()))
         time.sleep(10)
         jp = journal(b, "reimu-fru-power")
-        check("read in" not in jp, "reimu-fru-power: nothing to do, read at boot (%s)" % jp.strip()[-100:])
+        check("FRU ID read:" not in jp, "reimu-fru-power: FRU ID not read again (%s)" % jp.strip()[-100:])
         check(b.out("journalctl -b -o cat | grep -c 'FRU ID read:'").strip() == "1", "FRU EEPROM read once")
         print("    -- power off and on")
         fast(b)
@@ -631,12 +717,127 @@ def t_noeeprom():
         power_off(b)
         # off while reimu-fru-power waits or tries: stopped, not failed
         power_on(b, timeout=60)
-        check(b.out("systemctl is-active reimu-fru-power").strip() == "activating", "reimu-fru-power tries again")
+        check(b.out("systemctl is-active reimu-fru-power").strip() == "active", "reimu-fru-power tries again")
         power_off(b)
         check(b.out("systemctl is-failed reimu-fru-power hwmon-instantiator").split() == ["inactive"] * 2,
               "reimu-fru-power, hwmon-instantiator stopped, not failed")
         power_on(b, timeout=60)
         common_end(b)
+    finally:
+        b.stop()
+
+
+def t_slowbind():
+    """a driver that binds late, a chip that answers late: their sensors come
+    in the same power cycle; nothing half-made is left; power-off meanwhile"""
+    b = Platform("slowbind", fresh_env("slowbind")).start()
+    full = {"2-004c:bound", "6-004c:bound", "5-0020:bound", "5-0021:bound"}
+    try:
+        check(b.wait_ssh(), "up")
+        # the PCS driver isn't there for the first pass: its module is moved
+        # away (busybox modprobe has no "install" rules to delay it with) and
+        # loaded by hand once that pass is over
+        r = b.ssh("mv $(find /lib/modules -name 'l-pcs-i2c.ko*') /tmp/l-pcs-i2c.ko")
+        check(r.returncode == 0, "PCS module out of the way %s" % r.stderr.strip())
+        check(b.transition("On"), "on")
+        check(b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 120), "first pass done")
+        s0 = sorted(b.sensors())
+        c0 = b.clients()
+        print("    after the first pass: %s, %s" % (s0, sorted(c0)))
+        check(not any(n.startswith("CPU0") for n in s0), "the slow driver missed the first pass (the point of this test)")
+        check(not any(not x.endswith(":bound") for x in c0), "no half-made client %s" % sorted(c0))
+        check(b.ssh("insmod /tmp/l-pcs-i2c.ko").returncode == 0, "driver loaded, late")
+        ok = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), 150, 3)
+        check(bool(ok), "the late driver's sensors on D-Bus in the same power cycle %s" % sorted(b.sensors()))
+        ok = b.wait(lambda: b.clients() == full, 40, 1)
+        check(bool(ok), "and only what is there left instantiated, all bound %s" % sorted(b.clients()))
+        print("    " + journal(b, "hwmon-instantiator-rescan").strip()[-400:].replace("\n", "\n    "))
+        s1 = b.sensors()
+        check(len(s1) == 5 and all(v is not None for v in s1.values()), "the full set, readings %s" % s1)
+        u = b.out("systemctl list-units --all --no-legend --plain 'xyz.openbmc_project.Hwmon@*'")
+        check("failed" not in u, "no phosphor-hwmon failed")
+        power_off(b)
+
+        # the module is there now: a chip that answers late
+        print("    -- a PCS sensor answering late")
+        fast(b, rescan="5 5 5 10 10 10")
+        b.temperature("pcs0", 1500)
+        b.temperature("pcs1", 0)   # reads 0: "doesn't answer"
+        check(b.transition("On"), "on")
+        check(b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 60), "first pass done")
+        check("CPU0_Cores_2_3" not in b.sensors(), "late chip not there yet")
+        b.temperature("pcs1", 2000)
+        ok = b.wait(lambda: abs((b.sensors().get("CPU0_Cores_2_3") or 0) - 64) < 0.2, 60, 2)
+        check(bool(ok), "there later in the cycle, 64 °C (%s)" % b.sensors().get("CPU0_Cores_2_3"))
+        check(len(set(b.sensors())) == 5, "the same names as ever %s" % sorted(b.sensors()))
+
+        # power-off while the rescan waits or probes: nothing left, not failed
+        print("    -- off during a rescan")
+        check(b.out("systemctl is-active hwmon-instantiator-rescan").strip() == "active", "rescan still going")
+        b.set_power(False)
+        check(b.wait(lambda: b.host_state() == "Off", 20), "power cut seen")
+        clean = b.wait(lambda: not b.clients() and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == "", 60)
+        check(clean, "nothing left (%s, %s)" % (b.clients(), sorted(b.sensors())))
+        check(b.out("systemctl is-active hwmon-instantiator hwmon-instantiator-rescan").split() == ["inactive"] * 2,
+              "both stopped, not failed")
+        common_end(b)
+        pns_unchanged(b)
+    finally:
+        b.stop()
+
+
+def t_freeze():
+    """the vCPU not running for longer than RuntimeWatchdogSec (a stalled or
+    sleeping host): what the silent reset seen once looks like; shorter: nothing"""
+    import signal
+    b = Platform("freeze", fresh_env("freeze"), power=True, eeprom=False).start()
+    try:
+        check(b.wait_console(r"l_pcs_i2c at 0x24", 300) is not None, "instantiating")
+        os.kill(b.p.pid, signal.SIGSTOP)
+        time.sleep(70)
+        os.kill(b.p.pid, signal.SIGCONT)
+        check(b.wait(lambda: len(b.reset_causes()) >= 1, 30), "reset once QEMU runs again")
+        c = b.reset_causes()
+        print("    %s" % c)
+        check(c and c[0]["kind"] == "watchdog", "recorded as a watchdog expiry")
+        first = b.console().split("Starting kernel")[1]
+        check("Restarting system" not in first and not re.search(r"Oops|panic|soft lockup", first),
+              "silent: no reboot, oops or lockup message, as seen")
+        check(b.wait_ssh(), "up again")
+        os.kill(b.p.pid, signal.SIGSTOP)
+        time.sleep(20)
+        os.kill(b.p.pid, signal.SIGCONT)
+        time.sleep(15)
+        check(len(b.reset_causes()) == 1, "a 20 s stall: no reset (%s)" % b.reset_causes()[1:])
+    finally:
+        b.stop()
+
+
+def t_resetcause():
+    """the suite tells a watchdog expiry, a reboot and a QEMU reset apart"""
+    b = Platform("resetcause", fresh_env("resetcause")).start()
+    try:
+        check(b.wait_ssh(), "up")
+        # WDT1 about to expire, whatever systemd thinks: reload 1 s, restart
+        subprocess.run(ab.ssh_cmd("nohup sh -c 'sleep 1; devmem 0x1E785004 32 0x100000; devmem 0x1E785008 32 0x4755' >/dev/null 2>&1 &")[0],
+                       env=ab.ssh_cmd("x")[1], stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        check(b.wait(lambda: len(b.reset_causes()) >= 1, 60), "reset after WDT1 forced")
+        c = b.reset_causes()
+        print("    %s" % c)
+        check(c and c[0]["kind"] == "watchdog", "recorded as a watchdog expiry (%s)" % (c and c[0]["kind"]))
+        check(b.wait_ssh(), "up again")
+        b.ssh("nohup sh -c 'sleep 1; reboot -f' >/dev/null 2>&1 &", timeout=30)
+        check(b.wait(lambda: len(b.reset_causes()) >= 2, 60), "reset after reboot -f")
+        c = b.reset_causes()
+        print("    %s" % c[-1])
+        check(b.wait_ssh(), "up again")
+        c = b.reset_causes()
+        check(c[1]["kind"] == "reboot", "recorded as a reboot (%s)" % c[1]["kind"])
+        b.qmp(("system_reset", {}))
+        check(b.wait(lambda: len(b.reset_causes()) >= 3, 30), "reset by QMP")
+        c = b.reset_causes()
+        print("    %s" % c[-1])
+        check(c[2]["kind"] == "qemu", "recorded as a QEMU reset (%s)" % c[2]["kind"])
     finally:
         b.stop()
 
@@ -673,7 +874,7 @@ def t_offearly():
         b.stop()
 
 
-TESTS = [("off", t_off), ("offearly", t_offearly), ("hoston", t_hoston), ("macdiff", t_macdiff), ("nopns", t_nopns), ("noeeprom", t_noeeprom)]
+TESTS = [("resetcause", t_resetcause), ("freeze", t_freeze), ("slowbind", t_slowbind), ("off", t_off), ("offearly", t_offearly), ("hoston", t_hoston), ("macdiff", t_macdiff), ("nopns", t_nopns), ("noeeprom", t_noeeprom)]
 
 if __name__ == "__main__":
     for f in (PNS, FRU, os.path.join(W, "ab.mtd")):

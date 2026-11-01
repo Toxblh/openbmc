@@ -1,0 +1,187 @@
+#!/bin/sh
+# reimu-diag: everything first testers can send us, one tar.gz in /run/reimu-diag
+# (printed at the end). No passwords or keys: those files are never read, and
+# what's collected is swept for what looks like one (MANIFEST says what ran).
+# Serial numbers, MACs and IPs stay. Read only: no service stopped or
+# restarted, no I2C sweep (the shared buses: only what the running daemons
+# report), no GPIO, no chip access. Each collector has its time limit, all of
+# them about a minute; the archive at most 16 MiB (the oldest of the largest
+# logs goes first, noted).
+#   reimu-diag [--with-host]     --with-host: the host agent's report as well
+# Exit: 0, 3 when another run is on.
+DIR=/run/reimu-diag
+CAP=$((16 * 1024 * 1024))
+FILE_CAP=$((24 * 1024 * 1024))
+BUDGET=${REIMU_DIAG_BUDGET:-60}
+WITH_HOST=
+[ "$1" = "--with-host" ] && WITH_HOST=1
+umask 077
+mkdir -p "$DIR" && chmod 700 "$DIR" || exit 1
+renice 19 $$ >/dev/null 2>&1
+
+# one at a time
+LOCK=$DIR/lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    p=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "reimu-diag: another run is running (pid $p)" >&2
+        exit 3
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" || exit 3
+fi
+echo $$ > "$LOCK/pid"
+STAGE=$DIR/stage.$$
+trap 'rm -rf "$STAGE" "$LOCK" "$DIR/progress"' EXIT
+trap 'exit 1' TERM INT HUP
+
+now() { cut -d. -f1 /proc/uptime; }
+START=$(now)
+HOST=$(cat /etc/hostname 2>/dev/null); HOST=${HOST:-bmc}
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+NAME=reimu-diag-$HOST-$STAMP
+OUT=$STAGE/$NAME
+mkdir -p "$OUT"
+M=$OUT/MANIFEST
+{
+    echo "reimu-diag archive $NAME"
+    echo "time $(date -u +%Y-%m-%dT%H:%M:%SZ), uptime $(cat /proc/uptime)"
+    echo "args: ${WITH_HOST:+--with-host}"
+    echo "No passwords or keys are collected; serial numbers, MACs and IPs stay."
+    echo "collector   status   duration   bytes   errors"
+} > "$M"
+
+# MemAvailable decides how much text may sit in /run meanwhile
+mem=$(sed -n 's/MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)
+[ "${mem:-0}" -lt 122880 ] && FILE_CAP=$((4 * 1024 * 1024))
+
+TOTAL=38
+DONE=0
+# c NAME TIMEOUT FILE 'command': one collector, killed with its children when late
+c() {
+    name=$1 limit=$2 f=$OUT/$3 cmd=$4
+    DONE=$((DONE + 1))
+    echo "$DONE $TOTAL $name" > "$DIR/progress"
+    t0=$(now)
+    left=$((BUDGET - (t0 - START)))
+    if [ "$left" -le 1 ]; then
+        echo "$name   skipped: out of time" >> "$M"
+        return
+    fi
+    [ "$limit" -gt "$left" ] && limit=$left
+    setsid sh -c "$cmd" > "$f" 2> "$f.err" </dev/null &
+    pid=$!
+    st=ok
+    n=0
+    max=$((limit * 5))
+    while kill -0 $pid 2>/dev/null; do
+        if [ "$n" -ge "$max" ]; then
+            st=timeout
+            kill -9 -- -$pid 2>/dev/null
+            kill -9 $pid 2>/dev/null
+            break
+        fi
+        sleep 0.2
+        n=$((n + 1))
+    done
+    wait $pid 2>/dev/null
+    rc=$?
+    [ "$st" = ok ] && [ "$rc" != 0 ] && st="rc=$rc"
+    sz=$(wc -c < "$f" 2>/dev/null)
+    if [ "${sz:-0}" -gt "$FILE_CAP" ]; then
+        tail -c "$FILE_CAP" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        st="$st truncated (kept the newest $FILE_CAP bytes)"
+        sz=$FILE_CAP
+    fi
+    e=$(head -c 200 "$f.err" 2>/dev/null | tr '\n' ' ')
+    rm -f "$f.err"
+    [ -s "$f" ] || [ "$st" = ok ] || rm -f "$f" # empty and fine: nothing failed, no sensor while the platform is off
+    echo "$name   $st   $(( $(now) - t0 ))s   ${sz:-0}   $e" >> "$M"
+}
+
+# ---- the logs first: what we ask for most
+c journal-current 25 journal-current.txt 'journalctl -b --no-pager -o short-iso'
+c journal-previous 10 journal-previous.txt 'journalctl -b -1 --no-pager -o short-iso 2>/dev/null; true'
+c events 5 events.log 'cat /var/lib/reimu-logd/events.log.1 /var/lib/reimu-logd/events.log 2>/dev/null; true'
+c boot-record 5 boot-record.txt "grep -h ' boot: ' /var/lib/reimu-logd/events.log.1 /var/lib/reimu-logd/events.log 2>/dev/null | tail -n 40; cat /sys/class/watchdog/watchdog0/bootstatus"
+c dmesg 5 dmesg.txt 'dmesg'
+# ---- the firmware
+c os-release 3 os-release.txt 'cat /etc/os-release'
+c kernel 3 kernel.txt 'uname -a; cat /proc/version'
+c cmdline 3 cmdline.txt 'cat /proc/cmdline'
+c proc-mtd 3 proc-mtd.txt 'cat /proc/mtd'
+c reimu-ab-state 3 reimu-ab-state.txt 'cat /run/initramfs/reimu-ab'
+c reimu-ab-status 8 reimu-ab-status.txt 'reimu-ab status'
+c fw_printenv 5 fw_printenv.txt "fw_printenv | grep -E '^(reimu_[^=]*|bootcmd|bootargs)='"
+c uptime 3 uptime.txt 'uptime; cat /proc/uptime /proc/loadavg'
+# ---- systemd, memory
+c systemctl-failed 5 systemctl-failed.txt 'systemctl --failed --no-pager --no-legend'
+c list-units 8 list-units.txt 'systemctl list-units --all --no-pager --no-legend'
+c list-timers 5 list-timers.txt 'systemctl list-timers --all --no-pager'
+c top-rss 5 top-rss.txt 'awk "/^Name/{n=\$2} /^VmRSS/{print \$2, n}" /proc/[0-9]*/status 2>/dev/null | sort -rn | head -n 30'
+c free 3 free.txt 'free'
+c df 3 df.txt 'df'
+c meminfo 3 meminfo.txt 'cat /proc/meminfo'
+c slabinfo 3 slabinfo.txt 'cat /proc/slabinfo 2>/dev/null; true'
+# ---- the network
+c ip-addr 3 ip-addr.txt 'ip addr'
+c ip-route 3 ip-route.txt 'ip route; ip -6 route'
+c network-config 3 network-config.txt 'for f in /etc/systemd/network/*.network; do echo "# $f"; cat "$f"; done'
+# ---- USB
+c udc-state 3 udc-state.txt 'for u in /sys/class/udc/*; do echo "$u $(cat "$u/state" 2>/dev/null) $(cat "$u/current_speed" 2>/dev/null)"; done'
+c usb-gadget 5 usb-gadget.txt 'cd /sys/kernel/config/usb_gadget 2>/dev/null || exit 0; for f in $(find . -type f -name "report_desc" -o -type f -name "idVendor" -o -type f -name "idProduct" -o -type f -name "UDC" -o -type f -name "protocol" -o -type f -name "subclass"); do echo "# $f"; od -An -tx1 "$f"; done'
+c reimu-hid-watch 5 reimu-hid-watch.txt 'journalctl -b --no-pager -o short-iso -u reimu-hid-watch | tail -n 400'
+# ---- fans, heat, the host link: only from what the daemons already know
+c reimu-fand-status 5 reimu-fand-status.json 'reimu-fand --status'
+c overheatd 3 overheatd.txt 'cat /etc/overheatd.conf 2>/dev/null; echo "# emergency latch:"; cat /var/lib/overheatd/emergency 2>/dev/null; echo "# state:"; for f in /run/overheatd/*; do [ -f "$f" ] && { echo "$f: $(cat "$f")"; }; done; true'
+c reimu-hostlink 5 reimu-hostlink.json 'reimu-hostlink --ctl state'
+c hwmon 8 hwmon.txt 'for h in /sys/class/hwmon/hwmon*; do n=$(cat "$h/name" 2>/dev/null); for f in "$h"/*_input; do [ -f "$f" ] && echo "$n ${f##*/} $(cat "$f" 2>&1)"; done; done; true'
+c busctl-sensors 10 busctl-sensors.txt 'M="xyz.openbmc_project.ObjectMapper /xyz/openbmc_project/object_mapper xyz.openbmc_project.ObjectMapper"; for p in $(busctl call $M GetSubTreePaths sias /xyz/openbmc_project/sensors 0 1 xyz.openbmc_project.Sensor.Value 2>/dev/null | grep -o "/xyz/openbmc_project/sensors/[^\"]*"); do s=$(busctl call $M GetObject sas "$p" 1 xyz.openbmc_project.Sensor.Value | cut -d"\"" -f2); echo "${p#/xyz/openbmc_project/sensors/} $(busctl get-property "$s" "$p" xyz.openbmc_project.Sensor.Value Value)"; done; true'
+c chassis-host-state 3 chassis-host-state.txt 'busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 xyz.openbmc_project.State.Host CurrentHostState; busctl get-property xyz.openbmc_project.State.Chassis /xyz/openbmc_project/state/chassis0 xyz.openbmc_project.State.Chassis CurrentPowerState'
+c ipmi-device-id 3 ipmi-device-id.txt 'busctl call xyz.openbmc_project.Ipmi.Host /xyz/openbmc_project/Ipmi xyz.openbmc_project.Ipmi.Server execute yyyaya{sv} 6 0 1 0 0'
+c fru-xml 3 fru-xml.txt 'cat /var/volatile/motherboard_info.xml 2>/dev/null || cat /var/lib/reimu-pns/fru.xml'
+c pns-cached 3 pns-cached.txt 'ls -la /var/lib/reimu-pns /var/lib/reimu-fru 2>/dev/null; fdtget /var/lib/reimu-fru/motherboard_devtree.dtb / version 2>/dev/null; true'
+if [ -n "$WITH_HOST" ]; then
+    # the agent's own report (a fixed set, no user files): over the link
+    c host-report 25 host-report.json 'R=/run/reimu-hostlink/host-diag.b64; rm -f $R; reimu-hostlink --ctl diag || exit 1; n=0; while [ ! -s $R ] && [ $n -lt 20 ]; do sleep 1; n=$((n + 1)); done; [ -s $R ] || { echo "the host agent did not answer" >&2; exit 1; }; base64 -d < $R | gunzip; rm -f $R'
+fi
+
+# ---- the slow ones last: a systemd query per unit, the slots' digests (a read of the flash)
+c restart-counts 12 restart-counts.txt 'systemctl show -p Id -p NRestarts -p MainPID $(systemctl list-units --type=service --state=running --no-legend --plain | cut -d" " -f1)'
+c reimu-ab-plan 15 reimu-ab-plan.txt 'reimu-ab plan'
+
+# ---- what looks like a secret goes: private key blocks, then key=value
+scrub() {
+    awk '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ { print "[scrubbed: private key]"; k = 1 }
+         !k { print }
+         /-----END [A-Z0-9 ]*PRIVATE KEY-----/ { k = 0 }' "$1" |
+    sed -E -e "s/((pass(word|wd|phrase)?|pwd|secret|token|authorization|api[_-]?key|private[_-]?key|cookie|xsrf)[^A-Za-z0-9]{0,3}(bearer[[:space:]]+)?)[^[:space:]\"',;&]+/\1[scrubbed]/Ig" \
+           -e 's/[0-9a-fA-F]{64,}/[scrubbed: long hex]/g' > "$1.tmp" && mv "$1.tmp" "$1" || rm -f "$1"
+}
+echo "$DONE $TOTAL scrub" > "$DIR/progress"
+for f in "$OUT"/*; do
+    case "$f" in */MANIFEST) ;; *) [ -f "$f" ] && scrub "$f" ;; esac
+done
+scrub "$M"
+{
+    echo "duration of the collection: $(( $(now) - START ))s"
+    echo "(hwmon and sensors: what the drivers and the daemons report; no register sweep of the shared I2C buses)"
+} >> "$M"
+
+# ---- the archive, within its cap
+A=$DIR/$NAME.tar.gz
+pack() { tar -C "$STAGE" -czf "$A.tmp" "$NAME" && mv "$A.tmp" "$A"; }
+echo "$DONE $TOTAL archive" > "$DIR/progress"
+pack || exit 1
+tries=0
+while [ "$(wc -c < "$A")" -gt "$CAP" ] && [ $tries -lt 4 ]; do
+    big=$(ls -S "$OUT" | grep -v '^MANIFEST$' | head -n 1)
+    sz=$(wc -c < "$OUT/$big")
+    keep=$((sz / 2))
+    tail -c "$keep" "$OUT/$big" > "$OUT/$big.tmp" && mv "$OUT/$big.tmp" "$OUT/$big"
+    echo "$big truncated: the oldest part dropped, $keep of $sz bytes kept (the archive's cap: $CAP)" >> "$M"
+    pack || exit 1
+    tries=$((tries + 1))
+done
+chmod 600 "$A"
+echo "$A"

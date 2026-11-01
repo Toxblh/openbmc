@@ -11,6 +11,8 @@ SRC_URI = "git://github.com/makise-homura/libreimu.git;protocol=https \
            file://0001-reimu_fdt-free-the-previous-device-tree.patch \
            file://0002-reimu_find_filename-copy-the-name-before-closedir.patch \
            file://0003-reimu_readfile-without-a-size-read-errors-and-the-end.patch \
+           file://0004-reimu_dbus-property-sets-wait-for-the-reply.patch \
+           file://0005-reimu_gpio-a-line-another-reader-has-for-a-moment.patch \
           "
 # pinned: a build must not change by itself
 SRCREV = "4b706bc6d73e3c384cc995547be7cacbb2069a8a"

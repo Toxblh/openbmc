@@ -120,6 +120,15 @@ static void lm96163(int bus, double remote)
     uint8_t r[256] = { 0 };
     r[0xfe] = 0x01;
     r[0xff] = 0x49;
+    /* the healthy setup, as dumped from 6-004c on the board */
+    r[0x03] = r[0x09] = 0x06;
+    r[0x04] = r[0x0a] = 0x08;
+    r[0x05] = r[0x0b] = 0x46;
+    r[0x07] = r[0x0d] = 0x69;
+    r[0x16] = 0xa4;
+    r[0x19] = 0x6e;
+    r[0x21] = 0x0a;
+    r[0x45] = 0x68;
     r[0x4a] = 0x2b;
     r[0x4b] = 0x3f;
     r[0x4c] = 0x2e;
@@ -127,7 +136,6 @@ static void lm96163(int bus, double remote)
     r[0x4f] = 0x04;
     r[0x50] = 0x7f;
     r[0x51] = 0x3f;
-    r[0x03] = 0x06;
     r[0xbf] = 0x01;
     r[0x46] = 0xc7; /* 0x07c7: 2716 rpm */
     r[0x47] = 0x07;
@@ -261,6 +269,15 @@ static void start(struct fand *f, const struct config *c)
     fand_init(f, c, T);
     f->on_since_hint = T - 100000; /* on for a while: no settle */
     run(f, c->start_full_ms / 1000.0 + 1, HOST_ON);
+}
+
+/* takeover of whatever the chips hold now */
+static void start_keep(struct fand *f, const struct config *c)
+{
+    T += 1000;
+    fand_init(f, c, T);
+    f->on_since_hint = T - 100000;
+    run(f, 2, HOST_ON);
 }
 
 /* ------------------------------------------------------------------ tests */
@@ -591,15 +608,17 @@ static void t_outputs(void)
     CHECK(!f.out_alarm && !f.tach_alarm && !fand_alarm(&f), "no alarm");
     run(&f, 300, HOST_ON);
     CHECK(reg(6, 0x4c, 0x4c) == 18 && reg(6, 0x4c, 0x4c) < 46, "quiet: %d of 46", reg(6, 0x4c, 0x4c));
-    /* PWM_FREQ changed under it: the scale follows */
-    setreg(6, 0x4c, 0x4d, 0x10);
+    /* another PWM_FREQ configured: the scale follows */
+    struct config c2 = c;
+    c2.pwm_freq = 0x10;
+    fand_reconfig(&f, &c2);
     run(&f, 1, HOST_ON);
     CHECK(reg(6, 0x4c, 0x4c) == (int)lround(f.z[Z_CPU].duty * 32 / 100), "PWM_FREQ 0x10: %d of 32", reg(6, 0x4c, 0x4c));
-    setreg(6, 0x4c, 0x4d, 0x17);
     /* the high-resolution mode: 8 bits, 255 = 100 % */
     setreg(6, 0x4c, 0x45, 0x10);
-    setreg(6, 0x4c, 0x4a, 0x23);
-    setreg(6, 0x4c, 0x4d, 0x08);
+    c2.pwm_freq = 8;
+    c2.pwm_fast = 1;
+    fand_reconfig(&f, &c2);
     run(&f, 1, HOST_ON);
     CHECK(reg(6, 0x4c, 0x4c) == (int)lround(f.z[Z_CPU].duty * 255 / 100) && f.z[Z_CPU].out[0].ok, "high resolution: %d of 255",
           reg(6, 0x4c, 0x4c));
@@ -608,6 +627,7 @@ static void t_outputs(void)
     setreg(6, 0x4c, 0x45, 0x00);
     setreg(6, 0x4c, 0x4a, 0x2b);
     setreg(6, 0x4c, 0x4d, 0x17);
+    fand_reconfig(&f, &c);
     fand_failsafe(&c);
     CHECK(reg(6, 0x4c, 0x4c) == 46, "fail-safe: 46");
     /* the latch: a reader that took the MSB first would get a stale one */
@@ -822,10 +842,10 @@ static void t_tach_mode(void)
     board();
     run(&f, 31, HOST_ON);
     CHECK(reg(6, 0x4c, 0x4a) == 0x2a && f.z[Z_CPU].out[0].tach_mode_ok, "power on: set again");
-    /* the 1.4 kHz clock bit and polarity kept, whatever they are */
+    /* polarity and the clock are guarded too */
     setreg(6, 0x4c, 0x4a, 0x33);
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4a) == 0x32, "bits 3, 4 kept (0x%02x)", reg(6, 0x4c, 0x4a));
+    CHECK(reg(6, 0x4c, 0x4a) == 0x2a, "0x4A guarded as a whole (0x%02x)", reg(6, 0x4c, 0x4a));
     setreg(6, 0x4c, 0x4a, 0x2b);
     run(&f, 1, HOST_ON);
 
@@ -1093,6 +1113,199 @@ static void t_gpu(void)
     gpu_temp(NULL, 0);
 }
 
+/* a chip from the dump of the board (i2cdump format) */
+static int load_dump(int bus, int addr)
+{
+    static const char *const name = "tests/chips-corrupted-20261101-0147.txt";
+    FILE *fp = fopen(name, "r");
+    if (!fp) return -1;
+    char line[160];
+    int in = 0, got = 0;
+    uint8_t r[256] = { 0 };
+    while (fgets(line, sizeof(line), fp))
+    {
+        int b, a, row;
+        if (sscanf(line, "== bus %d addr 0x%x", &b, &a) == 2)
+        {
+            in = b == bus && a == addr;
+            continue;
+        }
+        if (!in || sscanf(line, "%x:", &row) != 1 || line[2] != ':') continue;
+        for (int i = 0; i < 16; i++) r[row + i] = strtol(line + 4 + 3 * i, NULL, 16);
+        got += 16;
+    }
+    fclose(fp);
+    if (got != 256) return -1;
+    mkdev(bus, addr, r);
+    return 0;
+}
+
+static void mark(int bus, int addr, const char *what, int on)
+{
+    char p[512];
+    snprintf(p, sizeof(p), "%s/i2c-%d/%02x.%s", R, bus, addr, what);
+    if (on) close(open(p, O_CREAT | O_WRONLY, 0644));
+    else unlink(p);
+}
+
+/* the setup of the chips guarded: the image found on the board */
+static void t_guard(void)
+{
+    struct fand f;
+    struct config c;
+    char err[FAND_MAX_ERR][128];
+    cfg_defaults(&c);
+    CHECK(c.pwm_freq == 0x17 && !c.pwm_fast && c.guard_ms == 5000 && c.guard_corrupt_regs == 4, "defaults: PWM_FREQ pinned at 0x17");
+    struct config k = c;
+    int n = cfg_parse(&k, "LM96163_PWM_FREQ=0x10\nLM96163_PWM_CLOCK=fast\nGUARD_SEC=2\nGUARD_CORRUPT_REGS=9\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && k.pwm_freq == 0x10 && k.pwm_fast && k.guard_ms == 2000 && k.guard_corrupt_regs == 9, "keys (%d: %s)", n, n ? err[0] : "");
+    k = c;
+    n = cfg_parse(&k, "LM96163_PWM_FREQ=0\nLM96163_PWM_CLOCK=warp\n", err, FAND_MAX_ERR);
+    CHECK(n == 2 && k.pwm_freq == 0x17, "bad PWM settings refused (%d)", n);
+
+    /* a healthy board at takeover: nothing to repair (the tachometer mode is
+     * set, as at every power-on) */
+    start(&f, &c);
+    CHECK(f.repairs == 0 && f.corruptions == 0, "healthy: no repairs (%u)", f.repairs);
+    CHECK(reg(6, 0x4c, 0x4a) == 0x2a && reg(2, 0x4c, 0x4a) == 0x2b, "the modes as they should be");
+
+    /* takeover of exactly the image found on the board */
+    board();
+    CHECK(!load_dump(2, 0x4c) && !load_dump(6, 0x4c) && !load_dump(2, 0x2c) && !load_dump(2, 0x2e), "the dump loaded (cwd: files/)");
+    CHECK(reg(2, 0x4c, 0x11) == 0x98 && reg(2, 0x4c, 0x4a) == 0x38 && reg(2, 0x4c, 0x4d) == 0x18, "image as found");
+    T = 2000000;
+    fand_init(&f, &c, T);
+    f.on_since_hint = T - 100000;
+    run(&f, 1, HOST_ON);
+    static const struct { int r, v; } want[] = { { 0x11, 0 }, { 0x12, 0 }, { 0x03, 6 }, { 0x09, 6 }, { 0x05, 0x46 }, { 0x08, 0 },
+        { 0x13, 0 }, { 0x14, 0 }, { 0x19, 0x6e }, { 0x21, 0x0a }, { 0x4a, 0x2b }, { 0x4d, 0x17 } };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++)
+        CHECK(reg(2, 0x4c, want[i].r) == want[i].v, "2-004c 0x%02x repaired: 0x%02x", want[i].r, reg(2, 0x4c, want[i].r));
+    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == 46, "polarity right, 100%% = 46 of the right scale (%d)", reg(2, 0x4c, 0x4c));
+    CHECK(f.corruptions == 1 && f.repairs >= 10 && f.z[Z_BOARD].out[0].repairs == f.repairs, "corruption event, %u repairs", f.repairs);
+    CHECK(f.z[Z_CPU].out[0].repairs == 0 && f.z[Z_BOARD].out[1].repairs == 0 && f.z[Z_BOARD].out[2].repairs == 0,
+          "the healthy chips of the dump: no repairs");
+    run(&f, 2, HOST_ON);
+    CHECK(f.g[G_IOHUB].valid && f.g[G_IOHUB].max > 55 && f.g[G_IOHUB].max < 58 && !f.z[Z_BOARD].failsafe,
+          "IOHUB reads %.2f again, the zone leaves its fail-safe", f.g[G_IOHUB].max);
+    unsigned rep = f.repairs;
+    run(&f, 300, HOST_ON);
+    CHECK(f.repairs == rep && f.corruptions == 1 && !fand_alarm(&f) && f.z[Z_BOARD].duty < 100 && !strcmp(led(), "none"),
+          "stays right, no alarm, quiet (%.1f%%)", f.z[Z_BOARD].duty);
+
+    /* the same while running: found by the next poll, the zone never blind */
+    double duty = f.z[Z_BOARD].duty;
+    CHECK(!load_dump(2, 0x4c), "corrupted while running");
+    run(&f, 1, HOST_ON);
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x11) == 0 && reg(2, 0x4c, 0x19) == 0x6e && f.corruptions == 2,
+          "next poll: everything repaired (0x4a 0x%02x), corruption event", reg(2, 0x4c, 0x4a));
+    run(&f, 10, HOST_ON);
+    CHECK(!f.z[Z_BOARD].failsafe && !fand_alarm(&f) && NEAR(f.z[Z_BOARD].duty, duty, 2), "no fail-safe, the duty kept (%.1f)", f.z[Z_BOARD].duty);
+    struct buf b = { 0 };
+    fand_json(&f, &b);
+    char s[64];
+    snprintf(s, sizeof(s), "\"repairs\":%u,\"corruptions\":2", f.repairs);
+    CHECK(b.s && strstr(b.s, s), "JSON: %s", s);
+    free(b.s);
+
+    /* one register: a repair, not a corruption; slow registers within GUARD_SEC */
+    start(&f, &c);
+    run(&f, 10, HOST_ON);
+    setreg(6, 0x4c, 0x19, 0x20);
+    run(&f, 6, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x19) == 0x6e && f.repairs == 1 && f.corruptions == 0, "T_CRIT repaired within GUARD_SEC, one repair");
+
+    /* the offset: repaired, and that poll's reading isn't trusted */
+    start(&f, &c);
+    run(&f, 10, HOST_ON);
+    setreg(2, 0x4c, 0x11, 0xf0);
+    int64_t last = f.g[G_IOHUB].s[0].last_ok;
+    run(&f, 1, HOST_ON);
+    CHECK(reg(2, 0x4c, 0x11) == 0 && f.g[G_IOHUB].s[0].last_ok == last, "offset repaired first, no reading in that poll");
+    run(&f, 1, HOST_ON);
+    CHECK(f.g[G_IOHUB].s[0].last_ok == T, "read again the next poll");
+    /* an offset that can't be repaired: no data, whatever it reads */
+    mark(2, 0x4c, "ro", 1);
+    setreg(2, 0x4c, 0x11, 0x02);
+    run(&f, 7, HOST_ON);
+    CHECK(f.z[Z_BOARD].failsafe && strstr(f.z[Z_BOARD].reason, "offset") && f.z[Z_BOARD].duty == 100, "offset stuck: fail-safe (%s)",
+          f.z[Z_BOARD].reason);
+    mark(2, 0x4c, "ro", 0);
+    run(&f, 2, HOST_ON);
+    CHECK(!f.z[Z_BOARD].failsafe, "back");
+
+    /* polarity on the CPU fan chip, the fan model inverted by it: repaired at
+     * once, no tachometer conclusion */
+    start(&f, &c);
+    fan_model("model");
+    run(&f, 20, HOST_ON);
+    unsigned checks = f.tach_checks;
+    setreg(6, 0x4c, 0x4a, 0x3a);
+    run(&f, 60, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4a) == 0x2a && !f.tach_alarm && f.tach_checks == checks, "polarity repaired, no fan alarm");
+    /* at takeover too, the fan stopped by it */
+    run(&f, 1, HOST_OFF);
+    board();
+    fan_model("model");
+    setreg(6, 0x4c, 0x4a, 0x3b);
+    run(&f, 31, HOST_ON);
+    run(&f, 60, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4a) == 0x2a && !f.tach_alarm && !f.tach_checks, "at takeover: repaired, no fan alarm");
+    /* polarity stuck: not driven, and now the alarm is right */
+    mark(6, 0x4c, "no-polarity", 1);
+    setreg(6, 0x4c, 0x4a, 0x3a);
+    run(&f, 30, HOST_ON);
+    CHECK(f.out_alarm && !strcmp(led(), "default-on") && !f.z[Z_CPU].out[0].ok, "polarity stuck: not driven, alarm, LED");
+    unsigned r2 = f.repairs;
+    run(&f, 10, HOST_ON);
+    CHECK(f.repairs == r2, "a register that refuses isn't counted");
+    mark(6, 0x4c, "no-polarity", 0);
+    fan_model(NULL);
+
+    /* the fail-safe must not leave an inverted PWM */
+    board();
+    setreg(2, 0x4c, 0x4a, 0x38);
+    setreg(6, 0x4c, 0x4a, 0x3a);
+    fand_failsafe(&c);
+    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && !(reg(6, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == 46, "--failsafe clears the polarity");
+
+    /* a chip with plain registers (QEMU): the write address doesn't work */
+    board();
+    mark(2, 0x4c, "noalias", 1);
+    setreg(2, 0x4c, 0x03, 0x80);
+    start_keep(&f, &c);
+    CHECK(reg(2, 0x4c, 0x03) == 0x06, "no write alias: the read address (0x%02x)", reg(2, 0x4c, 0x03));
+    mark(2, 0x4c, "noalias", 0);
+
+    /* EMC2305 */
+    start(&f, &c);
+    run(&f, 10, HOST_ON);
+    setreg(2, 0x2c, 0x2b, 0x1f);
+    setreg(2, 0x2c, 0x2a, 0x03);
+    setreg(2, 0x2e, 0x20, 0x40);
+    setreg(2, 0x2e, 0x42, 0xab);
+    run(&f, 6, HOST_ON);
+    CHECK(reg(2, 0x2c, 0x2b) == 0 && reg(2, 0x2c, 0x2a) == 0 && reg(2, 0x2e, 0x20) == 0x60 && reg(2, 0x2e, 0x42) == 0x2b && f.repairs == 4,
+          "EMC2305: output, polarity, WD_EN, direct mode repaired (%u)", f.repairs);
+    k = c;
+    k.emc_watchdog = 0;
+    start(&f, &k);
+    setreg(2, 0x2e, 0x20, 0x40);
+    run(&f, 10, HOST_ON);
+    CHECK(reg(2, 0x2e, 0x20) == 0x40, "EMC_WATCHDOG=no: left alone");
+
+    /* --observe: reports, writes nothing */
+    board();
+    CHECK(!load_dump(2, 0x4c), "observe: the image");
+    fand_observe = 1;
+    T += 1000;
+    fand_init(&f, &c, T);
+    f.on_since_hint = T - 100000;
+    run(&f, 3, HOST_ON);
+    fand_observe = 0;
+    CHECK(reg(2, 0x4c, 0x4a) == 0x38 && reg(2, 0x4c, 0x11) == 0x98 && f.repairs == 0 && f.z[Z_BOARD].failsafe, "observe: nothing written, no data");
+}
+
 static void t_fan_range(void)
 {
     struct fand f;
@@ -1272,7 +1485,7 @@ int main(void)
         { "curves", t_curves }, { "config", t_config }, { "host", t_host }, { "hysteresis_slew", t_hysteresis_slew },
         { "failsafe_inputs", t_failsafe_inputs }, { "outputs", t_outputs }, { "tach", t_tach }, { "manual", t_manual },
         { "reload", t_reload }, { "json", t_json }, { "fan_model", t_fan_model }, { "fan_range", t_fan_range },
-        { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu },
+        { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu }, { "guard", t_guard },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {

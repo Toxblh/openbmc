@@ -19,7 +19,9 @@
 # Installed: /usr/local/lib/reimu/reimu-hostd.py, the unit
 # /etc/systemd/system/reimu-hostd.service, /etc/reimu-hostd.conf (kept when
 # there), the key /etc/reimu-hostd/secret (by the pairing), the udev rule
-# /etc/udev/rules.d/60-reimu-bmc-hub.rules (the BMC's USB hub never suspended). Again: an update
+# /etc/udev/rules.d/60-reimu-bmc-hub.rules (the BMC's USB hub never suspended);
+# once paired /etc/modprobe.d/reimu-bmc-owns-i2c.conf and pwmd disabled (the BMC
+# the only master of the shared I2C buses; --uninstall gives both back). Again: an update
 # (with --pair: a new pairing). All of it is one { … } block: the shell reads
 # the whole of it before running any of it, so a download cut short runs
 # nothing, and the USB disk may go away while it runs.
@@ -240,6 +242,16 @@ do_install() {
             "not paired: run again with --pair 'reimu1:…' (the BMC's page Хост)"
         return 0
     fi
+    # the BMC the only master of the I2C buses shared with the host (the agent's
+    # text, pwmd's state written down there); after the pairing: until then
+    # no agent watches and the host's own fan control stays
+    if REIMU_HOSTD_ROOT="$REIMU_ROOT" REIMU_HOSTD_CONF="$CONF" python3 "$LIB/reimu-hostd.py" bus-owner install; then
+        msg "Шины I²C платформы теперь только у BMC: при выключенном BMC или старой прошивке вентиляторами никто не управляет" \
+            "the shared I2C buses are the BMC's alone: with the BMC down or on old firmware nobody drives the fans"
+    else
+        msg "Не удалось передать шины I²C платформы BMC (агент всё равно отключает драйверы хоста)" \
+            "the modprobe.d file or pwmd not handled (the agent unbinds the host's drivers anyway)"
+    fi
     since=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl_ daemon-reload
     systemctl_ enable reimu-hostd.service >/dev/null 2>&1 || systemctl_ enable reimu-hostd.service
@@ -270,6 +282,12 @@ do_uninstall() {
     # the hub rule stays while reimu-host.sh (the KVM side) is installed
     [ -f "$LIB/reimu-host.sh" ] || [ ! -f "$LIB/reimu-hostd.py" ] ||
         REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" hub-rule remove 2>/dev/null
+    # the agent is stopped by now, or it would stop pwmd again; nothing is unbound
+    if [ -f "$LIB/reimu-hostd.py" ]; then
+        REIMU_HOSTD_ROOT="$REIMU_ROOT" REIMU_HOSTD_CONF="$CONF" python3 "$LIB/reimu-hostd.py" bus-owner remove 2>/dev/null
+        msg "Управление вентиляторами возвращено хосту: драйверы вернутся после перезагрузки хоста" \
+            "fan control given back to the host: its drivers come back with the host's next reboot"
+    fi
     rm -f "$UNIT" "$LIB/reimu-hostd.py" "$SECRET"
     rmdir "$(dirname "$SECRET")" "$LIB" 2>/dev/null
     [ "$PURGE" = 1 ] && rm -f "$CONF"
