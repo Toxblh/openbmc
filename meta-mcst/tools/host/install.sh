@@ -26,8 +26,15 @@
 # the whole of it before running any of it, so a download cut short runs
 # nothing, and the USB disk may go away while it runs.
 #
+# A host without systemd (no /run/systemd/system or no systemctl): instead of
+# the unit /etc/init.d/reimu-hostd (reimu-hostd.init), started at boot by
+# update-rc.d, chkconfig, insserv or rc?.d links, log /var/log/reimu-hostd.log.
+#
 # REIMU_ROOT=DIR (tests): every path under DIR, root not needed, systemctl
-# only when REIMU_SYSTEMCTL names one; REIMU_SYS: /sys elsewhere.
+# only when REIMU_SYSTEMCTL names one; REIMU_SYS: /sys elsewhere. systemd is
+# taken for granted unless REIMU_RUN_SYSTEMD names the directory to look for;
+# update-rc.d, chkconfig, insserv only from the directory REIMU_RC_BIN;
+# REIMU_LINK_WAIT: seconds to wait for the link.
 
 {
 REIMU_SUMS='
@@ -36,7 +43,7 @@ REIMU_SUMS='
 # the self-contained installer: the pairing string written in by the page
 REIMU_PAIR_DEFAULT=''
 
-FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf"
+FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init"
 
 say() { printf '%s\n' "$*"; }
 # ru, then en
@@ -201,8 +208,103 @@ journal() {
 
 paired() { [ -f "$SECRET" ] && grep -q '^KEY=' "$SECRET"; }
 
+# ------------------------------------------------------------------ no systemd
+detect_init() {
+    INIT=systemd
+    if [ -n "$REIMU_ROOT" ]; then
+        if [ -n "${REIMU_RUN_SYSTEMD:-}" ]; then
+            [ -d "$REIMU_RUN_SYSTEMD" ] && [ -n "${REIMU_SYSTEMCTL:-}" ] || INIT=sysv
+        fi
+    else
+        [ -d /run/systemd/system ] && have systemctl || INIT=sysv
+    fi
+    if [ "$INIT" = sysv ] && [ -z "$REIMU_ROOT" ]; then
+        PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin # su without -: no sbin
+        export PATH
+    fi
+    REIMU_INIT=$INIT # the agent's commands below choose as this does
+    export REIMU_INIT
+}
+
+rc_tool() { # name -> its path
+    if [ -n "$REIMU_ROOT" ]; then
+        [ -n "${REIMU_RC_BIN:-}" ] && [ -x "$REIMU_RC_BIN/$1" ] && echo "$REIMU_RC_BIN/$1"
+    else
+        command -v "$1" 2>/dev/null
+    fi
+}
+
+rc_base() { # the directory with rc3.d
+    for b in "$REIMU_ROOT/etc/rc.d" "$REIMU_ROOT/etc"; do
+        [ -d "$b/rc3.d" ] && { echo "$b"; return 0; }
+    done
+    return 1
+}
+
+boot_on() {
+    how=
+    if t=$(rc_tool update-rc.d) && "$t" reimu-hostd defaults >/dev/null 2>&1; then how=update-rc.d
+    elif t=$(rc_tool chkconfig) && "$t" --add reimu-hostd >/dev/null 2>&1 && "$t" reimu-hostd on >/dev/null 2>&1; then how=chkconfig
+    elif t=$(rc_tool insserv) && "$t" reimu-hostd >/dev/null 2>&1; then how=insserv
+    elif b=$(rc_base); then
+        target=${INITD#"$REIMU_ROOT"}/reimu-hostd
+        for l in 3 5; do mkdir -p "$b/rc$l.d" && ln -sf "$target" "$b/rc$l.d/S99reimu-hostd"; done
+        for l in 0 6; do mkdir -p "$b/rc$l.d" && ln -sf "$target" "$b/rc$l.d/K01reimu-hostd"; done
+        how="${b#"$REIMU_ROOT"}/rc?.d"
+    fi
+    if [ -n "$how" ]; then
+        msg "Запуск при загрузке включён ($how)" "started at boot ($how)"
+    else
+        msg "ВНИМАНИЕ: нет ни update-rc.d, ни chkconfig, ни insserv, ни каталога rc3.d: агент НЕ будет запускаться при загрузке; запускайте его сами: ${INITD#"$REIMU_ROOT"}/reimu-hostd start" \
+            "WARNING: no update-rc.d, chkconfig, insserv or rc3.d directory: the agent will NOT start at boot; start it yourself: ${INITD#"$REIMU_ROOT"}/reimu-hostd start"
+    fi
+}
+
+boot_off() {
+    if t=$(rc_tool update-rc.d); then "$t" -f reimu-hostd remove >/dev/null 2>&1; fi
+    if t=$(rc_tool chkconfig); then "$t" --del reimu-hostd >/dev/null 2>&1; fi
+    if t=$(rc_tool insserv); then "$t" -r reimu-hostd >/dev/null 2>&1; fi
+    for b in "$REIMU_ROOT/etc/rc.d" "$REIMU_ROOT/etc"; do
+        rm -f "$b"/rc?.d/[SK][0-9][0-9]reimu-hostd
+    done
+}
+
+log_size() { # the log's size now
+    [ -f "$LOGF" ] || { echo 0; return 0; }
+    set -- $(wc -c < "$LOGF")
+    echo "${1:-0}"
+}
+
+start_sysv() {
+    show=${INITD#"$REIMU_ROOT"}/reimu-hostd
+    logshow=${LOGF#"$REIMU_ROOT"}
+    boot_on
+    since=$(log_size)
+    sh "$INITD/reimu-hostd" restart >/dev/null || die 1 "служба reimu-hostd не запустилась: $logshow, $show status" \
+        "reimu-hostd did not start: $logshow, $show status"
+    msg "Служба reimu-hostd запущена, жду связи с BMC…" "reimu-hostd started, waiting for the BMC…"
+    i=0
+    while [ $i -lt "${REIMU_LINK_WAIT:-20}" ]; do
+        [ "$(log_size)" -ge "$since" ] || since=0 # its loop set the old log aside
+        line=$(tail -c +$((since + 1)) "$LOGF" 2>/dev/null | grep -E 'connected to the BMC|refused|not reachable' | tail -n 1)
+        [ -n "$line" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    case $line in
+        *"connected to the BMC"*)
+            msg "Готово: $line. На странице BMC «Хост» агент «подключён»." "done: $line" ;;
+        *)
+            msg "Служба работает, но связи с BMC пока нет: tail -f $logshow" \
+                "the service runs, no link to the BMC yet: tail -f $logshow${line:+ ($line)}" ;;
+    esac
+    sh "$INITD/reimu-hostd" status 2>/dev/null | head -n 3
+    return 0
+}
+
 do_install() {
     have python3 || die 1 "нужен python3 (агент написан на нём)" "python3 is needed (the agent is written in it)"
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 6))' || die 1 "нужен python3 версии 3.6 или новее" "python3 3.6 or newer is needed"
     T=$(mktemp -d "${TMPDIR:-/tmp}/reimu-agent.XXXXXX") || die 1 "mktemp" "mktemp"
     trap 'rm -rf "$T"' EXIT
     if [ -n "$SELF" ] && grep -q '^#__REIMU_PAYLOAD__$' "$SELF" 2>/dev/null; then get_payload "$T"
@@ -211,7 +313,11 @@ do_install() {
     fi
     verify "$T"
     put "$T/reimu-hostd.py" "$LIB/reimu-hostd.py" 755
-    put "$T/reimu-hostd.service" "$UNIT" 644
+    if [ "$INIT" = systemd ]; then
+        put "$T/reimu-hostd.service" "$UNIT" 644
+    else
+        put "$T/reimu-hostd.init" "$INITD/reimu-hostd" 755
+    fi
     if [ -f "$CONF" ]; then
         msg "Настройки $CONF сохранены" "$CONF kept"
     else
@@ -252,6 +358,10 @@ do_install() {
         msg "Не удалось передать шины I²C платформы BMC (агент всё равно отключает драйверы хоста)" \
             "the modprobe.d file or pwmd not handled (the agent unbinds the host's drivers anyway)"
     fi
+    if [ "$INIT" = sysv ]; then
+        start_sysv
+        return 0
+    fi
     since=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl_ daemon-reload
     systemctl_ enable reimu-hostd.service >/dev/null 2>&1 || systemctl_ enable reimu-hostd.service
@@ -278,7 +388,11 @@ do_install() {
 }
 
 do_uninstall() {
-    systemctl_ disable --now reimu-hostd.service 2>/dev/null
+    [ "$INIT" = sysv ] || systemctl_ disable --now reimu-hostd.service 2>/dev/null
+    if [ -f "$INITD/reimu-hostd" ]; then
+        sh "$INITD/reimu-hostd" stop >/dev/null 2>&1
+        boot_off
+    fi
     # the hub rule stays while reimu-host.sh (the KVM side) is installed
     [ -f "$LIB/reimu-host.sh" ] || [ ! -f "$LIB/reimu-hostd.py" ] ||
         REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" hub-rule remove 2>/dev/null
@@ -288,10 +402,12 @@ do_uninstall() {
         msg "Управление вентиляторами возвращено хосту: драйверы вернутся после перезагрузки хоста" \
             "fan control given back to the host: its drivers come back with the host's next reboot"
     fi
-    rm -f "$UNIT" "$LIB/reimu-hostd.py" "$SECRET"
+    rm -f "$UNIT" "$LIB/reimu-hostd.py" "$SECRET" "$INITD/reimu-hostd" "$LOGF" "$LOGF.1" \
+        "$REIMU_ROOT/var/run/reimu-hostd.pid" "$REIMU_ROOT/var/run/reimu-hostd.agent.pid"
+    rm -rf "$REIMU_ROOT/var/run/reimu-hostd.lock"
     rmdir "$(dirname "$SECRET")" "$LIB" 2>/dev/null
     [ "$PURGE" = 1 ] && rm -f "$CONF"
-    systemctl_ daemon-reload 2>/dev/null
+    [ "$INIT" = sysv ] || systemctl_ daemon-reload 2>/dev/null
     msg "Агент удалён$([ "$PURGE" = 1 ] || echo " (настройки $CONF оставлены)"). Отозвать ключ на BMC: страница «Хост» → «Отключить агент»." \
         "removed$([ "$PURGE" = 1 ] || echo " ($CONF kept)"); revoke the key on the BMC: page Хост → «Отключить агент»"
 }
@@ -307,6 +423,9 @@ main() {
     UNIT=$REIMU_ROOT/etc/systemd/system/reimu-hostd.service
     CONF=$REIMU_ROOT/etc/reimu-hostd.conf
     SECRET=$REIMU_ROOT/etc/reimu-hostd/secret
+    INITD=$REIMU_ROOT/etc/init.d
+    [ -d "$INITD" ] || [ ! -d "$REIMU_ROOT/etc/rc.d/init.d" ] || INITD=$REIMU_ROOT/etc/rc.d/init.d
+    LOGF=$REIMU_ROOT/var/log/reimu-hostd.log
     PAIR=$REIMU_PAIR_DEFAULT URL=${REIMU_URL:-} ACTION=install PURGE=
     while [ $# -gt 0 ]; do
         case $1 in
@@ -346,6 +465,7 @@ main() {
     if [ -z "$REIMU_ROOT" ] && [ "$(id -u)" != 0 ]; then
         die 1 "нужны права root: sudo sh install.sh …" "run as root: sudo sh install.sh …"
     fi
+    detect_init
     case $ACTION in
         install) do_install ;;
         uninstall) do_uninstall ;;

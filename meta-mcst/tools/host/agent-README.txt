@@ -44,8 +44,15 @@ After install / после установки:
   systemctl status reimu-hostd ; journalctl -u reimu-hostd
   settings / настройки: /etc/reimu-hostd.conf
 
+No systemd (SysV init) / без systemd: install.sh sees it and installs
+/etc/init.d/reimu-hostd, on at boot by update-rc.d, chkconfig, insserv or rc?.d
+links (it says so if none of them is there / скажет, если ничего этого нет):
+  /etc/init.d/reimu-hostd status ; tail /var/log/reimu-hostd.log
+python3 3.6 or newer / python3 версии 3.6 или новее.
+
 Files / файлы: install.sh (checks the SHA-256 of the files below / проверяет
 SHA-256 файлов), reimu-hostd.py, reimu-hostd.service, reimu-hostd.conf,
+reimu-hostd.init,
 PAIRING.TXT (the one-time pairing string, valid 15 min / одноразовая строка
 привязки, действует 15 минут; the BMC removes this disk after the agent
 connects / BMC отключает этот диск, когда агент подключится).

@@ -88,7 +88,7 @@ try {
   const sh = fs.readFileSync(f, "utf8");
   check(sh.startsWith("#!/bin/sh") && sh.includes(`\nREIMU_PAIR_DEFAULT='${out.pair}'\n`), "the installer has the current pairing string");
   const payload = sh.split("\n#__REIMU_PAYLOAD__\n")[1] || "";
-  check(payload.split("\n").filter(Boolean).map((l) => l.split(" ")[0]).join(" ") === "reimu-hostd.py reimu-hostd.service reimu-hostd.conf", "and the agent's three files");
+  check(payload.split("\n").filter(Boolean).map((l) => l.split(" ")[0]).join(" ") === "reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init", "and the agent's four files");
   // the USB disk
   await agent.getByRole("button", { name: /USB-диск/ }).click();
   if ((process.env.AGENT_DISK || "error") === "error") {

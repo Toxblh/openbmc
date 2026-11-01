@@ -483,7 +483,9 @@ long s_action_done = 0;
 long s_forced_off_at = 0;   /* the forced power-off seen */
 int s_skipped_graceful = 0, s_skipped_force = 0;
 int s_graceful_cooled = 0;
-int s_polls_since_start = 0;
+int s_known_polls = 0;      /* polls in a row with real readings */
+int s_button_busy = 0;      /* someone else's press (the last run's): none of ours meanwhile */
+long s_button_busy_since = 0;
 char s_emergency[512] = ""; /* the marker's content, one line */
 
 static void ladder_save(void)
@@ -530,8 +532,29 @@ static void action_child(int force)
     _exit(127);
 }
 
+/* A press still on (the last run's goes on through a restart, KillMode=process):
+ * a child now would wait for the lock and press after it, with the host just off
+ * or not known to be. It ends by itself: looked at again until then, and a line
+ * busy for longer than any press isn't kept from the overheat protection. */
+static int button_busy(void)
+{
+    if (!s_button_busy) return 0;
+    if ((monotonic_sec() - s_button_busy_since <= ACTION_TIMEOUT_SEC) && (reimu_get_gpio_by_name("GPIO_PWR_BTN") == -3)) return 1;
+    s_button_busy = 0;
+    return 0;
+}
+
 static void action_start(int force)
 {
+    if (button_busy())
+    {
+        crit_printf("Overheat: the power button is being pressed by someone else: the %s waits for it", force ? "forced power-off" : "graceful shutdown");
+        /* (each state's backoff starts it again) */
+        s_action_rv = -1;
+        s_action_force = force;
+        s_action_done = monotonic_sec();
+        return;
+    }
     pid_t p = fork();
     if (p < 0)
     {
@@ -552,7 +575,11 @@ static void action_start(int force)
  * is pressing it, and that one ends it. */
 static void button_release(void)
 {
-    reimu_get_gpio_by_name("GPIO_PWR_BTN");
+    if (reimu_get_gpio_by_name("GPIO_PWR_BTN") == -3)
+    {
+        s_button_busy = 1;
+        s_button_busy_since = monotonic_sec();
+    }
 }
 
 static void action_reap(int kill_it)
@@ -649,13 +676,14 @@ static void ladder_force(const char *reason, const char *temps)
 }
 
 /* Called on every poll; power: GPIO_POWER_IN as read, <0: unknown (no action then).
+ * known: there are real readings this poll (none in the settle, none of a dead bus).
  * shutdown, poweroff: confirmed over these temperatures; ttrip: confirmed. */
-static void ladder_step(int power, int shutdown, int poweroff, int ttrip, const char *temps)
+static void ladder_step(int power, int known, int shutdown, int poweroff, int ttrip, const char *temps)
 {
     static int s_old_power = -1;
     long now = monotonic_sec();
     action_reap(0);
-    ++s_polls_since_start;
+    s_known_polls = known ? s_known_polls + 1 : 0;
 
     if (power < 0) return;
 
@@ -755,7 +783,10 @@ static void ladder_step(int power, int shutdown, int poweroff, int ttrip, const 
                 /* Not even asked (the button's GPIO busy...): again */
                 else if (!s_action_pid && (s_action_rv != ACTION_SENT) && s_action_rv && !s_action_force && (now - s_action_done >= 5)) action_start(0);
             }
-            else if (s_polls_since_start > LADDER_CONFIRM_POLLS * 2)
+            /* Not over it only says something after the polls a real reading needs to
+             * count as over it (the jump filter, then the confirmation). Blind: nothing
+             * is decided, hot readings coming back past the timeout force at once. */
+            else if (s_known_polls > LADDER_CONFIRM_POLLS * 2)
             {
                 if (!s_graceful_cooled) crit_printf("Overheat: CPU temperature under CPU_SHUTDOWN_TEMP again (%s): no escalation (an OS shutdown already started goes on)", temps);
                 s_graceful_cooled = 1;
@@ -1293,6 +1324,7 @@ int main(int argc, char *argv[])
             long hot_temp = 0;
 
             /* Powered on (for a while: its power-up must not see BMC traffic on the bus), so check I2C */
+            int known = 0;
             if(powered_on && (monotonic_sec() - powered_on_since >= pcs_settle_sec))
             {
                 update_sensors();
@@ -1359,6 +1391,7 @@ int main(int argc, char *argv[])
                     s->over_poweroff = (temp >= cpu_poweroff_temp) ? s->over_poweroff + 1 : 0;
                 }
                 if (i2c_fd >= 0) close(i2c_fd);
+                known = monitored > 0;
 
                 /* A CPU is over a temperature when 2 of its sensors say so, polls in a row
                  * (or its only one that answers; an answer of garbage is an answer) */
@@ -1456,7 +1489,7 @@ int main(int argc, char *argv[])
             else ttrip_polls = 0;
 
             emergency_read();
-            ladder_step(real_power, confirmed_shutdown, confirmed_poweroff, ttrip_confirmed, sensors_summary());
+            ladder_step(real_power, known, confirmed_shutdown, confirmed_poweroff, ttrip_confirmed, sensors_summary());
             emergency_read();
             if (s_ladder != LADDER_IDLE) fast_poll = 1;
             if(reimu_textfile_buf_append("\t<protection enabled=\"%s\" state=\"%s\" limit=\"%ld\" shutdown=\"%ld\" poweroff=\"%ld\" timeout=\"%ld\"/>\n", overheat_poweroff ? "yes" : "no", s_ladder_names[s_ladder], cpu_temp_limit, cpu_shutdown_temp, cpu_poweroff_temp, graceful_timeout_sec)) reimu_cancel(-250, "Out of memory\n");

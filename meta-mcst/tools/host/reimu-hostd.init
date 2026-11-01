@@ -1,0 +1,242 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: reimu-hostd
+# Required-Start: $local_fs $remote_fs $network
+# Required-Stop: $local_fs $remote_fs $network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: REIMU host agent
+# Description: inventory, health and GPU fan policy for the BMC
+### END INIT INFO
+# chkconfig: 2345 99 01
+# description: REIMU host agent: inventory, health and GPU fan policy for the BMC
+#
+# reimu-hostd for a host without systemd (install.sh puts it in /etc/init.d):
+# what reimu-hostd.service gets from systemd is here, Restart=always and
+# ExecStopPost in a small supervisor loop (this script again, "_loop").
+# Pid files in /var/run, the log /var/log/reimu-hostd.log (at the loop's start,
+# over 1 MiB: the old one kept as .1). POSIX sh.
+#
+# REIMU_ROOT=DIR (tests): every path under DIR; REIMU_RESTART_SEC, REIMU_STOP_SEC,
+# REIMU_SH: the waits and the shell of the loop.
+
+NAME=reimu-hostd
+ROOT=${REIMU_ROOT:-}
+# `service` and boot give a short PATH; python3 may be in /usr/local/bin
+[ -n "$ROOT" ] || PATH=$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+AGENT=$ROOT/usr/local/lib/reimu/reimu-hostd.py
+RUNDIR=$ROOT/var/run
+PIDFILE=$RUNDIR/$NAME.pid
+AGENTPID=$RUNDIR/$NAME.agent.pid
+LOCK=$RUNDIR/$NAME.lock
+LOG=$ROOT/var/log/$NAME.log
+LOG_MAX=1048576
+RESTART_SEC=${REIMU_RESTART_SEC:-5}
+STOP_SEC=${REIMU_STOP_SEC:-15}
+SH=${REIMU_SH:-/bin/sh}
+case $0 in /*) SELF=$0 ;; *) SELF=$(pwd)/$0 ;; esac
+# at boot there is no locale: an old python3 would fail on any non-ASCII line
+PYTHONIOENCODING=utf-8
+PYTHONUTF8=1
+export PYTHONIOENCODING PYTHONUTF8
+if [ -n "$ROOT" ]; then
+    REIMU_HOSTD_ROOT=$ROOT
+    REIMU_HOSTD_CONF=$ROOT/etc/reimu-hostd.conf
+    REIMU_HOSTD_SECRET=$ROOT/etc/reimu-hostd/secret
+    export REIMU_HOSTD_ROOT REIMU_HOSTD_CONF REIMU_HOSTD_SECRET
+fi
+
+# a live process of ours: pid reuse must not make us kill or wait for a stranger
+ours() { # pid pattern
+    case $1 in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 0
+    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q -e "$2"
+}
+is_loop() { ours "$1" "$NAME.* _loop"; }
+is_agent() { ours "$1" "$NAME.py"; }
+loop_pid() { p=$(cat "$PIDFILE" 2>/dev/null); is_loop "$p" && echo "$p"; }
+agent_pid() { p=$(cat "$AGENTPID" 2>/dev/null); is_agent "$p" && echo "$p"; }
+
+restore_auto() {
+    [ -f "$AGENT" ] && command -v python3 >/dev/null 2>&1 &&
+        python3 "$AGENT" restore-auto >>"$LOG" 2>&1 </dev/null
+}
+
+rotate_log() {
+    [ -f "$LOG" ] || return 0
+    set -- $(wc -c < "$LOG")
+    [ "${1:-0}" -gt "$LOG_MAX" ] && mv -f "$LOG" "$LOG.1"
+}
+
+# ------------------------------------------------------------------ the loop
+wait_child() {
+    # a trap ends a wait early
+    while kill -0 "$child" 2>/dev/null; do wait "$child"; done
+    child=
+}
+
+do_loop() {
+    cd / || exit 1 # not the installer's directory: the USB disk may go away
+    umask 022
+    ( set -C; echo $$ > "$PIDFILE" ) 2>/dev/null || exit 1
+    stopping=
+    child=
+    on_term() {
+        stopping=1
+        [ -z "$child" ] || kill -TERM "$child" 2>/dev/null
+    }
+    trap on_term TERM INT
+    trap '' HUP
+    while [ -z "$stopping" ]; do
+        rotate_log
+        python3 "$AGENT" run >>"$LOG" 2>&1 </dev/null &
+        child=$!
+        echo "$child" > "$AGENTPID"
+        [ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null # came between & and child=
+        wait_child
+        rm -f "$AGENTPID"
+        restore_auto # whatever stopped it: the GPU fan back to the driver's control
+        [ -z "$stopping" ] || break
+        sleep "$RESTART_SEC" &
+        child=$!
+        [ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null
+        wait_child
+    done
+    rm -f "$PIDFILE"
+    exit 0
+}
+
+# ------------------------------------------------------------------ the actions
+# one action at a time: never two copies
+lock() {
+    i=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        h=$(cat "$LOCK/pid" 2>/dev/null)
+        if [ -n "$h" ] && ! kill -0 "$h" 2>/dev/null; then
+            rm -rf "$LOCK" # its holder died
+            continue
+        fi
+        i=$((i + 1))
+        if [ $i -gt 30 ]; then # its holder hung, or the pid is someone else's now
+            rm -rf "$LOCK"
+            i=0
+            continue
+        fi
+        sleep 1
+    done
+    echo $$ > "$LOCK/pid"
+    trap 'rm -rf "$LOCK"' EXIT
+}
+
+kill_wait() { # pid kind(is_loop|is_agent)
+    i=0
+    while "$2" "$1" && [ $i -lt "$STOP_SEC" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if "$2" "$1"; then
+        kill -KILL "$1" 2>/dev/null
+        i=0
+        while "$2" "$1" && [ $i -lt 5 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+    fi
+}
+
+do_start() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "$NAME: python3 not found" >&2
+        exit 5
+    fi
+    if [ ! -f "$AGENT" ]; then
+        echo "$NAME: $AGENT not installed" >&2
+        exit 5
+    fi
+    p=$(loop_pid)
+    if [ -n "$p" ]; then
+        echo "$NAME: already running (pid $p)"
+        return 0
+    fi
+    rm -f "$PIDFILE"
+    a=$(agent_pid) # its loop was killed: the agent left alone
+    if [ -n "$a" ]; then
+        kill -TERM "$a" 2>/dev/null
+        kill_wait "$a" is_agent
+    fi
+    rm -f "$AGENTPID"
+    mkdir -p "$(dirname "$LOG")" || exit 1
+    if command -v setsid >/dev/null 2>&1; then
+        setsid $SH "$SELF" _loop </dev/null >/dev/null 2>&1 &
+    else
+        $SH "$SELF" _loop </dev/null >/dev/null 2>&1 &
+    fi
+    i=0
+    while [ $i -lt 10 ]; do
+        p=$(loop_pid)
+        if [ -n "$p" ]; then
+            echo "$NAME: started (pid $p)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "$NAME: did not start, see ${LOG#"$ROOT"}" >&2
+    exit 1
+}
+
+do_stop() {
+    [ -d "$RUNDIR" ] || return 0
+    l=$(loop_pid)
+    a=$(agent_pid)
+    if [ -z "$l" ] && [ -z "$a" ]; then
+        rm -f "$PIDFILE" "$AGENTPID"
+        echo "$NAME: not running"
+        return 0
+    fi
+    if [ -n "$l" ]; then
+        kill -TERM "$l" 2>/dev/null # it stops the agent and waits for it
+        kill_wait "$l" is_loop
+    fi
+    if [ -n "$a" ]; then
+        is_agent "$a" && kill -TERM "$a" 2>/dev/null
+        kill_wait "$a" is_agent
+    fi
+    rm -f "$PIDFILE" "$AGENTPID"
+    restore_auto
+    echo "$NAME: stopped"
+    return 0
+}
+
+do_status() {
+    l=$(loop_pid)
+    if [ -n "$l" ]; then
+        echo "$NAME: running (supervisor $l, agent $(agent_pid)); log ${LOG#"$ROOT"}"
+        return 0
+    fi
+    if [ -f "$PIDFILE" ]; then
+        echo "$NAME: dead, but $PIDFILE is there"
+        return 1
+    fi
+    echo "$NAME: stopped"
+    return 3
+}
+
+prepare() {
+    if ! mkdir -p "$RUNDIR" 2>/dev/null; then
+        echo "$NAME: can't create $RUNDIR" >&2
+        exit 1
+    fi
+    lock
+}
+
+case ${1:-} in
+    _loop) do_loop ;;
+    start) prepare; do_start ;;
+    stop) if [ -d "$RUNDIR" ]; then lock; do_stop; fi ;;
+    restart|force-reload) prepare; do_stop; do_start ;;
+    status) do_status ;;
+    *) echo "usage: $0 start|stop|restart|status" >&2; exit 2 ;;
+esac

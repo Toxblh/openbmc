@@ -559,8 +559,9 @@ static int on_signal(sd_event_source *s, const struct signalfd_siginfo *si, void
     if (s_observe) fand_log(5, "observer stopped");
     else
     {
-        if (F.phase != PH_OFF) fand_failsafe(&F.c);
-        fand_log(5, "stopped: fans 100%%");
+        int bad = F.phase != PH_OFF ? fand_failsafe(&F.c) : 0;
+        if (bad) fand_log(3, "stopped: fans NOT all confirmed at 100%%");
+        else fand_log(5, "stopped: fans 100%%");
     }
     sd_event_exit(s_ev, 0);
     return 0;
@@ -722,8 +723,8 @@ int main(int argc, char **argv)
         char err[FAND_MAX_ERR][128];
         cfg_defaults(&c);
         cfg_load(&c, s_conf, err, FAND_MAX_ERR);
-        fand_failsafe(&c);
-        fand_log(5, "fans set to 100%%");
+        if (fand_failsafe(&c)) fand_log(3, "fans NOT all confirmed at 100%%");
+        else fand_log(5, "fans set to 100%%");
         return 0;
     }
     if (argc >= 2 && argc <= 3 && !strcmp(argv[1], "--check-config")) return check_config(argc == 3 ? argv[2] : s_conf);

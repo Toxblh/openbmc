@@ -10,7 +10,7 @@ test: tests/test_fand
 	./tests/test_fand
 
 tests/test_fand: tests/test_fand.c fand.c fand-hw.c fand.h
-	$(HOSTCC) -Wall -Wextra -Wno-unused-parameter -g -O1 -fsanitize=address,undefined -I. -o $@ tests/test_fand.c fand.c fand-hw.c -lm
+	$(HOSTCC) -Wall -Wextra -Wno-unused-parameter -g -O1 -fsanitize=address,undefined -I. -Wl,--wrap=hw_rd_byte -Wl,--wrap=hw_wr_byte -Wl,--wrap=hw_now_ms -o $@ tests/test_fand.c fand.c fand-hw.c -lm
 
 HOSTCC ?= gcc
 

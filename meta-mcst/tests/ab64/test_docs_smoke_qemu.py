@@ -335,17 +335,11 @@ def t_smoke(b):
     check(b.out("cat /var/lib/reimu/last_power_state").strip() in ("0", "1"), "last_power_state 0 or 1")
 
     print("  -- ip-fallback (reimu.md:129)", flush=True)
-    to = b.out("grep FallbackTimeout /etc/ip-fallback/fallback-eth1.conf | cut -d= -f2").strip()
-    check(to.isdigit(), "fallback-eth1.conf: FallbackTimeout %s" % to)
-    end = time.time() + int(to or 60) + 60
-    addr = ""
-    while time.time() < end:
-        addr = b.out("ip addr show eth1 | grep 'inet '")
-        if "192.168.2.1/24" in addr:
-            break
-        time.sleep(5)
-    check("192.168.2.1/24" in addr, "eth1 without DHCP: the fallback address (%s; ip-fallback %s)"
-          % (addr.strip() or "none", b.out("systemctl is-active ip-fallback").strip()))
+    to = b.out("grep FallbackTimeout /etc/ip-fallback/fallback-eth0.conf | cut -d= -f2").strip()
+    check(to.isdigit(), "fallback-eth0.conf: FallbackTimeout %s" % to)
+    check(rc("[ ! -e /sys/class/net/eth1 ]") == 0, "no eth1 (bug 68)")
+    check("exited" in b.out("systemctl show -p SubState ip-fallback") or b.out("systemctl is-active ip-fallback").strip() == "active", "ip-fallback ran without eth1")
+    check(rc("journalctl -b -u ip-fallback --no-pager | grep -q 'eth1'") != 0, "ip-fallback: nothing about eth1")
     check("192.168.1.1" not in b.out("ip addr show eth0"), "eth0, with DHCP: no fallback address")
 
     print("  -- hwclock (reimu.md:156)", flush=True)

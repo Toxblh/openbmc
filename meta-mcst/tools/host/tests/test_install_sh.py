@@ -19,7 +19,7 @@ TOOLS = os.path.dirname(HERE)
 MKBUNDLE = os.path.join(TOOLS, "mkbundle.sh")
 INSTALL_SRC = os.path.join(TOOLS, "install.sh")
 DAEMON = os.environ.get("HOSTLINK_NATIVE", "")
-FILES = ("reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf")
+FILES = ("reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf", "reimu-hostd.init")
 
 
 def sh(cmd, env=None, timeout=120, input=None, cwd=None):
@@ -545,6 +545,523 @@ class Offline(Base):
         self.assertEqual(rc, 0, out)
         self.assertTrue(self.hl.paired())
         self.assertEqual(open(self.lib(), "rb").read(), open(os.path.join(TOOLS, "reimu-hostd.py"), "rb").read())
+
+
+# ------------------------------------------------------------------ SysV init
+FAKE_PY = r"""#!/bin/sh
+# the agent's run and restore-auto faked; anything else the real python3
+case " $* " in
+    *" run "*)
+        echo "$$" >> "$REIMU_ROOT/agents.log"
+        [ -f "$REIMU_ROOT/agent-silent" ] || echo "connected to the BMC at 127.0.0.1:5564 (ipv4)"
+        trap 'exit 0' TERM
+        while :; do sleep 1; done ;;
+    *" restore-auto "*)
+        echo "restore" >> "$REIMU_ROOT/restore.log"
+        exit 0 ;;
+esac
+exec /usr/bin/python3 "$@"
+"""
+
+
+def _alive_with(text):
+    """pids (not zombies) whose command line has TEXT"""
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                c = open("/proc/%s/cmdline" % d, "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            if text in c:
+                out.append(int(d))
+    return out
+
+
+class SysvBase(Base):
+    BIN = None
+
+    def setUp(self):
+        super().setUp()
+        if SysvBase.BIN is None:
+            SysvBase.BIN = bin_without(("systemctl", "journalctl", "update-rc.d", "chkconfig", "insserv"))
+        self.pybin = os.path.join(self.fake, "pybin")
+        self.rcbin = os.path.join(self.fake, "rcbin")
+        os.makedirs(self.pybin)
+        os.makedirs(self.rcbin)
+        p = os.path.join(self.pybin, "python3")
+        open(p, "w").write(FAKE_PY)
+        os.chmod(p, 0o755)
+        self.env = dict(os.environ, REIMU_ROOT=self.root, LC_ALL="C.UTF-8", PATH=self.pybin + ":" + self.BIN,
+                        REIMU_RUN_SYSTEMD=os.path.join(self.root, "run/systemd/system"), REIMU_RC_BIN=self.rcbin,
+                        REIMU_RESTART_SEC="1", REIMU_LINK_WAIT="3")
+        self.env.pop("REIMU_SYSTEMCTL", None)
+        self.env.pop("REIMU_JOURNALCTL", None)
+
+    def tearDown(self):
+        for pid in _alive_with(self.root):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        super().tearDown()
+
+    def p(self, rel):
+        return os.path.join(self.root, rel)
+
+    def rc_tool(self, name, rc=0):
+        f = os.path.join(self.rcbin, name)
+        open(f, "w").write('#!/bin/sh\necho "%s $*" >> "$REIMU_ROOT/rc.log"\nexit %d\n' % (name, rc))
+        os.chmod(f, 0o755)
+
+    def rc_log(self):
+        try:
+            return open(self.p("rc.log")).read()
+        except OSError:
+            return ""
+
+    def make_paired(self):
+        os.makedirs(self.p("etc/reimu-hostd"), exist_ok=True)
+        open(self.secret(), "w").write("KEY=00\nFINGERPRINT=00\n")
+
+    def mkrc(self, base="etc"):
+        for n in ("rc0.d", "rc3.d", "rc5.d", "rc6.d"):
+            os.makedirs(self.p(os.path.join(base, n)), exist_ok=True)
+
+    def install(self, *args, check=True):
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url] + list(args), env=self.env)
+        if check:
+            self.assertEqual(rc, 0, out)
+        return rc, out
+
+    def agents(self):
+        return _alive_with(self.p("usr/local/lib/reimu/reimu-hostd.py run"))
+
+
+class SysvInstall(SysvBase):
+    def test_detection(self):
+        self.make_paired()
+        fake = os.path.join(self.fake, "systemctl")
+        # the systemd directory, systemctl: systemd
+        os.makedirs(self.env["REIMU_RUN_SYSTEMD"])
+        self.env["REIMU_SYSTEMCTL"] = fake
+        self.install()
+        self.assertIn("restart reimu-hostd.service", self.systemctl())
+        self.assertFalse(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+        self.assertTrue(os.path.exists(self.unit()))
+        # the directory but no systemctl: SysV
+        del self.env["REIMU_SYSTEMCTL"]
+        self.install()
+        self.assertTrue(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+        sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        # systemctl but no directory (a stub on a SysV system): SysV
+        os.rmdir(self.env["REIMU_RUN_SYSTEMD"])
+        self.env["REIMU_SYSTEMCTL"] = fake
+        open(os.path.join(self.root, "systemctl.log"), "w").close()
+        self.make_paired()
+        self.install()
+        self.assertEqual(self.systemctl(), "", "not called")
+        self.assertTrue(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+
+    def test_install_without_systemd(self):
+        self.make_paired()
+        self.mkrc()
+        rc, out = self.install()
+        for bad in ("systemctl", "journalctl", "не найдена", "not found", "не запустилась"):
+            self.assertNotIn(bad, out)
+        init = self.p("etc/init.d/reimu-hostd")
+        self.assertTrue(os.access(init, os.X_OK))
+        self.assertFalse(os.path.exists(self.unit()), "no systemd unit where there is no systemd")
+        self.assertEqual(open(init, "rb").read(), open(os.path.join(TOOLS, "reimu-hostd.init"), "rb").read())
+        self.assertIn("connected to the BMC", out)
+        self.assertEqual(len(self.agents()), 1)
+        self.assertIn("connected to the BMC", open(self.p("var/log/reimu-hostd.log")).read())
+        rc, st = sh(["sh", init, "status"], env=self.env)
+        self.assertEqual(rc, 0, st)
+
+    def test_not_paired_not_started(self):
+        rc, out = self.install()
+        self.assertTrue(os.path.exists(self.p("etc/init.d/reimu-hostd")), "the files in place before pairing")
+        self.assertIn("--pair", out)
+        self.assertEqual(self.agents(), [])
+        self.assertFalse(os.path.exists(self.p("etc/rc3.d")))
+
+    def test_no_link_names_the_log_not_the_journal(self):
+        self.make_paired()
+        open(self.p("agent-silent"), "w").close()
+        rc, out = self.install()
+        self.assertIn("/var/log/reimu-hostd.log", out)
+        self.assertNotIn("journalctl", out)
+
+    def test_old_log_lines_dont_count(self):
+        self.make_paired()
+        os.makedirs(self.p("var/log"))
+        open(self.p("var/log/reimu-hostd.log"), "w").write("connected to the BMC long ago\n")
+        open(self.p("agent-silent"), "w").close()
+        rc, out = self.install()
+        self.assertNotIn("Готово", out)
+
+    def test_start_failure_names_the_log_and_the_command(self):
+        self.make_paired()
+        os.makedirs(self.p("var"))
+        open(self.p("var/run"), "w").close()  # no pidfile can be written
+        rc, out = self.install(check=False)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("/var/log/reimu-hostd.log", out)
+        self.assertIn("/etc/init.d/reimu-hostd status", out)
+        self.assertNotIn("journalctl", out)
+
+    def test_boot_tools(self):
+        for tool, want in (("update-rc.d", "update-rc.d reimu-hostd defaults"),
+                           ("chkconfig", "chkconfig --add reimu-hostd\nchkconfig reimu-hostd on"),
+                           ("insserv", "insserv reimu-hostd")):
+            with self.subTest(tool):
+                for t in os.listdir(self.rcbin):
+                    os.remove(os.path.join(self.rcbin, t))
+                self.rc_tool(tool)
+                self.make_paired()
+                self.mkrc()
+                self.install()
+                self.assertIn(want, self.rc_log())
+                self.assertEqual(os.listdir(self.p("etc/rc3.d")), [], "the tool's job")
+                rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+                self.assertEqual(rc, 0, out)
+                self.assertRegex(self.rc_log(), {"update-rc.d": r"update-rc.d -f reimu-hostd remove",
+                                                 "chkconfig": r"chkconfig --del reimu-hostd",
+                                                 "insserv": r"insserv -r reimu-hostd"}[tool])
+                self.assertFalse(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+                os.remove(self.p("rc.log"))
+
+    def test_boot_tool_order_and_failure_falls_through(self):
+        self.make_paired()
+        self.mkrc()
+        self.rc_tool("update-rc.d", rc=1)
+        self.rc_tool("chkconfig", rc=1)
+        self.rc_tool("insserv", rc=1)
+        self.install()
+        log = self.rc_log()
+        self.assertLess(log.index("update-rc.d"), log.index("chkconfig"))
+        self.assertLess(log.index("chkconfig"), log.index("insserv"))
+        self.assertTrue(os.path.lexists(self.p("etc/rc3.d/S99reimu-hostd")), "the links, last")
+
+    def test_symlink_fallback(self):
+        for base in ("etc", "etc/rc.d"):
+            with self.subTest(base):
+                self.make_paired()
+                self.mkrc(base)
+                self.install()
+                for link, in (("rc3.d/S99reimu-hostd",), ("rc5.d/S99reimu-hostd",), ("rc0.d/K01reimu-hostd",), ("rc6.d/K01reimu-hostd",)):
+                    self.assertEqual(os.readlink(self.p(os.path.join(base, link))), "/etc/init.d/reimu-hostd", link)
+                rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(os.listdir(self.p(os.path.join(base, "rc3.d"))), [])
+                shutil.rmtree(self.p(base))
+
+    def test_rc_d_init_d_when_no_etc_init_d(self):
+        self.make_paired()
+        self.mkrc("etc/rc.d")
+        os.makedirs(self.p("etc/rc.d/init.d"))
+        self.install()
+        self.assertTrue(os.path.exists(self.p("etc/rc.d/init.d/reimu-hostd")))
+        self.assertFalse(os.path.exists(self.p("etc/init.d")))
+        self.assertEqual(os.readlink(self.p("etc/rc.d/rc3.d/S99reimu-hostd")), "/etc/rc.d/init.d/reimu-hostd")
+
+    def test_no_way_to_start_at_boot_is_said(self):
+        self.make_paired()
+        rc, out = self.install()
+        self.assertIn("НЕ будет запускаться при загрузке", out)
+        self.assertIn("will NOT start at boot", out)
+        self.assertEqual(len(self.agents()), 1, "it runs now all the same")
+
+    def test_reinstall(self):
+        self.make_paired()
+        self.mkrc()
+        self.install()
+        first = self.agents()
+        self.install()
+        now = self.agents()
+        self.assertEqual(len(now), 1)
+        self.assertNotEqual(first, now, "restarted: the new code runs")
+
+    def test_uninstall_removes_everything(self):
+        self.make_paired()
+        self.mkrc()
+        self.install()
+        rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.agents(), [])
+        self.assertEqual(_alive_with("_loop"), [p for p in _alive_with("_loop") if self.root not in
+                                                open("/proc/%d/cmdline" % p).read()])
+        self.assertTrue(os.path.exists(self.p("restore.log")), "the GPU fan back to the driver")
+        for f in ("etc/init.d/reimu-hostd", "etc/rc3.d/S99reimu-hostd", "etc/rc5.d/S99reimu-hostd", "etc/rc0.d/K01reimu-hostd",
+                  "etc/rc6.d/K01reimu-hostd", "var/run/reimu-hostd.pid", "var/run/reimu-hostd.agent.pid",
+                  "var/log/reimu-hostd.log", "var/log/reimu-hostd.log.1"):
+            self.assertFalse(os.path.lexists(self.p(f)), f)
+        self.assertFalse(os.path.exists(self.lib()))
+        self.assertFalse(os.path.exists(self.secret()))
+        self.assertNotIn("journalctl", out)
+        self.assertNotIn("systemctl", out)
+        rc, out = sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, "twice: " + out)
+
+    def test_tampered_init_refused(self):
+        d = os.path.join(self.fake, "usb")
+        os.makedirs(d)
+        for f in FILES + ("install.sh",):
+            shutil.copy(os.path.join(self.out, "agent", f), d)
+        open(os.path.join(d, "reimu-hostd.init"), "a").write("# evil\n")
+        rc, out = sh(["sh", os.path.join(d, "install.sh")], env=self.env)
+        self.assertEqual(rc, 3, out)
+        self.assertIn("SHA-256", out)
+        self.assertFalse(os.path.exists(self.p("etc/init.d/reimu-hostd")))
+
+    def test_python_too_old_is_said(self):
+        p = os.path.join(self.pybin, "python3")
+        open(p, "w").write('#!/bin/sh\ncase "$*" in *version_info*) exit 1 ;; esac\nexit 0\n')
+        rc, out = self.install(check=False)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("3.6", out)
+
+    def test_pwmd_on_sysv(self):
+        self.make_paired()
+        self.mkrc()
+        os.makedirs(self.p("etc/init.d"))
+        open(self.p("etc/init.d/pwmd"), "w").close()
+        os.symlink("../init.d/pwmd", self.p("etc/rc3.d/S20pwmd"))
+        rc, out = self.install()
+        self.assertEqual(open(self.p("etc/reimu-hostd/bus-owner.state")).read().strip(), "pwmd=enabled")
+        self.assertFalse(os.path.lexists(self.p("etc/rc3.d/S20pwmd")))
+        self.assertTrue(os.path.lexists(self.p("etc/rc3.d/K20pwmd")))
+        self.assertIn("только у BMC", out)
+        sh(["sh", self.installed_script(), "--uninstall"], env=self.env)
+        self.assertTrue(os.path.lexists(self.p("etc/rc3.d/S20pwmd")), "given back")
+
+    def test_pwmd_not_stoppable_is_said_by_the_installer(self):
+        self.make_paired()
+        os.makedirs(self.p("proc/4242"))
+        open(self.p("proc/4242/comm"), "w").write("pwmd\n")
+        rc, out = self.install()  # the fake runner runs nothing: nothing can stop it
+        self.assertIn("ERROR", out)
+        self.assertIn("pwmd", out)
+        self.assertIn("Не удалось передать шины", out)
+        self.assertNotIn("только у BMC", out)
+        self.assertEqual(len(self.agents()), 1, "the agent itself runs: it keeps trying and tells the BMC")
+
+
+class InitScript(SysvBase):
+    """the init script itself, for real: a fake agent, in a temp dir"""
+    SHELL = "/bin/sh"
+
+    def setUp(self):
+        super().setUp()
+        if not shutil.which(self.SHELL.split()[0]):
+            self.skipTest(self.SHELL)
+        self.init = self.p("etc/init.d/reimu-hostd")
+        os.makedirs(os.path.dirname(self.init))
+        shutil.copy(os.path.join(TOOLS, "reimu-hostd.init"), self.init)
+        os.makedirs(os.path.dirname(self.lib()))
+        open(self.lib(), "w").close()
+        self.env["REIMU_SH"] = self.SHELL
+
+    def do(self, action, env=None):
+        return sh(self.SHELL.split() + [self.init, action], env=env or self.env, timeout=40)
+
+    def wait_agents(self, n, not_in=(), secs=10):
+        end = time.time() + secs
+        while time.time() < end:
+            a = [x for x in self.agents() if x not in not_in]
+            if len(a) == n:
+                return a
+            time.sleep(0.1)
+        self.fail("agents: %r, wanted %d" % (self.agents(), n))
+
+    def loops(self):
+        return _alive_with(self.init + " _loop")
+
+    def test_lsb_header(self):
+        t = open(self.init).read()
+        for k in ("### BEGIN INIT INFO", "# Provides: reimu-hostd", "# Default-Start:", "# Default-Stop:", "### END INIT INFO",
+                  "# chkconfig:"):
+            self.assertIn(k, t)
+        self.assertTrue(t.startswith("#!/bin/sh\n"))
+
+    def test_start_status_stop(self):
+        self.assertEqual(self.do("status")[0], 3)
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        self.wait_agents(1)
+        self.assertEqual(len(self.loops()), 1)
+        rc, out = self.do("status")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(open(self.p("var/run/reimu-hostd.pid")).read().strip(), str(self.loops()[0]))
+        rc, out = self.do("stop")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.agents(), [])
+        self.assertEqual(self.loops(), [])
+        self.assertIn("restore", open(self.p("restore.log")).read(), "stop: the GPU fan to the driver")
+        self.assertFalse(os.path.exists(self.p("var/run/reimu-hostd.pid")))
+        self.assertEqual(self.do("status")[0], 3)
+        self.assertEqual(self.do("stop")[0], 0, "stopped again: fine")
+
+    def test_double_start_one_copy(self):
+        self.do("start")
+        first = self.wait_agents(1)
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        time.sleep(1.5)
+        self.assertEqual(self.agents(), first)
+        self.assertEqual(len(self.loops()), 1)
+
+    def test_concurrent_starts_one_copy(self):
+        ps = [subprocess.Popen(self.SHELL.split() + [self.init, "start"], env=self.env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) for _ in range(6)]
+        for x in ps:
+            x.wait(40)
+        self.wait_agents(1)
+        time.sleep(1.5)
+        self.assertEqual(len(self.agents()), 1)
+        self.assertEqual(len(self.loops()), 1)
+
+    def test_restart(self):
+        self.do("start")
+        first = self.wait_agents(1)
+        rc, out = self.do("restart")
+        self.assertEqual(rc, 0, out)
+        self.wait_agents(1, not_in=first)
+        self.assertEqual(len(self.agents()), 1)
+        self.assertEqual(len(self.loops()), 1)
+
+    def test_agent_dies_and_comes_back(self):
+        self.do("start")
+        first = self.wait_agents(1)
+        os.kill(first[0], 9)
+        new = self.wait_agents(1, not_in=first)
+        self.assertNotEqual(new, first)
+        self.assertIn("restore", open(self.p("restore.log")).read(), "restore-auto between the runs")
+        self.assertEqual(open(self.p("var/run/reimu-hostd.agent.pid")).read().strip(), str(new[0]))
+        self.assertEqual(self.do("status")[0], 0)
+
+    def test_stale_pidfile_of_someone_else(self):
+        os.makedirs(self.p("var/run"))
+        other = subprocess.Popen(["sleep", "30"])
+        try:
+            open(self.p("var/run/reimu-hostd.pid"), "w").write("%d\n" % other.pid)
+            open(self.p("var/run/reimu-hostd.agent.pid"), "w").write("%d\n" % other.pid)
+            self.assertEqual(self.do("status")[0], 1, "a dead service with its pidfile")
+            rc, out = self.do("start")
+            self.assertEqual(rc, 0, out)
+            self.wait_agents(1)
+            self.assertIsNone(other.poll(), "not ours: not killed")
+            self.do("stop")
+            self.assertIsNone(other.poll())
+        finally:
+            other.kill()
+            other.wait()
+
+    def test_stale_lock(self):
+        os.makedirs(self.p("var/run/reimu-hostd.lock"))
+        open(self.p("var/run/reimu-hostd.lock/pid"), "w").write("999999\n")
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        self.wait_agents(1)
+
+    def test_supervisor_killed_orphan_agent_no_second_copy(self):
+        self.do("start")
+        first = self.wait_agents(1)
+        os.kill(self.loops()[0], 9)
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        new = self.wait_agents(1, not_in=first)
+        time.sleep(0.5)
+        self.assertEqual(self.agents(), new, "the orphan gone")
+
+    def test_stop_kills_a_stubborn_agent(self):
+        p = os.path.join(self.pybin, "python3")
+        open(p, "w").write(FAKE_PY.replace("trap 'exit 0' TERM", "trap '' TERM"))
+        self.env["REIMU_STOP_SEC"] = "2"
+        self.do("start")
+        self.wait_agents(1)
+        rc, out = self.do("stop")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.agents(), [])
+        self.assertEqual(self.loops(), [])
+
+    def test_term_to_the_loop_stops_the_agent(self):
+        self.do("start")
+        self.wait_agents(1)
+        os.kill(self.loops()[0], 15)
+        self.wait_agents(0)
+        end = time.time() + 5
+        while self.loops() and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual(self.loops(), [])
+        self.assertIn("restore", open(self.p("restore.log")).read())
+
+    def test_log_kept_small(self):
+        log = self.p("var/log/reimu-hostd.log")
+        os.makedirs(os.path.dirname(log))
+        open(log + ".1", "w").write("older\n")
+        with open(log, "wb") as f:
+            f.write(b"x" * (1024 * 1024 + 1))
+        self.do("start")
+        self.wait_agents(1)
+        time.sleep(0.3)
+        self.assertEqual(os.path.getsize(log + ".1"), 1024 * 1024 + 1)
+        self.assertLess(os.path.getsize(log), 1000)
+        self.assertIn("connected", open(log).read())
+
+    def test_small_log_appended(self):
+        log = self.p("var/log/reimu-hostd.log")
+        os.makedirs(os.path.dirname(log))
+        open(log, "w").write("before\n")
+        self.do("start")
+        self.wait_agents(1)
+        time.sleep(0.3)
+        self.assertTrue(open(log).read().startswith("before\n"))
+        self.assertFalse(os.path.exists(log + ".1"))
+
+    def test_without_setsid(self):
+        d = bin_without(("systemctl", "journalctl", "setsid"))
+        self.env["PATH"] = self.pybin + ":" + d
+        rc, out = self.do("start")
+        self.assertEqual(rc, 0, out)
+        self.wait_agents(1)
+        self.assertEqual(self.do("stop")[0], 0)
+        self.assertEqual(self.agents(), [])
+
+    def test_with_setsid_its_own_session(self):
+        self.do("start")
+        self.wait_agents(1)
+        loop = self.loops()[0]
+        self.assertEqual(os.getsid(loop), loop)
+
+    def test_no_python_says_so(self):
+        d = bin_without(("python3", "systemctl", "journalctl"))
+        self.env["PATH"] = d
+        rc, out = sh("PATH=%s; export PATH; %s %s start" % (d, self.SHELL, self.init), env=self.env)
+        self.assertEqual(rc, 5, out)
+        self.assertIn("python3", out)
+
+    def test_syntax(self):
+        rc, out = sh(self.SHELL.split() + ["-n", self.init])
+        self.assertEqual(rc, 0, out)
+
+    def test_unknown_action(self):
+        rc, out = self.do("frobnicate")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("start", out)
+
+
+class InitScriptDash(InitScript):
+    SHELL = "dash"
+
+
+class InitScriptBashPosix(InitScript):
+    SHELL = "bash --posix"
+
+
+class InitScriptBusybox(InitScript):
+    SHELL = "busybox sh"
 
 
 if __name__ == "__main__":

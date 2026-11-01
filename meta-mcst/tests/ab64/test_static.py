@@ -682,6 +682,34 @@ def _(ctx):
     sub(ctx, REIMU_AB, """        [ "$(sha256sum < "$d/$f.bin" | cut -d' ' -f1)" = "$want" ] || die "$d/$f.bin: damaged (SHA256SUMS)"\n""", "")
 
 
+DTS_5564 = "meta-mcst/meta-ab64/recipes-kernel/linux/linux-aspeed/aspeed-bmc-mcst-reimu-5564.dts"
+
+
+@check("S68", 68, "no eth1 on REIMU-5564: MAC2 has no PHY, all 32 MDIO addresses read 0x0000ffff, a fake link and a stuck TX queue")
+def s68(ctx):
+    t = ctx.src(DTS_5564)
+    return re.search(r'&mac1\s*\{\s*status\s*=\s*"disabled"', t) is not None, "mac1 in the device tree"
+
+
+@mutant("S68", "mac1 enabled again")
+def _(ctx):
+    sub(ctx, DTS_5564, '&mac1 { status = "disabled"; };', '&mac1 { status = "okay"; };')
+
+
+FROM_STOCK = "meta-mcst/tools/ab64/reimu-ab-from-stock"
+
+
+@check("S70", 70, "from-stock: the RAM firmware answers with the board's ssh host keys (no REMOTE HOST IDENTIFICATION HAS CHANGED)")
+def s70(ctx):
+    t = ctx.src(FROM_STOCK)
+    return "hostkeys.tar" in t and "-C /etc/ssh" in t, "host keys carried over"
+
+
+@mutant("S70", "host keys not put back")
+def _(ctx):
+    sub(ctx, FROM_STOCK, """r 'tar -xf - -C /etc/ssh' < "$w/hostkeys.tar"\n""", "")
+
+
 @check("S65", 65, "hwmon-instantiator doesn't instantiate the EMC2305 (reimu-fand owns it over i2c-dev, the 6.18 driver's probe would zero its PWM setup)")
 def s65(ctx):
     t = ctx.src("meta-mcst/meta-common/recipes-mcst/hwmon-instantiator/files/hwmon-instantiator.c")
@@ -889,6 +917,17 @@ FAND_MUTANTS = [
     ("35c", "fand.c", "double valid = o->tach_mode_ok ? fmax(c->tach_valid_duty, 0) : c->tach_valid_duty_other;",
      "double valid = 0;", "the tachometer trusted at any duty (its dropouts below 50 % taken as a stopped fan)"),
     ("35d", "fand.c", "    c->tach_mode = 2;\n", "    c->tach_mode = 3;\n", "TACH_MODE left at 11 (least effect), not 10 (accurate)"),
+    ("35e", "fand.c", "        f->on_since_hint = -1;\n        if (f->phase != PH_OFF) enter_off(f);",
+     "        if (f->phase != PH_OFF) enter_off(f);", "bug 74: the run file's on-since survives a host seen off: no settle at the next power-on"),
+    ("35f", "fand.c", "if (c->emc_watchdog && c->poll_ms > 3000)", "if (0)", "bug 75: POLL_MS over the EMC2305 watchdog's 4 s accepted"),
+    ("35g", "fand.c", "if (!hw_wr_byte(b, a, r, val) && hw_rd_byte(b, a, r) == val) return 0;", "{ hw_wr_byte(b, a, r, val); return 0; }",
+     "bug 76: the fail-safe's duty writes neither read back nor retried"),
+    ("35h", "fand.c", "for (int k = 0; k < 3 && (cfg & 0x30) != 0x20 && fs_retry(k); k++)", "for (int k = 0; k < 1 && (cfg & 0x30) != 0x20 && fs_retry(k); k++)",
+     "bug 76: the fail-safe's write of 0x4A not retried"),
+    ("35i", "fand.c", "            raw = 0;\n", "", "bug 76: a polarity bit that can't be cleared: full scale, the fan stopped"),
+    ("35j", "fand.c", "cfg = rb >= 0 ? rb : wr ? cfg : want;", "cfg = rb >= 0 ? rb : cfg;", "bug 76: 0x4A written, not read back: taken as inverted, the fan stopped by a 0"),
+    ("35k", "fand.c", "return hw_now_ms() < (k ? s_fs_chip_end : s_fs_hard_end);", "return 1;", "bug 76: the fail-safe not limited in time (18 s on dead buses, TimeoutStopSec=15)"),
+    ("35l", "fand.c", 'fand_log(3, "fail-safe: fan %d-%04x: PWPGM', 'fand_log(5, "fail-safe: fan %d-%04x: PWPGM', "bug 76: PWPGM that can't be set not said at error level"),
 ]
 
 
@@ -915,6 +954,106 @@ for _id, _f, _old, _new, _what in FAND_MUTANTS:
     def _m(ctx, f=_f, old=_old, new=_new):
         ctx.fand_mutant = (f, old, new)
     next(c for c in CHECKS if c[0] == "S35")[4].append(("%s: %s" % (_id, _what), _m))
+
+
+# ------------------------------------------------------------------ native tests of the power code
+SERVER_CTL = "meta-mcst/meta-common/recipes-mcst/buttonscripts/files/server_ctl.c"
+UNIT = os.path.join(HERE, "unit")
+
+
+def unit_test(ctx, test, rel, *libs):
+    """tests/ab64/unit/test against the file rel (as a mutant may have it), under ASan/UBSan"""
+    if not shutil.which("gcc") or not os.path.exists(os.path.join(LIBREIMU_SRC, "reimu.h")):
+        raise Skip("no gcc, or no libreimu source (--libreimu-src) for reimu.h")
+    w = os.path.join(TMP, "unit-" + test)
+    shutil.rmtree(w, ignore_errors=True)
+    os.makedirs(w)
+    open(os.path.join(w, os.path.basename(rel)), "w").write(ctx.src(rel))
+    r = cc("-g", "-O1", "-fsanitize=address,undefined", "-I", w, "-I", os.path.join(UNIT, "stubs"), "-I", LIBREIMU_SRC,
+           "-o", os.path.join(w, "t"), os.path.join(UNIT, test + ".c"), *libs)
+    if r.returncode:
+        return False, "doesn't build: " + r.stderr[-300:]
+    r = subprocess.run([os.path.join(w, "t")], capture_output=True, text=True, timeout=120,
+                       env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0"))
+    fails = [re.sub(r"^.*?\.c:", "", l.strip()) for l in r.stdout.splitlines() if "FAIL" in l]
+    summary = (r.stdout.strip().splitlines() or [r.stderr[-200:]])[-1]
+    return r.returncode == 0 and not fails, "%s%s" % (summary[:120], ("; " + " | ".join(fails[:3])[:300]) if fails else "")
+
+
+@check("S71", 71, "server_ctl (unit/test_server_ctl.c): a power-off press looks at power good again after the lock; the long press polls it, released at its drop, 5 s at the most")
+def s71(ctx):
+    return unit_test(ctx, "test_server_ctl", SERVER_CTL)
+
+
+@mutant("S71", "off host pressed after the lock wait")
+def _(ctx):
+    sub(ctx, SERVER_CTL, "if (off_only && (power_state == 0))", "if (0)")
+
+
+@mutant("S71", "power good unknown after the lock: pressed")
+def _(ctx):
+    sub(ctx, SERVER_CTL, "if (off_only && (power_state < 0)) return power_state;", "")
+
+
+@mutant("S71", "held on after power good dropped")
+def _(ctx):
+    sub(ctx, SERVER_CTL, "if (good == 0)", "if (0)")
+
+
+@mutant("S71", "the press past its limit: no deadline")
+def _(ctx):
+    sub(ctx, SERVER_CTL, "long long left = start + delay - monotonic_ms();", "long long left = start + delay + 1000 - monotonic_ms();")
+    sub(ctx, SERVER_CTL, "        if (monotonic_ms() >= start + delay) break;\n", "")
+
+
+@check("S72", 72, "overheatd (unit/test_ladder.c): no action while the last run's press holds the button line, none lost, not kept out for good")
+def s72(ctx):
+    ok, detail = unit_test(ctx, "test_ladder", OHD, "-lfdt")
+    wired = re.search(r"\n\s*button_release\(\);\s*\n\s*ladder_load\(\);", ctx.src(OHD)) is not None
+    return ok and wired, detail + ("" if wired else "; the line not looked at on start")
+
+
+@mutant("S72", "started with the line busy")
+def _(ctx):
+    sub(ctx, OHD, "    if (button_busy())\n", "    if (0)\n")
+
+
+@mutant("S72", "busy not noted")
+def _(ctx):
+    sub(ctx, OHD, "        s_button_busy = 1;\n", "")
+
+
+@mutant("S72", "not looked at on start")
+def _(ctx):
+    sub(ctx, OHD, "    button_release();\n    ladder_load();", "    ladder_load();")
+
+
+@mutant("S72", "a busy line keeps the protection out for good")
+def _(ctx):
+    sub(ctx, OHD, "(monotonic_sec() - s_button_busy_since <= ACTION_TIMEOUT_SEC) && ", "")
+
+
+@check("S73", 73, "overheatd (unit/test_ladder.c): \"cooled\" in the graceful state only from real readings")
+def s73(ctx):
+    ok, detail = unit_test(ctx, "test_ladder", OHD, "-lfdt")
+    src = ctx.src(OHD)
+    wired = "known = monitored > 0;" in src and "ladder_step(real_power, known, " in src
+    return ok and wired, detail + ("" if wired else "; known not from the readings of the poll")
+
+
+@mutant("S73", "cooled from the polls since the start, as before")
+def _(ctx):
+    sub(ctx, OHD, "s_known_polls = known ? s_known_polls + 1 : 0;", "++s_known_polls;")
+
+
+@mutant("S73", "cooled with the first reading")
+def _(ctx):
+    sub(ctx, OHD, "else if (s_known_polls > LADDER_CONFIRM_POLLS * 2)", "else if (known)")
+
+
+@mutant("S73", "known not from the readings")
+def _(ctx):
+    sub(ctx, OHD, "known = monitored > 0;", "known = 1;")
 
 
 # ------------------------------------------------------------------ run

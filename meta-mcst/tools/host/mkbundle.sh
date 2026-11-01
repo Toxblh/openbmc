@@ -3,7 +3,8 @@
 # reimu-agent-bundle runs it at build time; tests/test_install_sh.py too):
 #   OUT/agent/      install.sh (the SHA-256 of the files written into it),
 #                   reimu-hostd.py, reimu-hostd.service, reimu-hostd.conf,
-#                   SHA256SUMS, README.txt         -> /usr/share/www/agent/
+#                   reimu-hostd.init, SHA256SUMS, README.txt
+#                                                  -> /usr/share/www/agent/
 #   --disk: OUT/disk.img  a FAT12 image «REIMU-AGENT» (1 MiB) with the same
 #                   files and PAIRING.TXT, 512 bytes of placeholder: the BMC's
 #                   reimu-agent-disk writes the pairing string over them at
@@ -13,7 +14,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$1
 DISK=${2:-}
-FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf"
+FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init"
 A=$OUT/agent
 mkdir -p "$A"
 for f in $FILES; do

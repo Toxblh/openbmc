@@ -14,6 +14,70 @@
 
 #include "fand.h"
 
+/* the transfers of fand.c (-Wl,--wrap, see the Makefile): faults put in, and the
+ * time they take, simulated: a transfer on a dead bus takes its ~1.5 s */
+int __real_hw_rd_byte(int bus, int addr, int reg);
+int __real_hw_wr_byte(int bus, int addr, int reg, int val);
+static struct fault {
+    int bus, addr, reg;  /* writes to it ...: */
+    int lose;            /* ... this many are lost, acknowledged */
+    int nak;             /* ... this many are refused */
+    int stick;           /* these bits of 0x4A can't be cleared */
+    int lock;            /* 0x4A takes no write at all, acknowledged */
+    int rd_fail_from;    /* reads of it fail after this many, -1: never */
+    int dead_bus;        /* every transfer: fails, in 1.5 s; -2: all of them */
+    int dead_wr_bus;     /* every write: the same */
+    int hang_rest;       /* every transfer but the ID registers and the first reads of 0x4A: the same */
+} I;
+static int64_t s_hw_ms;
+int64_t __wrap_hw_now_ms(void) { return s_hw_ms; }
+static void no_faults(void)
+{
+    memset(&I, 0, sizeof(I));
+    I.bus = I.dead_bus = I.dead_wr_bus = -1;
+    I.rd_fail_from = -1;
+}
+int __wrap_hw_rd_byte(int bus, int addr, int reg)
+{
+    s_hw_ms += 1;
+    if (I.dead_bus == -2 || bus == I.dead_bus || (I.hang_rest && reg < 0xfd && reg != 0x4a))
+    {
+        s_hw_ms += 1500;
+        return -1;
+    }
+    if (bus == I.bus && addr == I.addr && reg == I.reg && I.rd_fail_from >= 0 && I.rd_fail_from-- == 0)
+    {
+        I.rd_fail_from = 0;
+        return -1;
+    }
+    return __real_hw_rd_byte(bus, addr, reg);
+}
+int __wrap_hw_wr_byte(int bus, int addr, int reg, int val)
+{
+    s_hw_ms += 1;
+    if (I.dead_bus == -2 || bus == I.dead_bus || bus == I.dead_wr_bus || I.hang_rest)
+    {
+        s_hw_ms += 1500;
+        return -1;
+    }
+    if (bus == I.bus && addr == I.addr && reg == I.reg)
+    {
+        if (I.nak > 0)
+        {
+            I.nak--;
+            return -1;
+        }
+        if (I.lose > 0)
+        {
+            I.lose--;
+            return 0;
+        }
+        if (I.lock) return 0;
+        if (reg == 0x4a) val |= I.stick;
+    }
+    return __real_hw_wr_byte(bus, addr, reg, val);
+}
+
 static int s_fail, s_pass;
 static char R[200]; /* the fake root */
 static int64_t T;   /* simulated ms */
@@ -1447,6 +1511,180 @@ static void t_reload(void)
     CHECK(!f.z[Z_CPU].failsafe, "back");
 }
 
+/* an observed Off: what the run file said about the host is over */
+static void t_on_since_hint(void)
+{
+    struct fand f;
+    struct config c = cfg_test();
+    board();
+    T = 1000000;
+    fand_init(&f, &c, T);
+    f.on_since_hint = T - 100000;
+    run(&f, 5, HOST_OFF);
+    run(&f, 1, HOST_ON);
+    CHECK(f.phase == PH_SETTLE, "the host seen off, then on: it settles (phase %d)", f.phase);
+
+    fand_init(&f, &c, T);
+    f.on_since_hint = T - 100000;
+    run(&f, 1, HOST_PENDING);
+    run(&f, 1, HOST_ON);
+    CHECK(f.phase == PH_RUN, "not known yet, then on: the hint counts (phase %d)", f.phase);
+}
+
+/* the EMC2305 watchdog fires at 4 s */
+static void t_poll_watchdog(void)
+{
+    struct config c;
+    char err[FAND_MAX_ERR][128];
+    cfg_defaults(&c);
+    int n = cfg_parse(&c, "POLL_MS=5000\n", err, FAND_MAX_ERR);
+    CHECK(n >= 1 && c.poll_ms == 3000 && strstr(err[0], "POLL_MS"), "POLL_MS over 3 s with the watchdog: an error, 3000 (%d, %d)", n, c.poll_ms);
+    CHECK(c.stale_ms >= 2 * c.poll_ms, "... the stale rule holds (%d)", c.stale_ms);
+    cfg_defaults(&c);
+    n = cfg_parse(&c, "POLL_MS=3001\nSTALE_SEC=10\n", err, FAND_MAX_ERR);
+    CHECK(n == 1 && c.poll_ms == 3000 && c.stale_ms == 10000, "3001: 3000 (%d, %d)", n, c.poll_ms);
+    cfg_defaults(&c);
+    n = cfg_parse(&c, "POLL_MS=3000\nSTALE_SEC=10\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && c.poll_ms == 3000, "3000 is fine (%d)", n);
+    cfg_defaults(&c);
+    n = cfg_parse(&c, "POLL_MS=5000\nSTALE_SEC=10\nEMC_WATCHDOG=no\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && c.poll_ms == 5000, "no watchdog: 5000 stays (%d, %d)", n, c.poll_ms);
+}
+
+/* run fand_failsafe, what it logged in *log */
+static int64_t failsafe_logged(const struct config *c, char *log, size_t size)
+{
+    char file[300];
+    snprintf(file, sizeof(file), "%s.log", R);
+    fflush(stderr);
+    int save = dup(2), fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || dup2(fd, 2) < 0) abort();
+    close(fd);
+    int q = fand_quiet;
+    fand_quiet = 0;
+    int64_t t0 = s_hw_ms;
+    fand_failsafe(c);
+    int64_t took = s_hw_ms - t0;
+    fand_quiet = q;
+    fflush(stderr);
+    dup2(save, 2);
+    close(save);
+    fd = open(file, O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, log, size - 1);
+    log[n > 0 ? n : 0] = 0;
+    if (fd >= 0) close(fd);
+    unlink(file);
+    return took;
+}
+
+static void t_failsafe_verify(void)
+{
+    struct config c = cfg_test();
+    char log[2000];
+
+    /* the corrupted state seen on the board, the write of 0x4A refused once */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.nak = 1;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == 46, "0x4A refused once: retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
+
+    /* acknowledged and lost, twice */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.lose = 2;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == 46, "0x4A lost twice: read back, retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
+
+    /* the duty itself */
+    board();
+    no_faults();
+    setreg(6, 0x4c, 0x4c, 5);
+    I.bus = 6, I.addr = 0x4c, I.reg = 0x4c, I.lose = 2;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(reg(6, 0x4c, 0x4c) == 46, "0x4C lost twice: retried (%d)", reg(6, 0x4c, 0x4c));
+    CHECK(!strstr(log, "<3>"), "... nothing to report: %s", log);
+
+    /* an EMC2305 channel */
+    board();
+    no_faults();
+    setreg(2, 0x2c, 0x50, 5);
+    I.bus = 2, I.addr = 0x2c, I.reg = 0x50, I.nak = 2;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(all_full(), "an EMC2305 channel refused twice: retried (%d)", reg(2, 0x2c, 0x50));
+
+    /* never takes it: said, the others done */
+    board();
+    no_faults();
+    I.bus = 2, I.addr = 0x2c, I.reg = 0x40, I.nak = 1000;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(strstr(log, "<3>") && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x2c, 0x50) == 0xff && reg(2, 0x2e, 0x40) == 0xff,
+          "an EMC2305 channel refused for good: an error, the rest 100%% (%s)", log);
+
+    /* the polarity bit can't be cleared: inverted, full scale is 0 */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    setreg(2, 0x4c, 0x4c, 5);
+    I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.stick = 0x10;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK((reg(2, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == 0, "polarity stuck: 0x4C 0, full with it inverted (%d)", reg(2, 0x4c, 0x4c));
+    CHECK(strstr(log, "<3>") != NULL, "... said at error level: %s", log);
+
+    /* ... but only when it was seen: written, then 0x4A unreadable must not stop the fan */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.rd_fail_from = 1;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) != 0, "cleared, not read back: no 0 written (%d)", reg(2, 0x4c, 0x4c));
+
+    /* PWPGM can't be set: the chip runs its lookup table */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4a, 0x0b);
+    I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.lock = 1;
+    failsafe_logged(&c, log, sizeof(log));
+    CHECK(strstr(log, "<3>") && strstr(log, "PWPGM"), "PWPGM not set: said at error level: %s", log);
+
+    /* time: a dead bus doesn't keep the others out, and the unit's TimeoutStopSec=15 */
+    board();
+    no_faults();
+    setreg(2, 0x4c, 0x4c, 5);
+    setreg(2, 0x2c, 0x30, 5);
+    setreg(2, 0x2e, 0x30, 5);
+    I.dead_bus = 6;
+    int64_t took = failsafe_logged(&c, log, sizeof(log));
+    CHECK(reg(2, 0x4c, 0x4c) == 46 && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x2e, 0x30) == 0xff && took <= 3000,
+          "the CPU fan's bus dead: the others 100%%, %lld ms", (long long)took);
+
+    board();
+    no_faults();
+    I.dead_bus = -2;
+    took = failsafe_logged(&c, log, sizeof(log));
+    CHECK(took <= 7500, "every bus dead: %lld ms", (long long)took);
+
+    board();
+    no_faults();
+    setreg(6, 0x4c, 0x4a, 0x3b);
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    I.dead_wr_bus = 2;
+    took = failsafe_logged(&c, log, sizeof(log));
+    CHECK(took <= 9000 && reg(6, 0x4c, 0x4c) == 46, "every write on bus 2 hanging: %lld ms, the CPU fan done", (long long)took);
+
+    /* the worst there is: each chip answers its ID, then each transfer hangs */
+    board();
+    no_faults();
+    setreg(6, 0x4c, 0x4a, 0x3b);
+    setreg(2, 0x4c, 0x4a, 0x3b);
+    I.hang_rest = 1;
+    took = failsafe_logged(&c, log, sizeof(log));
+    CHECK(took <= 10500, "every transfer hanging after the ID: %lld ms (TimeoutStopSec=15)", (long long)took);
+    no_faults();
+}
+
 static void t_json(void)
 {
     struct fand f;
@@ -1480,12 +1718,14 @@ int main(void)
 {
     snprintf(R, sizeof(R), "%s/fand-test-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", getpid());
     setenv("REIMU_FAND_FAKE", R, 1);
+    no_faults();
     fand_quiet = getenv("VERBOSE") == NULL;
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "curves", t_curves }, { "config", t_config }, { "host", t_host }, { "hysteresis_slew", t_hysteresis_slew },
         { "failsafe_inputs", t_failsafe_inputs }, { "outputs", t_outputs }, { "tach", t_tach }, { "manual", t_manual },
         { "reload", t_reload }, { "json", t_json }, { "fan_model", t_fan_model }, { "fan_range", t_fan_range },
         { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu }, { "guard", t_guard },
+        { "on_since_hint", t_on_since_hint }, { "poll_watchdog", t_poll_watchdog }, { "failsafe_verify", t_failsafe_verify },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {

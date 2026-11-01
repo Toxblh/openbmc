@@ -4,7 +4,7 @@
 // ("NAME BASE64") after the line #__REIMU_PAYLOAD__. install.sh checks them
 // against the SHA-256 written into it at the BMC's build, as it checks
 // downloaded ones; the shell never reads past install.sh's own block.
-export const AGENT_FILES = ["reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf"];
+export const AGENT_FILES = ["reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf", "reimu-hostd.init"];
 const PAIR_RE = /^reimu1:[A-Za-z0-9_-]{16,2000}$/;
 const SLOT = "\nREIMU_PAIR_DEFAULT=''\n";
 

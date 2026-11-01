@@ -56,6 +56,9 @@ for n in "ethaddr 1e660000" "eth1addr 1e680000"; do
     for f in fdt fdt-ro; do fdtput -t bx "$w/$f" /ahb/ethernet@${n#* } local-mac-address $mac; done
     echo "${n% *}: $(fdtget -t bx "$w/fdt" /ahb/ethernet@${n#* } local-mac-address)"
 done
+# the board's ssh host keys: the new firmware in RAM answers with them too, or
+# plain ssh to it fails with "REMOTE HOST IDENTIFICATION HAS CHANGED"
+r 'cd /etc/ssh && tar -cf - ssh_host_*' > "$w/hostkeys.tar"
 r 'rm -rf /tmp/ab && mkdir -p /tmp/ab'
 for f in zImage fdt fdt-ro initrd kexec; do put "$w/$f" /tmp/ab/$f; done
 r 'chmod +x /tmp/ab/kexec'
@@ -101,6 +104,7 @@ sleep 15
 wait_up
 say "new firmware: $(r 'uname -r; cat /run/initramfs/reimu-ab; sed -n s/^VERSION_ID=//p /etc/os-release' | tr '\n' ' ')"
 r 'grep -qw '"$extra"' /proc/cmdline' || { echo "not the new firmware?" >&2; exit 1; }
+r 'tar -xf - -C /etc/ssh' < "$w/hostkeys.tar"
 if [ -s "$w/volatile.tar" ]; then
     put "$w/volatile.tar" /tmp/volatile.tar
     r 'tar -xf /tmp/volatile.tar -C /var/volatile && systemctl restart hwmon-instantiator' &&

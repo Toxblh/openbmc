@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "fand.h"
@@ -258,6 +259,13 @@ static int smbus(int fd, char rw, uint8_t cmd, int size, union i2c_smbus_data *d
 {
     struct i2c_smbus_ioctl_data a = { rw, cmd, size, d };
     return ioctl(fd, I2C_SMBUS, &a);
+}
+
+int64_t hw_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
 }
 
 int hw_rd_byte(int bus, int addr, int reg)

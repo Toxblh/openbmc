@@ -81,7 +81,7 @@ def main():
     r = K.sh("mount -o ro /dev/%s %s" % (blk, MNT), check=False)
     check(r.returncode == 0, "mount -o ro: %s" % r.stderr.strip())
     names = sorted(os.listdir(MNT))
-    check(names == sorted(["PAIRING.TXT", "README.txt", "install.sh", "reimu-hostd.conf", "reimu-hostd.py", "reimu-hostd.service"]),
+    check(names == sorted(["PAIRING.TXT", "README.txt", "install.sh", "reimu-hostd.conf", "reimu-hostd.init", "reimu-hostd.py", "reimu-hostd.service"]),
           "files: %s" % names)
     check(open(MNT + "/PAIRING.TXT").read().split("\n")[0].strip() == s, "PAIRING.TXT: the pairing string")
     check(open(MNT + "/install.sh", "rb").read() == open(AD + "/agent/install.sh", "rb").read(), "install.sh as the BMC serves it")

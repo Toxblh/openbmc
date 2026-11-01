@@ -17,6 +17,7 @@ SRC_URI = " \
             file://reimu-hostd.py \
             file://reimu-hostd.service \
             file://reimu-hostd.conf \
+            file://reimu-hostd.init \
             file://install.sh \
             file://mkbundle.sh \
             file://agent-README.txt \

@@ -190,7 +190,9 @@ void fand_init(struct fand *f, const struct config *c, int64_t now);
 void fand_reconfig(struct fand *f, const struct config *c);
 void fand_step(struct fand *f, int64_t now, int host);
 /* every configured fan to 100 %, as fast as possible (exit, crash) */
-void fand_failsafe(const struct config *c);
+/* every fan to 100 %: the number of faults left (each logged), chips that don't
+ * answer aren't any: they are unpowered with the host */
+int fand_failsafe(const struct config *c);
 /* 1: a platform device answers (the platform is powered) */
 int fand_probe(const struct config *c);
 int fand_set_mode(struct fand *f, int zone, int mode, char *err, size_t n);
@@ -231,6 +233,7 @@ void fand_log(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3
 /* ---- hardware (fand-hw.c). REIMU_FAND_FAKE=<dir>: devices are register
  * files <dir>/i2c-<bus>/<addr, 2 hex digits> (256 bytes; a plain 2-byte
  * read gives bytes 0, 1), the LED <dir>/leds/<name>/{trigger,brightness} */
+int64_t hw_now_ms(void); /* monotonic */
 int hw_rd_byte(int bus, int addr, int reg);
 int hw_wr_byte(int bus, int addr, int reg, int val);
 int hw_rd_word(int bus, int addr, int reg);

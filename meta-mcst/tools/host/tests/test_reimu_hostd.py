@@ -6,7 +6,7 @@
 Nothing of the machine it runs on is read or written: every path goes through
 the agent's Fs(root) and every command through a recording fake runner.
 """
-import gzip
+import gzip, subprocess
 import base64
 import time, importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
 
@@ -435,8 +435,8 @@ class TestMetrics(Base):
 class TestGpuFan(Base):
     HW = GPU_DEV + "/hwmon/hwmon2"
 
-    def fan(self, floor=30):
-        return hd.GpuFan(self.fs, floor=floor)
+    def fan(self, floor=30, **kw):
+        return hd.GpuFan(self.fs, floor=floor, **kw)
 
     def hw(self, k):
         return self.t.get(self.HW + "/" + k)
@@ -526,8 +526,65 @@ class TestGpuFan(Base):
         self.assertEqual(self.t.get(GPU_DEV + "/hwmon/hwmon6/pwm1_enable"), "1")
         self.assertEqual([e["kind"] for e in ev], ["gpu_fan_reapplied"])
 
-    def test_link_lost_returns_to_auto(self):
+    def lost(self, duty=30, **kw):
+        f = self.fan(**kw)
+        f.set_policy("manual", duty)
+        f.tick(0, True)
+        return f
+
+    def test_link_lost_holds_the_floor(self):
+        """the idle driver stops the fan (0 rpm): the IOHUB behind the card went to 86 C"""
+        f = self.lost(30)
+        ev = f.tick(61, False)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", "102"))
+        self.assertEqual([e["kind"] for e in ev], ["gpu_fan_floor_link_lost"])
+        self.assertEqual(f.tick(70, False), [])
+
+    def test_link_lost_keeps_a_higher_duty(self):
+        f = self.lost(60)
+        f.tick(61, False)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", "153"))
+
+    def test_link_lost_hot_card_to_the_driver_and_back(self):
+        f = self.lost(40)
+        self.t.put(self.HW + "/temp1_input", "71000")
+        ev = f.tick(61, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+        self.assertEqual([e["kind"] for e in ev], ["gpu_fan_auto_link_lost"])
+        self.t.put(self.HW + "/temp1_input", "65000")  # between: stays the driver's
+        f.tick(70, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+        self.t.put(self.HW + "/temp1_input", "59000")
+        f.tick(80, False)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", "102"))
+
+    def test_link_lost_no_temperature_to_the_driver(self):
+        f = self.lost(40)
+        os.unlink(self.t.p(self.HW + "/temp1_input"))
+        f.tick(61, False)
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+
+    def test_link_lost_auto_policy_stays_the_drivers(self):
         f = self.fan()
+        f.set_policy("auto")
+        f.tick(0, True)
+        f.tick(61, False)
+        self.assertNotEqual(self.hw("pwm1_enable"), "1")
+
+    def test_link_back_after_the_floor(self):
+        f = self.lost(30)
+        f.tick(61, False)
+        f.tick(70, True)
+        self.assertEqual((self.hw("pwm1_enable"), self.hw("pwm1")), ("1", "77"))
+
+    def test_agent_stop_after_the_floor_gives_it_back(self):
+        f = self.lost(30)
+        f.tick(61, False)
+        f.restore_auto("stop")
+        self.assertEqual(self.hw("pwm1_enable"), "2")
+
+    def test_link_lost_returns_to_auto(self):
+        f = self.fan(link_lost_duty=0)
         f.set_policy("manual", 40)
         f.tick(0, True)
         ev = f.tick(61, False)
@@ -539,7 +596,7 @@ class TestGpuFan(Base):
 
     def test_link_lost_restore_retried_after_a_failed_write(self):
         """review: pwm1_enable=2 failing once on link loss was never retried"""
-        f = self.fan()
+        f = self.fan(link_lost_duty=0)
         f.set_policy("manual", 40)
         f.tick(0, True)
         real, fails = f.fs.write, [1]
@@ -1210,6 +1267,388 @@ class TestBusOwner(Base):
         text = "\n".join(msgs)
         self.assertIn("ir38064", text)
         self.assertIn("make-initrd", text)
+
+
+# ------------------------------------------------------------------ SysV init
+class SysvBase(Base):
+    def setUp(self):
+        super().setUp()
+        self._was = os.environ.get("REIMU_INIT")
+        os.environ["REIMU_INIT"] = "sysv"
+        hd.BusOwner.SETTLE = 0
+        self.cfg = hd.parse_config("")
+        self.logged = []
+        hd._logger = self.logged.append
+
+    def tearDown(self):
+        hd._logger = None
+        if self._was is None:
+            del os.environ["REIMU_INIT"]
+        else:
+            os.environ["REIMU_INIT"] = self._was
+        super().tearDown()
+
+    def pwmd_script(self, level="/etc/rc3.d", prio="S20"):
+        self.t.put("/etc/init.d/pwmd", "#!/bin/sh\n")
+        if level:
+            os.makedirs(self.t.p(level), exist_ok=True)
+            os.symlink("../init.d/pwmd", self.t.p("%s/%spwmd" % (level, prio)))
+
+    def owner(self):
+        return hd.BusOwner(self.fs, self.run, self.cfg)
+
+    def errors(self):
+        return [x for x in self.logged if x.startswith("ERROR")]
+
+
+class TestInitChoice(SysvBase):
+    def test_detect(self):
+        have = lambda n: "/bin/" + n
+        none = lambda n: None
+        self.assertEqual(hd.detect_init(self.fs, which=have), "sysv", "no /run/systemd/system")
+        os.makedirs(self.t.p("/run/systemd/system"))
+        self.assertEqual(hd.detect_init(self.fs, which=have), "systemd")
+        self.assertEqual(hd.detect_init(self.fs, which=none), "sysv", "no systemctl")
+
+    def test_environment_and_test_trees(self):
+        self.assertEqual(hd.init_system(self.fs), "sysv")
+        del os.environ["REIMU_INIT"]
+        self.assertEqual(hd.init_system(self.fs), "systemd", "a test tree says nothing: as the installer's REIMU_ROOT")
+        os.environ["REIMU_INIT"] = "sysv"
+
+    def test_stop_by_script_then_service(self):
+        self.pwmd_script()
+        self.run.table["/etc/init.d/pwmd"] = (0, "")
+        self.assertEqual(hd.Init(self.fs, self.run).ctl("stop", "pwmd")[0], 0)
+        self.assertEqual(self.run.calls, [["/etc/init.d/pwmd", "stop"]])
+        self.run.calls.clear()
+        self.run.table["service"] = (0, "")
+        del self.run.table["/etc/init.d/pwmd"]
+        self.assertEqual(hd.Init(self.fs, self.run).ctl("stop", "pwmd")[0], 0)
+        self.assertEqual(self.run.calls, [["/etc/init.d/pwmd", "stop"], ["service", "pwmd", "stop"]])
+
+    def test_rc_d_init_d(self):
+        self.t.put("/etc/rc.d/init.d/pwmd", "#!/bin/sh\n")
+        self.run.table["/etc/rc.d/init.d/pwmd"] = (0, "")
+        self.assertEqual(hd.Init(self.fs, self.run).ctl("stop", "pwmd")[0], 0)
+
+    def test_no_commands_at_all_do_not_raise(self):
+        self.assertEqual(hd.Init(self.fs, self.run).ctl("stop", "pwmd")[0], 127)
+        self.assertEqual(hd.run_cmd(["no-such-command-here"])[0], 127)
+        self.assertEqual(hd.run_cmd(["/etc/init.d/no-such-script", "stop"])[0], 127)
+
+    def test_systemd_argv_unchanged(self):
+        os.environ["REIMU_INIT"] = "systemd"
+        self.run.table["systemctl"] = (0, "")
+        i = hd.Init(self.fs, self.run)
+        i.ctl("stop", "pwmd")
+        i.disable_now("pwmd")
+        i.enable_now("pwmd")
+        self.assertEqual(self.run.calls, [["systemctl", "stop", "pwmd"], ["systemctl", "disable", "--now", "pwmd"],
+                                          ["systemctl", "enable", "--now", "pwmd"]])
+
+    def test_state(self):
+        i = hd.Init(self.fs, self.run)
+        self.assertEqual(i.state("pwmd"), "absent")
+        self.pwmd_script(level=None)
+        self.assertEqual(i.state("pwmd"), "disabled")
+        os.makedirs(self.t.p("/etc/rc3.d"))
+        os.symlink("../init.d/pwmd", self.t.p("/etc/rc3.d/K20pwmd"))
+        self.assertEqual(i.state("pwmd"), "disabled")
+        os.symlink("../init.d/pwmd", self.t.p("/etc/rc3.d/S20pwmd"))
+        self.assertEqual(i.state("pwmd"), "enabled")
+        self.assertEqual(i.state("wmd"), "absent", "the exact name")
+
+    def test_state_rc_d(self):
+        self.t.put("/etc/rc.d/init.d/pwmd", "#!/bin/sh\n")
+        os.makedirs(self.t.p("/etc/rc.d/rc5.d"))
+        os.symlink("../init.d/pwmd", self.t.p("/etc/rc.d/rc5.d/S20pwmd"))
+        self.assertEqual(hd.Init(self.fs, self.run).state("pwmd"), "enabled")
+
+    def test_disable_each_tool(self):
+        self.pwmd_script(level=None)
+        for tool, argv in (("update-rc.d", ["update-rc.d", "pwmd", "disable"]), ("chkconfig", ["chkconfig", "pwmd", "off"]),
+                           ("insserv", ["insserv", "-r", "pwmd"])):
+            with self.subTest(tool):
+                self.run.calls.clear()
+                self.run.table = {tool: (0, "")}
+                self.assertTrue(hd.Init(self.fs, self.run).disable("pwmd"))
+                self.assertIn(argv, self.run.calls)
+
+    def test_enable_each_tool(self):
+        for tool, argvs in (("update-rc.d", [["update-rc.d", "x", "defaults"], ["update-rc.d", "x", "enable"]]),
+                            ("chkconfig", [["chkconfig", "--add", "x"], ["chkconfig", "x", "on"]]),
+                            ("insserv", [["insserv", "x"]])):
+            with self.subTest(tool):
+                self.run.calls.clear()
+                self.run.table = {tool: (0, "")}
+                self.assertTrue(hd.Init(self.fs, self.run).enable("x"))
+                for a in argvs:
+                    self.assertIn(a, self.run.calls)
+
+    def test_disable_enable_by_links(self):
+        self.pwmd_script()
+        i = hd.Init(self.fs, self.run)
+        self.assertTrue(i.disable("pwmd"))
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["K20pwmd"])
+        self.assertEqual(i.state("pwmd"), "disabled")
+        self.assertTrue(i.enable("pwmd"))
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["S20pwmd"], "as it was")
+
+    def test_enable_new_links(self):
+        self.pwmd_script(level=None)
+        for d in ("rc3.d", "rc5.d"):
+            os.makedirs(self.t.p("/etc/" + d))
+        self.assertTrue(hd.Init(self.fs, self.run).enable("pwmd"))
+        self.assertEqual(os.readlink(self.t.p("/etc/rc5.d/S99pwmd")), "/etc/init.d/pwmd")
+
+    def test_tool_said_yes_but_links_remain(self):
+        self.pwmd_script()
+        self.run.table["chkconfig"] = (0, "")
+        self.assertTrue(hd.Init(self.fs, self.run).disable("pwmd"))
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), ["K20pwmd"])
+
+    def test_cant_disable(self):
+        self.pwmd_script(level=None)  # a script, and neither tool nor rc directory
+        self.assertFalse(hd.Init(self.fs, self.run).disable("pwmd"))
+
+    def test_os_power_shutdown(self):
+        self.run.table["shutdown"] = (0, "")
+        c = hd.Controller(self.cfg, hd.GpuFan(self.fs), self.run)
+        self.assertTrue(c.op_os_power({"action": "poweroff"}, 0)[0])
+        self.assertTrue(c.op_os_power({"action": "reboot"}, 0)[0])
+        self.assertEqual(self.run.calls, [["shutdown", "-h", "now"], ["shutdown", "-r", "now"]])
+
+    def test_os_power_no_shutdown(self):
+        self.run.table["poweroff"] = (0, "")
+        c = hd.Controller(self.cfg, hd.GpuFan(self.fs), self.run)
+        ok, text = c.op_os_power({"action": "poweroff"}, 0)
+        self.assertTrue(ok)
+        self.assertIn(["poweroff"], self.run.calls)
+        self.assertIn("poweroff", text)
+
+    def test_os_power_nothing_there_does_not_raise(self):
+        c = hd.Controller(self.cfg, hd.GpuFan(self.fs), self.run)
+        self.assertFalse(c.op_os_power({"action": "reboot"}, 0)[0])
+
+    def test_install_service(self):
+        here = tempfile.mkdtemp(prefix="here-")
+        self.addCleanup(shutil.rmtree, here)
+        open(os.path.join(here, "reimu-hostd.init"), "w").write("#!/bin/sh\n")
+        os.makedirs(self.t.p("/etc/rc3.d"))
+        hd.install_service(self.fs, self.run, here)
+        s = self.t.p("/etc/init.d/reimu-hostd")
+        self.assertTrue(os.access(s, os.X_OK))
+        self.assertIn(["/etc/init.d/reimu-hostd", "restart"], self.run.calls)
+        self.assertTrue(os.path.lexists(self.t.p("/etc/rc3.d/S99reimu-hostd")))
+        hd.remove_service(self.fs, self.run)
+        self.assertFalse(os.path.exists(s))
+        self.assertEqual(os.listdir(self.t.p("/etc/rc3.d")), [])
+
+    def test_systemd_install_service_argv(self):
+        os.environ["REIMU_INIT"] = "systemd"
+        self.run.table["systemctl"] = (0, "")
+        here = tempfile.mkdtemp(prefix="here-")
+        self.addCleanup(shutil.rmtree, here)
+        open(os.path.join(here, "reimu-hostd.service"), "w").write("[Unit]\n")
+        hd.install_service(self.fs, self.run, here)
+        self.assertTrue(os.path.exists(self.t.p(hd.UNIT)))
+        self.assertEqual(self.run.calls, [["systemctl", "daemon-reload"], ["systemctl", "enable", "reimu-hostd.service"],
+                                          ["systemctl", "restart", "reimu-hostd.service"]])
+
+    def test_status_without_systemctl_does_not_raise(self):
+        self.t.put("/etc/init.d/reimu-hostd", "#!/bin/sh\n")
+        self.assertEqual(hd.Init(self.fs, self.run).status("reimu-hostd")[0], 127)
+
+
+class TestPwmdSysv(SysvBase):
+    def running(self):
+        self.t.put("/proc/4242/comm", "pwmd")
+
+    def test_stopped_by_its_script(self):
+        self.pwmd_script()
+        self.running()
+        self.run.table["/etc/init.d/pwmd"] = (0, "")
+        ev = self.owner().tick()
+        self.assertIn(["/etc/init.d/pwmd", "stop"], self.run.calls)
+        self.assertNotIn(["pkill", "-x", "pwmd"], self.run.calls)
+        self.assertTrue(any("pwmd stopped" in e["text"] for e in ev))
+        self.assertEqual(self.errors(), [])
+
+    def test_not_stoppable_error_and_reported(self):
+        self.pwmd_script(level=None)
+        self.running()
+        self.run.table["/etc/init.d/pwmd"] = (1, "boom")
+        o = self.owner()
+        ev = [e for e in o.tick() if "pwmd" in e["text"]]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "bmc_owns_i2c_failed")
+        self.assertIn("NOT", ev[0]["text"])
+        self.assertTrue(self.errors(), self.logged)
+        st = hd.bus_owner_state(self.fs, self.cfg)
+        self.assertFalse(st["clean"])
+        self.assertTrue(any("NOT stopped" in x for x in st["found"]), st)
+        self.assertEqual([e for e in o.tick() if "pwmd" in e["text"]], [], "no flood")
+        self.assertEqual(len(self.errors()), 1)
+
+    def test_gone_later_is_told_and_clears(self):
+        self.pwmd_script(level=None)
+        self.running()
+        o = self.owner()
+        o.tick()
+        os.remove(self.t.p("/proc/4242/comm"))
+        ev = o.tick()
+        self.assertTrue(any("pwmd" in e["text"] and e["kind"] == "bmc_owns_i2c" for e in ev), ev)
+        self.assertEqual(hd.bus_owner_state(self.fs, self.cfg)["found"][:0], [])
+        self.assertNotIn("pwmd", " ".join(hd.bus_owner_state(self.fs, self.cfg)["found"]))
+
+    def test_commands_said_yes_but_it_stays(self):
+        self.pwmd_script(level=None)
+        self.running()
+        self.run.table["/etc/init.d/pwmd"] = (0, "")
+        o = self.owner()
+        o.tick()
+        o.tick()
+        self.assertEqual(self.errors(), [])
+        ev = o.tick()
+        self.assertTrue(any(e["kind"] == "bmc_owns_i2c_failed" for e in ev), ev)
+        self.assertTrue(self.errors())
+
+    def test_process_without_service_killed_by_name_and_said(self):
+        self.running()
+        self.run.table["pkill"] = (0, "")
+        ev = self.owner().tick()
+        self.assertIn(["pkill", "-x", "pwmd"], self.run.calls)
+        t = " ".join(e["text"] for e in ev)
+        self.assertIn("no service", t)
+        self.assertEqual(self.errors(), [])
+
+    def test_no_pkill_kill_by_pid_of_exact_comm(self):
+        self.running()
+        self.t.put("/proc/4243/comm", "pwmd2")
+        self.run.table["kill"] = (0, "")
+        self.owner().tick()
+        self.assertIn(["kill", "4242"], self.run.calls)
+        self.assertEqual(self.errors(), [])
+
+    def test_nothing_can_kill_it(self):
+        self.running()
+        ev = self.owner().tick()
+        self.assertTrue(any(e["kind"] == "bmc_owns_i2c_failed" for e in ev))
+        self.assertTrue(self.errors())
+
+    def test_other_processes_left_alone(self):
+        self.t.put("/proc/4243/comm", "pwmd2")
+        self.assertEqual(self.owner().tick(), [])
+        self.assertEqual(self.run.calls, [])
+
+    def test_systemd_stop_failing_too_is_an_error(self):
+        os.environ["REIMU_INIT"] = "systemd"
+        self.running()
+        self.run.table["systemctl"] = (1, "nope")
+        self.run.table["pkill"] = (1, "")
+        ev = self.owner().tick()
+        self.assertTrue(any(e["kind"] == "bmc_owns_i2c_failed" for e in ev), ev)
+        self.assertTrue(self.errors())
+
+    def test_install_disables_and_remove_gives_back(self):
+        self.pwmd_script()
+        self.assertTrue(hd.bus_owner(self.fs, self.run, "install", self.cfg))
+        self.assertEqual(self.t.get(hd.BUS_STATE), "pwmd=enabled")
+        self.assertEqual(hd.Init(self.fs, self.run).state("pwmd"), "disabled")
+        self.assertIn(["/etc/init.d/pwmd", "stop"], self.run.calls)
+        self.run.calls.clear()
+        hd.bus_owner(self.fs, self.run, "remove", self.cfg)
+        self.assertEqual(hd.Init(self.fs, self.run).state("pwmd"), "enabled")
+        self.assertIn(["/etc/init.d/pwmd", "start"], self.run.calls)
+
+    def test_remove_leaves_it_off_when_it_was_off(self):
+        self.pwmd_script(level=None)
+        hd.bus_owner(self.fs, self.run, "install", self.cfg)
+        self.assertEqual(self.t.get(hd.BUS_STATE), "pwmd=disabled")
+        self.run.calls.clear()
+        hd.bus_owner(self.fs, self.run, "remove", self.cfg)
+        self.assertEqual(self.run.calls, [])
+
+    def test_install_cant_disable_says_so(self):
+        # enabled by a link in a level the tools below can't touch: S in rc3.d,
+        # which can't be renamed
+        self.pwmd_script()
+        real = os.rename
+        def no(a, b):
+            if "pwmd" in a and "rc3.d" in a:
+                raise OSError("read-only")
+            return real(a, b)
+        hd.os.rename = no
+        try:
+            self.assertFalse(hd.bus_owner(self.fs, self.run, "install", self.cfg))
+        finally:
+            hd.os.rename = real
+        self.assertTrue(self.errors(), self.logged)
+
+    def test_install_cant_stop_says_so(self):
+        self.pwmd_script(level=None)
+        self.running()
+        self.assertFalse(hd.bus_owner(self.fs, self.run, "install", self.cfg))
+        self.assertTrue(self.errors())
+
+    def test_agent_first_tick_finds_it_enabled_at_boot(self):
+        self.pwmd_script()
+        real = os.rename
+        def no(a, b):
+            if "pwmd" in a and "rc3.d" in a:
+                raise OSError("read-only")
+            return real(a, b)
+        hd.os.rename = no
+        try:
+            o = self.owner()
+            ev = o.tick()
+            self.assertTrue(any(e["kind"] == "bmc_owns_i2c_failed" and "boot" in e["text"] for e in ev), ev)
+            self.assertTrue(any("boot" in x for x in hd.bus_owner_state(self.fs, self.cfg)["found"]))
+            self.assertEqual(o.tick(), [], "once")
+        finally:
+            hd.os.rename = real
+
+    def test_agent_first_tick_disables_when_it_can(self):
+        self.pwmd_script()
+        self.assertEqual(self.owner().tick(), [])
+        self.assertEqual(hd.Init(self.fs, self.run).state("pwmd"), "disabled")
+
+    def test_journal_gets_the_priority_only_under_systemd(self):
+        hd.log_error("x")
+        self.assertEqual(self.logged[-1], "ERROR: x")
+        os.environ["JOURNAL_STREAM"] = "1:2"
+        try:
+            hd.log_error("y")
+            self.assertEqual(self.logged[-1], "<3>ERROR: y")
+        finally:
+            del os.environ["JOURNAL_STREAM"]
+
+
+class TestOldSystems(SysvBase):
+    def test_python_36_syntax(self):
+        import ast
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reimu-hostd.py"), encoding="utf-8").read()
+        ast.parse(src, feature_version=(3, 6))
+
+    def test_diag_on_python_36_gzip(self):
+        """gzip.compress has mtime= only from 3.8"""
+        real = gzip.compress
+        hd.gzip.compress = lambda data, compresslevel=9: real(data, compresslevel)
+        try:
+            c = hd.Controller(hd.parse_config("ALLOW=diag"), hd.GpuFan(self.fs), self.run, hd.Collector(self.fs, self.run, self.cfg))
+            r = c.handle({"t": "control", "id": 1, "op": "diag"}, 0)
+        finally:
+            hd.gzip.compress = real
+        self.assertTrue(r["ok"], r)
+        self.assertIn("inventory", json.loads(gzip.decompress(base64.b64decode(r["gz"])).decode()))
+
+    def test_hub_rule_failing_is_one_line(self):
+        self.t.put("/etc/udev", "a file, not a directory")
+        env = dict(os.environ, REIMU_HOSTD_ROOT=self.t.root)
+        r = subprocess.run([sys.executable, hd.__file__, "hub-rule", "install"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertNotIn(b"Traceback", r.stdout)
 
 
 class TestTransport(Base):

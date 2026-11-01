@@ -2,8 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <libgen.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <time.h>
+#include <gpiod.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <syslog.h>
@@ -23,6 +26,9 @@
 /* power good after the power button: the lock is kept until then (a job
  * started meanwhile would see the platform off and take the flash) */
 #define POWER_ON_WAIT_S 10
+#define SHORT_PRESS_MS 200
+#define LONG_PRESS_MS 5000
+#define PRESS_POLL_MS 200 /* power good during the long press */
 
 static int pns_fd = -1;
 
@@ -69,12 +75,90 @@ static int get_power_state(void)
     return reimu_get_gpio_by_name("GPIO_POWER_IN");
 }
 
-static int press_button(const char *sym, int delay)
+/* in libreimu, not in its header */
+int reimu_gpio_to_num(const char *name);
+
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+/* The long press of a host that is on (libreimu's reimu_set_gpio can't end
+ * early): held until power good drops, delay at the most. Holding on after the
+ * drop is pressing the button of a host that is off: on the board power good
+ * drops at ~4 s of the 5 s, and once the host came back on a second later.
+ * Power good is read once per poll, busy or failing just isn't a drop: nothing
+ * here may make the press longer than delay. */
+static int press_until_power_drops(const char *sym, int delay)
+{
+    int num = reimu_gpio_to_num(sym), power_num = reimu_gpio_to_num("GPIO_POWER_IN");
+    if (num < 0) return num;
+    if (power_num < 0) return power_num;
+    struct gpiod_chip *chip = gpiod_chip_open("/dev/gpiochip0");
+    if (chip == NULL) return -1;
+    struct gpiod_line *line = gpiod_chip_get_line(chip, num), *power = gpiod_chip_get_line(chip, power_num);
+    if ((line == NULL) || (power == NULL))
+    {
+        gpiod_chip_close(chip);
+        return -2;
+    }
+    /* a reader has it for a moment: as in libreimu, a second of that */
+    int rv = -1;
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        if (attempt) reimu_msleep(50, NULL);
+        rv = gpiod_line_request_output(line, "libreimu", 0);
+        if (!rv || (errno != EBUSY)) break;
+    }
+    if (rv)
+    {
+        gpiod_chip_close(chip);
+        return -3;
+    }
+    long long start = monotonic_ms();
+    for (;;)
+    {
+        long long left = start + delay - monotonic_ms();
+        if (left <= 0) break;
+        reimu_msleep((left < PRESS_POLL_MS) ? left : PRESS_POLL_MS, NULL);
+        if (monotonic_ms() >= start + delay) break;
+        if (gpiod_line_request_input(power, "libreimu")) continue;
+        int good = gpiod_line_get_value(power);
+        gpiod_line_release(power);
+        if (good == 0)
+        {
+            syslog(LOG_NOTICE, "power good dropped %lld ms into the press: released", monotonic_ms() - start);
+            break;
+        }
+    }
+    /* released: it would stay driven; an input again floats it */
+    gpiod_line_release(line);
+    rv = gpiod_line_request_input(line, "libreimu");
+    if (!rv) gpiod_line_release(line);
+    gpiod_chip_close(chip);
+    return rv ? -4 : 0;
+}
+
+/* off_only: a press meant to power the host off. The power state seen by the
+ * caller may be 15 s old by now (the lock), and the button of a host that is off
+ * powers it on: looked at again, with the lock; not known: not pressed. */
+static int press_button(const char *sym, int delay, int off_only)
 {
     int rv = pns_guard();
     if (rv) return rv;
+    int power_button = !strcmp(sym, "GPIO_PWR_BTN");
+    int power_state = power_button ? get_power_state() : -1;
+    if (off_only && (power_state == 0))
+    {
+        fprintf(stderr, "The host is off already: the power button isn't pressed\n");
+        syslog(LOG_NOTICE, "the host went off meanwhile: the power button isn't pressed");
+        return 0;
+    }
+    if (off_only && (power_state < 0)) return power_state;
     /* the power button of a platform that is off: it powers up */
-    int powering_on = !strcmp(sym, "GPIO_PWR_BTN") && get_power_state() == 0;
+    int powering_on = power_button && (power_state == 0);
     /* The pulse isn't cut short: the power units' mutual Conflicts= stop this
      * one (TimeoutStopSec is much longer than a press), and a line given up half
      * way stays driven low, the button held. A signal takes effect after it. */
@@ -84,7 +168,8 @@ static int press_button(const char *sym, int delay)
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGHUP);
     sigprocmask(SIG_BLOCK, &block, &old);
-    rv = reimu_set_gpio_by_name(sym, 0, delay);
+    if (power_button && (power_state == 1) && (delay >= LONG_PRESS_MS)) rv = press_until_power_drops(sym, delay);
+    else rv = reimu_set_gpio_by_name(sym, 0, delay);
     sigprocmask(SIG_SETMASK, &old, NULL);
     if (rv || !powering_on) return rv;
     for (int i = 0; i < POWER_ON_WAIT_S * 5; ++i)
@@ -98,17 +183,17 @@ static int press_button(const char *sym, int delay)
 
 static int server_pwrbut_s(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 {
-    return press_button("GPIO_PWR_BTN", 200);
+    return press_button("GPIO_PWR_BTN", SHORT_PRESS_MS, 0);
 }
 
 static int server_pwrbut_h(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 {
-    return press_button("GPIO_PWR_BTN", 5000);
+    return press_button("GPIO_PWR_BTN", LONG_PRESS_MS, 0);
 }
 
 static int server_reset(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 {
-    return press_button("GPIO_RST_BTN", 200);
+    return press_button("GPIO_RST_BTN", SHORT_PRESS_MS, 0);
 }
 
 static int server_pwr_on(int argc, char *argv[])
@@ -128,7 +213,7 @@ static int server_pwr_off(int argc, char *argv[])
     switch(power_state)
     {
         case 0:  return 0;
-        case 1:  return server_pwrbut_s(argc, argv);
+        case 1:  return press_button("GPIO_PWR_BTN", SHORT_PRESS_MS, 1);
         default: return power_state;
     }
 }
@@ -139,7 +224,7 @@ static int server_pwr_off_hard(int argc, char *argv[])
     switch(power_state)
     {
         case 0:  return 0;
-        case 1:  return server_pwrbut_h(argc, argv);
+        case 1:  return press_button("GPIO_PWR_BTN", LONG_PRESS_MS, 1);
         default: return power_state;
     }
 }

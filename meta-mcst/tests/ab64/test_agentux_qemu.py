@@ -31,7 +31,7 @@ from test_ab_qemu import check, failed, fresh, redfish  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 HL_PORT = int(os.environ.get("HL_PORT", 3364))
 OBJ = "/xyz/openbmc_project/reimu/hostlink"
-FILES = ("reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf")
+FILES = ("reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf", "reimu-hostd.init")
 ONLY = ab.ONLY
 
 

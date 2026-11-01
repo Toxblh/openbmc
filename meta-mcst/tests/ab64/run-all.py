@@ -24,8 +24,9 @@ AB = "/work/openbmc/meta-mcst/tests/ab64"
 FLASH_SRC = "/work/openbmc/meta-mcst/meta-ab64/recipes-mcst/reimu-ab/files/reimu-flash.c"
 FLASH_TEST = ("d=$(mktemp -d) && gcc -O2 -o $d/reimu-flash %s && gcc -shared -fPIC -o $d/flaky.so %s/flaky-pwrite.c -ldl"
               " && python3 %s/test_reimu_flash.py $d/reimu-flash $d/flaky.so $d/w; r=$?; rm -rf $d; exit $r" % (FLASH_SRC, AB, AB))
-CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab_plan": ["python3", AB + "/test_ab_plan.py"],
+CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab_plan": ["python3", AB + "/test_ab_plan.py"], "test_ab_lock": ["python3", AB + "/test_ab_lock.py"],
                     "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST]}
+WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
                "kvm_hid", "logs", "overheatd", "pns", "regressions"]
 # bug-for-bug: stock + new need both images, the group list below is the new one's
@@ -143,7 +144,7 @@ def main():
     os.makedirs(out)
     src, img = os.path.join(out, "src"), os.path.join(WORK, "runs", "image")
     os.makedirs(src)
-    subprocess.check_call("docker exec %s tar -C %s/.. -cf - meta-mcst/tests meta-mcst/tools | tar -xf - -C %s" % (DOCKER, TREE, src), shell=True)
+    subprocess.check_call("docker exec %s tar -C %s/.. -cf - meta-mcst/tests meta-mcst/tools meta-mcst/%s | tar -xf - -C %s" % (DOCKER, TREE, WWW, src), shell=True)
     os.makedirs(img, exist_ok=True)
     gone = [n for n in FIXTURES if not os.path.exists(os.path.join(WORK, "fixtures", n))]
     if gone or not chromium() or not os.path.isdir(os.path.join(WORK, "e2e/node_modules/playwright")):
@@ -159,6 +160,9 @@ def main():
     jobs = []
     for t, c in CONTAINER_SUITES.items():
         jobs.append(Job(t, ["docker", "exec", DOCKER] + c))
+    # no QEMU, on this machine: the web tree in a browser (PY: a python with pyte for real zsh, vim)
+    jobs.append(Job("console_size", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                     "node", os.path.join(e2e, "console-size.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

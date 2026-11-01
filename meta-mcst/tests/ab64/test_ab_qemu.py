@@ -224,6 +224,9 @@ class Bmc:
             try:
                 r = self.ssh("systemctl is-system-running --wait 2>/dev/null; true", timeout=200)
                 if r.returncode == 0 and r.stdout.strip() in ("running", "degraded"):
+                    # AB_SCRIPT=FILE: run a newer reimu-ab than the image's (bind mount)
+                    if os.environ.get("AB_SCRIPT") and self.scp(os.environ["AB_SCRIPT"], "/tmp/reimu-ab.new"):
+                        self.ssh("chmod +x /tmp/reimu-ab.new; mount --bind /tmp/reimu-ab.new /usr/sbin/reimu-ab")
                     return True
             except subprocess.TimeoutExpired:
                 pass
@@ -428,6 +431,65 @@ def t_update():
         b.stop()
 
 
+def login_as(pw, cmd="true"):
+    """one ssh try with the password pw only (rc 0: it logs in)"""
+    a = os.path.join(W, ".askpass-try")
+    open(a, "w").write("#!/bin/sh\necho '%s'\n" % pw)
+    os.chmod(a, 0o755)
+    env = dict(os.environ, SSH_ASKPASS=a, SSH_ASKPASS_REQUIRE="force", DISPLAY="x")
+    return subprocess.run(["ssh", "-p", str(SSH), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                           "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=20", "-o", "PreferredAuthentications=password",
+                           "-o", "NumberOfPasswordPrompts=1", "root@127.0.0.1", cmd], env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+
+def t_settings():
+    """root password, a network file, the ssh host key and /var/lib/ipmi survive updates to the other slot and back"""
+    b = Bmc("settings", fresh("settings")).start()
+    new = "N3wPassw0rd-ab"
+    askpass = os.path.join(W, ".askpass")
+    try:
+        check(b.wait_ssh(), "up")
+        r = b.ssh("echo 'root:%s' | chpasswd; echo rc=$?" % new)
+        check("rc=0" in r.stdout, "chpasswd (%s)" % (r.stdout + r.stderr).strip())
+        open(askpass, "w").write("#!/bin/sh\necho %s\n" % new)     # the harness's ssh logs in with it from now on
+        b.ssh("printf '[Match]\\nName=nonexist0\\n[Network]\\nAddress=192.0.2.77/24\\n' > /etc/systemd/network/50-keep.network")
+        b.ssh("mkdir -p /var/lib/ipmi; echo keep > /var/lib/ipmi/ab-test-marker")
+        probe = ("cat /etc/systemd/network/50-keep.network | md5sum; cat /var/lib/ipmi/ab-test-marker; "
+                 "ls /var/lib/ipmi | sort | md5sum; for k in /etc/ssh/ssh_host_*_key.pub /etc/dropbear/*; do "
+                 "[ -f $k ] && md5sum $k; done 2>/dev/null; grep '^root:' /etc/shadow | md5sum")
+        before = b.out(probe)
+        print("    mounts: " + b.out("grep -E ' / | /etc ' /proc/mounts").strip().replace("\n", "\n    "))
+        print("    upper shadow: " + b.out("ls -l /run/initramfs/rw/cow/etc/shadow /run/initramfs/rw/etc/shadow 2>&1 | head -3").strip())
+        check(len(before.splitlines()) >= 5, "state recorded (%s)" % before.replace("\n", " | "))
+        b.ssh("sync")
+        def state_ok(slot, tag):
+            check(ab_state(b) == "kernel=%s rofs=%s state=ok" % (slot, slot), "%s: running slot %s (%s)" % (tag, slot, ab_state(b)))
+            check(login_as(new).returncode == 0, "%s: the new root password logs in" % tag)
+            check(login_as("0penBmc").returncode != 0, "%s: the old password is refused" % tag)
+            after = b.out(probe)
+            check(after == before, "%s: network file, ipmi dir, ssh host key, shadow unchanged\n%s\nvs\n%s" % (tag, before, after))
+        # update to B, boot it
+        install_b(b)
+        b.ssh("reboot")
+        check(b.wait_console(r"reimu\.slot=b", 300, len(b.console()) - 10) is not None, "U-Boot boots slot B")
+        check(b.wait_ssh(), "up in B")
+        state_ok("b", "slot B")
+        # update again, into slot A (the one not running), boot it
+        r = b.ssh("reimu-ab install /tmp/reimu-ab.tar a", timeout=900) if b.ssh("test -f /tmp/reimu-ab.tar").returncode == 0 else None
+        if r is None:
+            check(b.scp(os.path.join(W, "reimu-ab.tar"), "/tmp/reimu-ab.tar"), "update copied again")
+            r = b.ssh("reimu-ab install /tmp/reimu-ab.tar a", timeout=900)
+        check(r.returncode == 0, "reimu-ab install into slot A (%s)" % (r.stdout + r.stderr).strip()[-200:])
+        b.ssh("reboot")
+        check(b.wait_console(r"reimu\.slot=a", 300, len(b.console()) - 10) is not None, "U-Boot boots slot A")
+        check(b.wait_ssh(), "up in A")
+        state_ok("a", "slot A")
+    finally:
+        open(askpass, "w").write("#!/bin/sh\necho 0penBmc\n")
+        b.stop()
+
+
 def t_badkernel():
     img = fresh("badkernel")
     set_env(img, reimu_slot="b", reimu_pending="1", reimu_tries="0")
@@ -517,6 +579,8 @@ def t_stock():
               "stock REIMU 1.0.2 running")
         stock_key = b.out("cat /etc/ssh/ssh_host_ed25519_key.pub").split()[1:2]
 
+        hostkey = "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+        board_key = b.out(hostkey).strip()
         # the board test: the new firmware from RAM, the flash read-only
         env = dict(os.environ, SSHPASS="0penBmc")
         tool = os.path.join(TOOLS, "reimu-ab-from-stock")
@@ -525,6 +589,8 @@ def t_stock():
         print("    " + (r.stdout + r.stderr).strip()[-500:].replace("\n", "\n    "))
         check(r.returncode == 0, "test mode: the new firmware started from the stock one (kexec)")
         check(ab_state(b) == "kernel=a rofs=ram state=ram", "rofs from the initrd (%s)" % ab_state(b))
+        check(board_key and b.out(hostkey).strip() == board_key, "the board's ssh host key in the RAM firmware (%s)" % board_key)
+        check(b.out("stat -c %a /etc/ssh/ssh_host_ed25519_key").strip() == "600", "its private key 600")
         w = b.ssh("reimu-flash write /dev/mtd7 0 /etc/hostname")
         check(w.returncode != 0, "flash read-only in test mode (%s)" % w.stderr.strip()[:80])
         check(b.ssh("fw_setenv reimu_x 1").returncode != 0, "U-Boot environment read-only in test mode")
@@ -982,7 +1048,7 @@ def t_solcut():
         check(o.startswith("A/B"), "power cut %s: an A/B slot boots" % label)
 
 
-TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update),
+TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update), ("settings", t_settings),
          ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("fallback", t_fallback),
          ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("solcut", t_solcut), ("restorecut", t_restorecut),
          ("restorecut-a", t_restorecut_a), ("stock", t_stock)]

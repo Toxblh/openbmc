@@ -152,7 +152,9 @@
 };
 
 &mac0 { status = "okay"; };
-&mac1 { status = "okay"; };
+/* MAC2 goes nowhere on this board: no PHY (all 32 MDIO addresses read 0xffff,
+ * "Generic PHY" then shows a link), no packets, TX times out */
+&mac1 { status = "disabled"; };
 &uart5 { status = "okay"; };
 &ibt { status = "okay"; };
 

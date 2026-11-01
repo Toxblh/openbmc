@@ -6,6 +6,7 @@ CONFIGFILES="/etc/ip-fallback/fallback"
 N=0
 for intf in $INTERFACES
 do
+    [ -d /sys/class/net/$intf ] || continue
     COUNTDN[$N]="no"
     ADAPTER[$N]=$intf
     TIMEOUT[$N]=0

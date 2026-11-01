@@ -51,6 +51,12 @@ STATE=/run/initramfs/reimu-ab
 HEALTH_DEADLINE=${HEALTH_DEADLINE:-300}
 HEALTH_UNITS=${HEALTH_UNITS:-"bmcweb.socket reimu-serial.service"}
 HEALTH_URL=${HEALTH_URL:-}
+# install and set-slot hold this lock for their whole run (a second one is
+# refused); boot takes it after its health wait (blocking: a running install
+# finishes first), and leaves the environment alone if one of them decided
+# meanwhile (DECIDED changed). Under /run: gone across a reboot or kexec.
+LOCK=${REIMU_AB_LOCK:-/run/reimu-ab.lock}
+DECIDED=${REIMU_AB_DECIDED:-/run/reimu-ab-decided}
 
 say() { printf '%s\n' "$*"; }
 die() { printf '%s: %s\n' "$me" "$*" >&2; logger -t $me -- "$*" 2>/dev/null; exit 1; }
@@ -71,6 +77,15 @@ env_set() { # NAME VALUE: set (if it differs) and read back
 booted() { sed -n "s/.*$1=\([a-z]*\).*/\1/p" $STATE 2>/dev/null; }
 other() { [ "$1" = a ] && echo b || echo a; }
 flash_mounted() { grep -qE '^/dev/mtdblock|jffs2' /proc/mounts; }
+lock_nb() { exec 9>"$LOCK" && flock -n 9 || die "another reimu-ab install/set-slot is running"; }
+lock_wait() { exec 9>"$LOCK" && flock 9 || die "cannot take $LOCK"; }
+decided() { cat /proc/sys/kernel/random/uuid > "$DECIDED" 2>/dev/null; }
+# boot: did install/set-slot (or anyone) change what boot saw at its start?
+changed() {
+    lock_wait
+    [ "$(env_get reimu_slot)" = "$s0" ] && [ "$(env_get reimu_pending)" = "$p0" ] && [ "$(cat "$DECIDED" 2>/dev/null)" = "$g0" ] && return 1
+    log "slot/pending changed by an install or set-slot meanwhile: the U-Boot environment is left alone"
+}
 kexec_started() { grep -qwE 'reimu\.(ram|test)' /proc/cmdline; }
 
 # the last 4 KiB of rofs-X: "reimu-rofs BYTES SHA256", "reimu-kernel BYTES
@@ -220,6 +235,7 @@ do_plan() {
 }
 
 do_install() {
+    lock_nb
     tar=${1:-}
     [ -f "$tar" ] || die "$tar: no such file"
     choose "${2:-}"
@@ -252,6 +268,7 @@ do_install() {
     env_set reimu_tries 0
     env_set reimu_pending 1
     env_set reimu_slot $last
+    decided
     say "slot $last boots next (pending until healthy; reimu-ab set-slot $(other $last) to go back)"
 }
 
@@ -271,8 +288,10 @@ do_boot() {
         log "started by kexec (reimu.ram/reimu.test): nothing to confirm, the U-Boot environment is left alone"
         return 0
     fi
+    s0=$(env_get reimu_slot) p0=$(env_get reimu_pending) g0=$(cat "$DECIDED" 2>/dev/null)
     [ "$(env_get reimu_slot)" = "$k" ] || log "U-Boot booted slot $k, not slot $(env_get reimu_slot): slot $(env_get reimu_slot) didn't start"
     if [ "$st" = fallback ]; then
+        ! changed || return 0
         # kernel of one slot, rofs of the other: next time boot the slot the
         # rofs is from, if its kernel is known to be intact (else this one)
         if part_ok $r kernel; then
@@ -289,6 +308,7 @@ do_boot() {
         while ! healthy; do
             up=$(cut -d. -f1 /proc/uptime)
             if [ "$up" -ge "$HEALTH_DEADLINE" ]; then
+                ! changed || return 0
                 log "slot $k: not healthy after ${up}s, going back to slot $(other $k)"
                 env_set reimu_slot $(other $k); env_set reimu_tries 0; env_set reimu_pending 0
                 systemctl reboot
@@ -296,8 +316,11 @@ do_boot() {
             fi
             sleep 5
         done
+        ! changed || return 0
         env_set reimu_pending 0
         log "slot $k: healthy, update confirmed"
+    else
+        ! changed || return 0
     fi
     env_set reimu_slot $k
     env_set reimu_tries 0
@@ -305,8 +328,10 @@ do_boot() {
 
 do_set_slot() {
     case ${1:-} in a|b) ;; *) die "set-slot a|b" ;; esac
+    lock_nb
     verify_slot $1 || die "slot $1 is not intact: not switching"
     env_set reimu_slot $1; env_set reimu_tries 0; env_set reimu_pending 1
+    decided
     say "slot $1 boots next"
 }
 

@@ -80,6 +80,18 @@ new pairing). From a copy of this directory: `sudo sh install.sh --pair
 'reimu1:…'` (or the agent's own `sudo ./reimu-hostd.py install --pair …`).
 The page then shows «подключён»; `journalctl -u reimu-hostd` on the host.
 
+**Without systemd** (`/run/systemd/system` or `systemctl` missing, e.g. a SysV
+distribution; python3 >= 3.6): `reimu-hostd.init` goes to `/etc/init.d/reimu-hostd`
+instead of the unit: a supervisor loop (`/var/run/reimu-hostd.pid`) runs the agent,
+`restore-auto` when it exits, again 5 s later; the log is `/var/log/reimu-hostd.log`,
+over 1 MiB kept as `.1` at the loop's start. At boot by update-rc.d, chkconfig,
+insserv or rc?.d links; with none of them the installer says it won't start at boot.
+The agent chooses the same way (`Init`): pwmd by its script or `service`, «enabled»
+meaning S links in rc?.d, `shutdown -h|-r now` (or poweroff/reboot) for os_power.
+A pwmd process with no service is killed by its exact name. pwmd that can't be
+stopped or disabled: an `ERROR:` log line, the event `bmc_owns_i2c_failed`, and in
+`i2c_owner.found`; `bus-owner install` exits 1.
+
 Optional: `EDAC_AUTOLOAD=yes` in `/etc/reimu-hostd.conf` loads `e2k_edac` at
 start (ECC counters); without it the page has a button «Загрузить e2k_edac».
 `smartctl` (smartmontools), when installed, adds SMART health.
@@ -162,7 +174,7 @@ The agent: 64 KiB a line from the BMC.
   the agent masks any hex string of 32+ characters in its log. The `Json`
   property has no token or key (tested); `Pair()` returns the token only to
   its caller.
-* **Allow-list**: the agent executes only `systemctl poweroff|reboot`,
+* **Allow-list**: the agent executes only `systemctl poweroff|reboot` (no systemd: `shutdown`, `poweroff`, `reboot`),
   `modprobe e2k_edac` (or `edac_e2k`; fixed argv, no shell) and writes only the amdgpu
   `pwm1`/`pwm1_enable`; each op can be disabled on the host (`ALLOW`). There
   is no way for the BMC to run anything else, and the host can only report:

@@ -42,7 +42,7 @@ info "fans: $(cat /sys/class/hwmon/hwmon*/fan*_input 2>/dev/null | tr '\n' ' ')"
 
 # network
 t "eth0 up with the board MAC" 'ip -4 -o addr show eth0 | grep -q inet && m=$(cat /sys/class/net/eth0/address) && [ "$m" = "$(fw_printenv -n ethaddr | tr A-F a-f)" ] && echo $m $(ip -4 -o addr show eth0 | sed "s/.*inet \([^ ]*\).*/\1/")'
-t "eth1 MAC" '[ "$(cat /sys/class/net/eth1/address)" = "$(fw_printenv -n eth1addr | tr A-F a-f)" ]'
+t "no eth1 (MAC2 has no PHY on this board: bug 68)" '[ ! -e /sys/class/net/eth1 ]'
 
 # user space
 f=$(systemctl --failed --no-legend --plain 2>/dev/null | cut -d' ' -f1 | tr '\n' ' ')

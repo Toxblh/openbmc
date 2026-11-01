@@ -565,6 +565,12 @@ int cfg_parse(struct config *c, const char *text, char err[][128], int maxerr)
         add_err(err, maxerr, &nerr, "CPU_FAN_MAX_DUTY %g below CPU_FAN_MIN_DUTY %g: 100", c->cpu_fan_max, c->cpu_fan_min);
         c->cpu_fan_max = 100;
     }
+    /* the EMC2305 watchdog fires 4 s after the last write: each tick writes, and takes its time */
+    if (c->emc_watchdog && c->poll_ms > 3000)
+    {
+        add_err(err, maxerr, &nerr, "POLL_MS %d over 3000 with EMC_WATCHDOG (it fires at 4 s): 3000", c->poll_ms);
+        c->poll_ms = 3000;
+    }
     /* the stale time must be longer than a poll */
     if (c->stale_ms < 2 * c->poll_ms)
     {
@@ -1328,12 +1334,41 @@ static void check_tach(struct fand *f, struct output *o)
 }
 
 /* ------------------------------------------------------------------ fail-safe */
+/* Time: a transfer on a dead bus takes its timeout (~1.5 s seen on the board).
+ * Each chip gets its share of FAILSAFE_MS, so that a dead bus doesn't keep the
+ * others out: past it the first try of a step is still made, no retries. Past
+ * FAILSAFE_HARD_MS nothing is: the worst case is that and one hung transfer,
+ * inside the unit's TimeoutStopSec=15 (ExecStopPost is killed then) and, in the
+ * daemon (SIGTERM, host off), WatchdogSec=30. */
+#define FAILSAFE_MS 6000
+#define FAILSAFE_HARD_MS 9000
+static int64_t s_fs_chip_end, s_fs_hard_end;
+
+static void fs_next_chip(int64_t all_end, int chips_left)
+{
+    int64_t now = hw_now_ms(), left = all_end - now;
+    s_fs_chip_end = now + (left > 0 ? left / chips_left : 0);
+}
+
+static int fs_retry(int k)
+{
+    return hw_now_ms() < (k ? s_fs_chip_end : s_fs_hard_end);
+}
+
+/* written and read back, up to 3 times */
+static int fs_write(int b, int a, int r, int val)
+{
+    for (int k = 0; k < 3 && fs_retry(k); k++)
+        if (!hw_wr_byte(b, a, r, val) && hw_rd_byte(b, a, r) == val) return 0;
+    return -1;
+}
+
 /* the chip's ID, read up to 3 times: one failed transfer must not leave a
  * fan out of the fail-safe */
 static int ident3(int kind, int b, int a)
 {
     int id = 0;
-    for (int k = 0; k < 3 && !id; k++)
+    for (int k = 0; k < 3 && !id && fs_retry(k); k++)
     {
         if (kind == OUT_LM96163) id = lm96163_ident(b, a);
         else
@@ -1345,28 +1380,73 @@ static int ident3(int kind, int b, int a)
     return id;
 }
 
-void fand_failsafe(const struct config *c)
+int fand_failsafe(const struct config *c)
 {
+    int bad = 0;
     struct devaddr lm[2] = { c->cpu_fan, c->board_fan };
+    int64_t end = hw_now_ms() + FAILSAFE_MS;
+    s_fs_hard_end = hw_now_ms() + FAILSAFE_HARD_MS;
+    int chips = 2 + c->ncase;
     for (int i = 0; i < 2; i++)
     {
         int b = lm[i].bus, a = lm[i].addr;
+        fs_next_chip(end, chips--);
         if (ident3(OUT_LM96163, b, a) != 1) continue;
         int cfg = -1, max = -1;
-        for (int k = 0; k < 3 && cfg < 0; k++) cfg = hw_rd_byte(b, a, 0x4a);
+        for (int k = 0; k < 3 && cfg < 0 && fs_retry(k); k++) cfg = hw_rd_byte(b, a, 0x4a);
+        if (cfg < 0)
+        {
+            fand_log(3, "fail-safe: fan %d-%04x: 0x4A can't be read, the PWM mode and polarity not known", b, a);
+            bad++;
+        }
         /* manual, and not inverted: with bit 4, full scale would stop the fan */
-        if (cfg >= 0 && (cfg & 0x30) != 0x20) hw_wr_byte(b, a, 0x4a, (cfg | 0x20) & ~0x10);
-        for (int k = 0; k < 3 && max < 0 && cfg >= 0; k++) max = lm96163_max(b, a, cfg);
+        else if ((cfg & 0x30) != 0x20)
+        {
+            int want = (cfg | 0x20) & ~0x10;
+            for (int k = 0; k < 3 && (cfg & 0x30) != 0x20 && fs_retry(k); k++)
+            {
+                int wr = hw_wr_byte(b, a, 0x4a, want), rb = hw_rd_byte(b, a, 0x4a);
+                /* (not read back but acknowledged: taken as done, a 0 below
+                 * for a polarity that isn't inverted would stop the fan) */
+                cfg = rb >= 0 ? rb : wr ? cfg : want;
+            }
+            if (!(cfg & 0x20))
+            {
+                fand_log(3, "fail-safe: fan %d-%04x: PWPGM can't be set (0x4A 0x%02x): the chip follows its lookup table, the duty is not ours", b, a, cfg);
+                bad++;
+            }
+        }
+        for (int k = 0; k < 3 && max < 0 && cfg >= 0 && fs_retry(k); k++) max = lm96163_max(b, a, cfg);
         /* scale unknown: 0x3f is full scale of the 6-bit register (100 % with
          * any PWM_FREQ); the 8-bit mode needs its read 0x4D */
-        hw_wr_byte(b, a, 0x4c, max > 0 ? max : 0x3f);
+        int raw = max > 0 ? max : 0x3f;
+        if (cfg >= 0 && (cfg & 0x10))
+        {
+            fand_log(3, "fail-safe: fan %d-%04x: the PWM polarity can't be cleared (0x4A 0x%02x): 0x4C 0 is its full scale", b, a, cfg);
+            raw = 0;
+        }
+        if (fs_write(b, a, 0x4c, raw))
+        {
+            fand_log(3, "fail-safe: fan %d-%04x: 0x4C %d not taken", b, a, raw);
+            bad++;
+        }
     }
     for (int i = 0; i < c->ncase; i++)
     {
         int b = c->case_fan[i].bus, a = c->case_fan[i].addr;
+        fs_next_chip(end, chips--);
         if (ident3(OUT_EMC2305, b, a) != 1) continue;
-        for (int n = 0; n < 5; n++) hw_wr_byte(b, a, 0x30 + 0x10 * n, 0xff);
+        for (int n = 0; n < 5; n++)
+        {
+            int r = 0x30 + 0x10 * n;
+            if (!fs_write(b, a, r, 0xff)) continue;
+            fand_log(3, "fail-safe: fan %d-%04x: channel %d not at 100 %%", b, a, n + 1);
+            bad++;
+            /* out of time, and this one just failed: the bus, not the channel */
+            if (hw_now_ms() >= s_fs_chip_end) break;
+        }
     }
+    return bad;
 }
 
 /* the fan chips' ID registers, the first PCS sensor: any of them answering
@@ -1501,7 +1581,7 @@ static void enter_off(struct fand *f)
 {
     if (f->phase == PH_RUN)
     {
-        /* one try: if the host is not really off, the fans are at 100 % */
+        /* if the host is not really off, the fans are at 100 % */
         if (!fand_observe) fand_failsafe(&f->c);
         fand_log(5, "host off: fans unpowered, idle");
     }
@@ -1584,6 +1664,8 @@ void fand_step(struct fand *f, int64_t now, int host)
     }
     if (host == HOST_OFF)
     {
+        /* seen off: whatever the run file said about its being on is over */
+        f->on_since_hint = -1;
         if (f->phase != PH_OFF) enter_off(f);
         set_led(f, f->tach_latched);
         return;

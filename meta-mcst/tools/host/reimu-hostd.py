@@ -12,7 +12,7 @@ may ask it for a few things.
     clocks, load, VRAM, PCIe link), disk temperatures and SMART health
   * from the BMC, only this list (ALLOW), never a command line: the video
     card's fan auto / manual DUTY % (never below GPU_FAN_FLOOR) / "turbo"
-    (100 % for N minutes); the OS shut down or rebooted (systemctl);
+    (100 % for N minutes); the OS shut down or rebooted (systemctl, or shutdown without systemd);
     modprobe e2k_edac (or edac_e2k)
   * on its own (host-local, in ALLOW as usb_hub, no BMC message): the BMC's
     virtual USB hub (1d6b:0107: the KVM keyboard/mouse, virtual media) kept
@@ -34,8 +34,10 @@ The video card's fan: the policy the BMC asks for is kept by the agent. The
 driver resets it after a GPU reset (amdgpu hang: pwm1_enable back to 2, the
 fans stopped while the IOHUB behind the card heated to 90 °C), and the card's
 hwmon may come back under another number: it is checked every 2 s and set
-again. With no word from the BMC for LINK_LOST_SEC, and when the agent stops,
-the fan goes back to the driver's automatic control.
+again. With no word from the BMC for LINK_LOST_SEC a manual policy stays, at
+least GPU_FAN_LINK_LOST (the IOHUB behind the card needs the air), unless the
+card is hot or its temperature unknown: then, and when the agent stops, the
+fan goes back to the driver's automatic control.
 
 The link: TLS to the BMC's TCP BMC_PORT (5564), the BMC's certificate pinned
 (its SHA-256, from the pairing), the agent proven by HMAC-SHA256 of the BMC's
@@ -65,7 +67,7 @@ Config /etc/reimu-hostd.conf (KEY=VALUE), the key /etc/reimu-hostd/secret
 (root only). REIMU_HOSTD_ROOT=DIR: every /sys, /proc, /etc, /dev path under
 DIR and no command executed (logged to DIR/commands.log): the tests.
 """
-import base64, binascii, glob, gzip, hashlib, hmac, json, os, re, select, shutil, signal, socket, ssl, struct, subprocess
+import base64, binascii, glob, gzip, hashlib, hmac, io, json, os, re, select, shutil, signal, socket, ssl, struct, subprocess
 import sys, time, uuid
 
 VERSION = "1.0"
@@ -106,6 +108,19 @@ def log(msg):
         print(msg, flush=True)
 
 
+def _gzip(data):
+    """no timestamp in it (gzip.compress has mtime= only from Python 3.8)"""
+    b = io.BytesIO()
+    with gzip.GzipFile(fileobj=b, mode="wb", compresslevel=6, mtime=0) as f:
+        f.write(data)
+    return b.getvalue()
+
+
+def log_error(msg):
+    """an error, in any log; under systemd the journal has its priority too"""
+    log(("<3>" if os.environ.get("JOURNAL_STREAM") else "") + "ERROR: " + str(msg))
+
+
 # ------------------------------------------------------------------ config
 DEFAULTS = {
     "BMC": "",                # HOST[:PORT] instead of the list below (tests, a routed BMC)
@@ -116,7 +131,8 @@ DEFAULTS = {
     "DISCOVERY": True,        # multicast probe for the BMC on the interfaces
     "INTERVAL": 10,           # s between metrics
     "GPU_FAN_FLOOR": 30,      # % the manual duty never goes below
-    "LINK_LOST_SEC": 60,      # no word from the BMC this long: the GPU fan to the driver
+    "LINK_LOST_SEC": 60,      # no word from the BMC this long: see GpuFan
+    "GPU_FAN_LINK_LOST": 40,  # % held meanwhile while the card is cool; 0: to the driver
     "ALLOW": set(OPS + LOCAL_OPS),
     "EDAC_AUTOLOAD": False,   # modprobe e2k_edac at start when EDAC is absent
     "SMART": True,            # smartctl (when installed) every SMART_SEC
@@ -153,6 +169,7 @@ def parse_config(text):
     c["INTERVAL"] = min(max(c["INTERVAL"], 2), 3600)
     c["GPU_FAN_FLOOR"] = min(max(c["GPU_FAN_FLOOR"], 20), 100)
     c["LINK_LOST_SEC"] = min(max(c["LINK_LOST_SEC"], 15), 3600)
+    c["GPU_FAN_LINK_LOST"] = min(max(c["GPU_FAN_LINK_LOST"], 0), 100)
     return c
 
 
@@ -248,9 +265,12 @@ def _natkey(s):
     return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)]
 
 
+SYS_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
 def run_cmd(argv, timeout=10):
     """a command of the allow-list (fixed argv, no shell): (rc, output)"""
-    exe = shutil.which(argv[0], path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    exe = shutil.which(argv[0], path=SYS_PATH)
     if not exe:
         return 127, "%s: not installed" % argv[0]
     try:
@@ -278,6 +298,168 @@ def fake_runner(root):
             return 0, ""
         return 127, "%s: not run (REIMU_HOSTD_ROOT)" % argv[0]
     return run
+
+
+# ------------------------------------------------------------------ init systems
+INIT_DIRS = ("/etc/init.d", "/etc/rc.d/init.d")
+RC_BASES = ("/etc/rc.d", "/etc")
+
+
+def detect_init(fs, which=None):
+    """systemd only when it runs here (as install.sh decides)"""
+    which = which or (lambda n: shutil.which(n, path=SYS_PATH))
+    return "systemd" if fs.exists("/run/systemd/system") and which("systemctl") else "sysv"
+
+
+def init_system(fs):
+    """REIMU_INIT: the installer's word; a test tree without it: systemd, as
+    install.sh's REIMU_ROOT"""
+    forced = os.environ.get("REIMU_INIT")
+    if forced in ("systemd", "sysv"):
+        return forced
+    return "systemd" if getattr(fs, "root", "") else detect_init(fs)
+
+
+class Init:
+    """services, by whichever init system this host has. SysV: the script,
+    `service`; at boot update-rc.d, chkconfig, insserv, or the rc?.d links
+    themselves, which are also what "enabled" means there"""
+
+    def __init__(self, fs, run):
+        self.fs, self.run, self.kind = fs, run, init_system(fs)
+
+    def script(self, name):
+        for d in INIT_DIRS:
+            if self.fs.exists(d + "/" + name):
+                return d + "/" + name
+        return None
+
+    def ctl(self, action, name, timeout=60):
+        if self.kind == "systemd":
+            return self.run(["systemctl", action, name], timeout=timeout)
+        s = self.script(name)
+        if s:
+            r = self.run([s, action], timeout=timeout)
+            if r[0] not in (126, 127):
+                return r
+        return self.run(["service", name, action], timeout=timeout)
+
+    def status(self, name):
+        if self.kind == "systemd":
+            return self.run(["systemctl", "--no-pager", "status", name + ".service"], timeout=30)
+        return self.ctl("status", name, timeout=30)
+
+    def _rc_base(self):
+        for b in RC_BASES:
+            if self.fs.exists(b + "/rc3.d"):
+                return b
+        return None
+
+    def _links(self, name, kind="S", levels="2-5"):
+        out = []
+        for b in RC_BASES:
+            out += [x for x in self.fs.glob("%s/rc[%s].d/%s[0-9][0-9]%s" % (b, levels, kind, name)) if x not in out]
+        return out
+
+    def _flip(self, links, to):
+        """S20name <-> K20name, in place"""
+        for x in links:
+            d, n = os.path.split(x)
+            try:
+                os.rename(self.fs.p(x), self.fs.p(d + "/" + to + n[1:]))
+            except OSError as e:
+                log("%s: %s" % (x, e))
+
+    def _tool(self, cmds):
+        """the commands of a boot tool, in order: True when it did them; False
+        when it failed or isn't here"""
+        for c in cmds:
+            if self.run(c, timeout=30)[0] != 0:
+                return False
+        return True
+
+    def state(self, name):
+        """enabled, disabled, absent, or systemd's own word"""
+        if self.kind == "systemd":
+            _, out = self.run(["systemctl", "is-enabled", name], timeout=15)
+            for line in reversed(out.splitlines()):
+                if line.strip() in PWMD_WORDS:
+                    return line.strip()
+            return "absent"
+        if self._links(name):
+            return "enabled"
+        return "disabled" if self.script(name) else "absent"
+
+    def enable(self, name):
+        if self.kind == "systemd":
+            return self.run(["systemctl", "enable", name], timeout=60)[0] == 0
+        done = (self._tool([["update-rc.d", name, "defaults"], ["update-rc.d", name, "enable"]])
+                or self._tool([["chkconfig", "--add", name], ["chkconfig", name, "on"]])
+                or self._tool([["insserv", name]]))
+        if self._links(name):
+            return True
+        off = self._links(name, "K")
+        if off:
+            self._flip(off, "S")
+        elif self._rc_base() and not done:
+            b, target = self._rc_base(), self.script(name) or INIT_DIRS[0] + "/" + name
+            try:
+                for lev, n in (("3", "S99"), ("5", "S99"), ("0", "K01"), ("6", "K01")):
+                    os.makedirs(self.fs.p("%s/rc%s.d" % (b, lev)), exist_ok=True)
+                    link = self.fs.p("%s/rc%s.d/%s%s" % (b, lev, n, name))
+                    if not os.path.lexists(link):
+                        os.symlink(target, link)
+            except OSError as e:
+                log("%s at boot: %s" % (name, e))
+        return bool(self._links(name)) or done
+
+    def disable(self, name):
+        if self.kind == "systemd":
+            return self.run(["systemctl", "disable", name], timeout=60)[0] == 0
+        done = (self._tool([["update-rc.d", name, "disable"]]) or self._tool([["chkconfig", name, "off"]])
+                or self._tool([["insserv", "-r", name]]))
+        self._flip(self._links(name), "K")  # whatever the tool said, the links are the truth
+        if self._links(name):
+            return False
+        return bool(done or self._rc_base() or not self.script(name))
+
+    def enable_now(self, name):
+        if self.kind == "systemd":
+            return self.run(["systemctl", "enable", "--now", name], timeout=60)[0] == 0
+        ok = self.enable(name)
+        self.ctl("start", name)
+        return ok
+
+    def disable_now(self, name):
+        if self.kind == "systemd":
+            return self.run(["systemctl", "disable", "--now", name], timeout=60)[0] == 0
+        ok = self.disable(name)
+        self.ctl("stop", name)  # a running one is the BusOwner's to check
+        return ok
+
+    def remove_boot(self, name):
+        if self.kind == "systemd":
+            return
+        self._tool([["update-rc.d", "-f", name, "remove"]])
+        self._tool([["chkconfig", "--del", name]])
+        self._tool([["insserv", "-r", name]])
+        for x in self._links(name, "[SK]", "0-6"):
+            try:
+                os.remove(self.fs.p(x))
+            except OSError:
+                pass
+
+    def power(self, action):
+        """(rc, what was done, its output): action poweroff or reboot"""
+        if self.kind == "systemd":
+            rc, out = self.run(["systemctl", action], timeout=30)
+            return rc, "systemctl " + action, out
+        argv = ["shutdown", "-h" if action == "poweroff" else "-r", "now"]
+        rc, out = self.run(argv, timeout=30)
+        if rc in (126, 127):
+            argv = [action]
+            rc, out = self.run(argv, timeout=30)
+        return rc, " ".join(argv), out
 
 
 # ------------------------------------------------------------------ collection
@@ -712,16 +894,83 @@ def pwmd_running(fs):
 def bus_owner_state(fs, cfg):
     found = [n if drv == "pwm-fan" else "%s (%s)" % (n, drv) for n, drv, _ in shared_bus_bound(fs)]
     if pwmd_running(fs):
-        found.append("pwmd")
+        found.append("pwmd (NOT stopped)" if cfg.get("_pwmd_error") else "pwmd")
+    if cfg.get("_pwmd_boot"):
+        found.append("pwmd (enabled at boot, NOT disabled)")
     return {"enforced": "bmc_owns_i2c" in cfg["ALLOW"], "clean": not found, "found": found,
             "modprobe_conf": fs.exists(BUS_CONF)}
 
 
 class BusOwner:
+    SETTLE = 3  # seconds bus_owner gives a stopped pwmd to be gone
+
     def __init__(self, fs, run, cfg):
         self.fs, self.run, self.cfg = fs, run, cfg
         self.failed = set()
         self.pwmd_told = False
+        self.pwmd_err_told = False
+        self.pwmd_strikes = 0
+        self.boot_checked = False
+
+    def _kill_pwmd(self):
+        """by its exact name only, as the /proc check found it"""
+        r = self.run(["pkill", "-x", "pwmd"], timeout=10)
+        if r[0] in (126, 127):
+            pids = [c.split("/")[2] for c in self.fs.glob("/proc/[0-9]*/comm") if self.fs.read(c) == "pwmd"]
+            r = self.run(["kill"] + pids, timeout=10) if pids else (0, "")
+        return r
+
+    def _boot_check(self):
+        """SysV: enabled at boot again, or never disabled: the links say so"""
+        self.boot_checked = True
+        svc = Init(self.fs, self.run)
+        if svc.kind != "sysv" or svc.state("pwmd") not in PWMD_ON:
+            return []
+        if svc.disable("pwmd"):
+            log("the BMC is the only I2C master here: pwmd disabled at boot")
+            return []
+        text = "the BMC is NOT sure to be the only I2C master: pwmd stays enabled at boot, could not disable it"
+        log_error(text)
+        self.cfg["_pwmd_boot"] = text
+        return [{"kind": "bmc_owns_i2c_failed", "text": text}]
+
+    def _pwmd(self):
+        events = []
+        if not pwmd_running(self.fs):
+            if self.pwmd_err_told:
+                text = "the BMC is the only I2C master here: pwmd no longer runs"
+                log(text)
+                events.append({"kind": "bmc_owns_i2c", "text": text})
+            self.pwmd_told = self.pwmd_err_told = False
+            self.pwmd_strikes = 0
+            self.cfg.pop("_pwmd_error", None)
+            return events
+        self.pwmd_strikes += 1
+        svc = Init(self.fs, self.run)
+        rc, out = svc.ctl("stop", "pwmd", timeout=30)
+        krc = 0
+        if rc != 0:
+            krc, kout = self._kill_pwmd()
+            out = (out or "").strip() + " " + (kout or "").strip()
+        failed = rc != 0 and krc != 0 and pwmd_running(self.fs)
+        if failed or self.pwmd_strikes >= 3:  # 3: every command says yes, and there it is again
+            if not self.pwmd_err_told:
+                self.pwmd_err_told = self.pwmd_told = True
+                text = ("the BMC is NOT the only I2C master here: pwmd runs and could not be stopped (%s): a second "
+                        "master corrupts the fan chips" % (out.strip()[:120] or "it comes back"))
+                log_error(text)
+                self.cfg["_pwmd_error"] = text
+                events.append({"kind": "bmc_owns_i2c_failed", "text": text})
+        elif not self.pwmd_told:
+            self.pwmd_told = True
+            if svc.kind == "sysv" and not svc.script("pwmd"):
+                text = ("the BMC is the only I2C master here: a pwmd process with no service for it was killed by "
+                        "name; whatever started it may start it again, then it is killed again")
+            else:
+                text = "the BMC is the only I2C master here: pwmd stopped"
+            log(text)
+            events.append({"kind": "bmc_owns_i2c", "text": text})
+        return events
 
     def tick(self):
         events = []
@@ -739,27 +988,10 @@ class BusOwner:
             text = "the BMC is the only I2C master here: %s (%s) unbound" % (name, drv)
             log(text)
             events.append({"kind": "bmc_owns_i2c", "text": text})
-        if pwmd_running(self.fs):
-            rc, _ = self.run(["systemctl", "stop", "pwmd"], timeout=30)
-            if rc != 0:
-                self.run(["pkill", "-x", "pwmd"], timeout=10)
-            if not self.pwmd_told:
-                self.pwmd_told = True
-                text = "the BMC is the only I2C master here: pwmd stopped"
-                log(text)
-                events.append({"kind": "bmc_owns_i2c", "text": text})
-        else:
-            self.pwmd_told = False
+        if not self.boot_checked:
+            events += self._boot_check()
+        events += self._pwmd()
         return events
-
-
-def _pwmd_enabled(run):
-    """how systemctl has pwmd (its stderr is in the output): absent if unknown"""
-    _, out = run(["systemctl", "is-enabled", "pwmd"], timeout=15)
-    for line in reversed(out.splitlines()):
-        if line.strip() in PWMD_WORDS:
-            return line.strip()
-    return "absent"
 
 
 def _initramfs_data(raw):
@@ -802,7 +1034,9 @@ def initramfs_check(fs):
 def bus_owner(fs, run, action, cfg):
     """install: the modules kept out, pwmd disabled (how it was written down
     once, an update keeps that), the drivers unbound now. remove: both given
-    back, nothing unbound (the drivers come back with the next boot)"""
+    back, nothing unbound (the drivers come back with the next boot). False:
+    pwmd not dealt with, said at error level"""
+    svc = Init(fs, run)
     conf, state = fs.p(BUS_CONF), fs.p(BUS_STATE)
     if action == "remove":
         if os.path.exists(conf):
@@ -813,32 +1047,44 @@ def bus_owner(fs, run, action, cfg):
             os.remove(state)
         except OSError:
             was = ""
-        if was in PWMD_ON:
-            run(["systemctl", "enable", "--now", "pwmd"], timeout=60)
+        if was in PWMD_ON or (was == "generated" and svc.kind == "sysv"):
+            svc.enable_now("pwmd")
         elif was == "generated":
             run(["chkconfig", "pwmd", "on"], timeout=15)
             run(["systemctl", "start", "pwmd"], timeout=60)
-        return
+        return True
     if "bmc_owns_i2c" not in cfg["ALLOW"]:
         log("bmc_owns_i2c is not in ALLOW: the host keeps its own drivers on the shared I2C buses")
-        return
+        return True
     os.makedirs(os.path.dirname(conf), exist_ok=True)
     with open(conf + ".new", "w") as f:
         f.write(BUS_CONF_TEXT)
     os.chmod(conf + ".new", 0o644)
     os.rename(conf + ".new", conf)
-    cur = _pwmd_enabled(run)
+    cur = svc.state("pwmd")
     if not os.path.exists(state):
         os.makedirs(os.path.dirname(state), mode=0o700, exist_ok=True)
         with open(state + ".new", "w") as f:
             f.write("pwmd=%s\n" % cur)
         os.rename(state + ".new", state)
+    ok = True
     if cur in PWMD_ON:
-        run(["systemctl", "disable", "--now", "pwmd"], timeout=60)
+        ok = svc.disable_now("pwmd")
+        if not ok:
+            log_error("pwmd stays enabled at boot, could not disable it: the BMC is NOT sure to be the only I2C master")
     elif cur == "generated":  # an init script: chkconfig has its state
         run(["chkconfig", "pwmd", "off"], timeout=15)
         run(["systemctl", "stop", "pwmd"], timeout=60)
-    BusOwner(fs, run, cfg).tick()
+    owner = BusOwner(fs, run, cfg)
+    owner.boot_checked = True  # just done
+    owner.tick()
+    end = time.monotonic() + owner.SETTLE
+    while pwmd_running(fs) and not owner.pwmd_err_told and time.monotonic() < end:
+        time.sleep(0.2)
+    if pwmd_running(fs):
+        ok = False
+        if not owner.pwmd_err_told:
+            log_error("pwmd still runs: the BMC is NOT the only I2C master yet (the agent keeps trying and tells the BMC)")
     r = initramfs_check(fs)
     k = fs.read("/proc/sys/kernel/osrelease") or "$(uname -r)"
     how = "make-initrd -k %s (ALT; or dracut -f --kver %s)" % (k, k)
@@ -847,6 +1093,7 @@ def bus_owner(fs, run, action, cfg):
             "rebuild it (the modprobe.d file goes in): %s" % (r["file"], " ".join(r["found"]), how))
     elif r["file"] and r["found"] is None:
         log("%s can't be read here: if it has %s (lsinitrd), rebuild it: %s" % (r["file"], " ".join(BUS_MODULES), how))
+    return ok
 
 
 def edac_autoload(fs, run, cfg):
@@ -860,8 +1107,14 @@ class GpuFan:
     """the policy the BMC asked for, kept on the card: auto (the driver's),
     manual DUTY (>= floor), turbo (100 % until a time, then the policy)"""
 
-    def __init__(self, fs, floor=30):
-        self.fs, self.floor = fs, floor
+    # no word from the BMC: at least this much while the card is cool (the idle
+    # driver stops the fan, and the IOHUB behind the card relies on its air);
+    # a card this hot goes to the driver, back below the second
+    LOST_HOT, LOST_COOL = 70000, 60000
+
+    def __init__(self, fs, floor=30, link_lost_duty=40):
+        self.fs, self.floor, self.link_lost_duty = fs, floor, link_lost_duty
+        self.lost_hot = False
         self.mode, self.duty = "auto", None
         self.turbo_until = None
         self.touched = False     # pwm1_enable written by us since the last auto
@@ -917,6 +1170,8 @@ class GpuFan:
         if self.turbo_until is not None and now >= self.turbo_until:
             self.turbo_until = None
         if self.link_lost:
+            if self.lost_hold():
+                return 1, int(max(self.duty, self.link_lost_duty) * 255 / 100.0 + 0.5)
             return None
         if self.turbo_until is not None:
             return 1, 255
@@ -924,15 +1179,36 @@ class GpuFan:
             return 1, int(self.duty * 255 / 100.0 + 0.5)
         return None
 
+    def lost_hold(self):
+        """link lost: hold the card's fan ourselves? Not with an auto policy,
+        a hot card or no temperature: the driver knows better"""
+        if self.mode != "manual" or self.link_lost_duty <= 0:
+            return False
+        h = self.hwmon()
+        t = self.fs.int(h + "/temp1_input") if h else None
+        if t is None:
+            self.lost_hot = True
+        elif t >= self.LOST_HOT:
+            self.lost_hot = True
+        elif t < self.LOST_COOL:
+            self.lost_hot = False
+        return not self.lost_hot
+
     def tick(self, now, link_ok):
         events = []
         if not link_ok:
+            first = not self.link_lost
             self.link_lost = True
+            if self.lost_hold():
+                if first:
+                    events.append({"kind": "gpu_fan_floor_link_lost",
+                                   "text": "no word from the BMC: the GPU fan held at %d %% or more" % self.link_lost_duty})
             # until the driver has it back: a failed write is tried again
-            if self.touched and self._to_auto():
+            elif self.touched and self._to_auto():
                 events.append({"kind": "gpu_fan_auto_link_lost", "text": "no word from the BMC: the GPU fan back to the driver"})
         else:
             self.link_lost = False
+            self.lost_hot = False
         h = self.hwmon()
         self.present = h is not None
         if not h:
@@ -1034,8 +1310,8 @@ class Controller:
         a = msg.get("action")
         if a not in ("poweroff", "reboot"):
             return False, "action must be poweroff or reboot"
-        rc, out = self.run(["systemctl", a], timeout=30)
-        return rc == 0, "systemctl %s%s" % (a, "" if rc == 0 else ": " + out.strip()[:200])
+        rc, what, out = Init(self.fan.fs, self.run).power(a)
+        return rc == 0, "%s%s" % (what, "" if rc == 0 else ": " + out.strip()[:200])
 
     def op_edac_load(self, msg, now):
         return edac_modprobe(self.run)
@@ -1056,7 +1332,7 @@ class Controller:
              "agent": {"version": VERSION, "proto": PROTO}}
         while True:
             d["kernel_log"] = klog
-            z = base64.b64encode(gzip.compress(json.dumps(d).encode(), 6, mtime=0)).decode()
+            z = base64.b64encode(_gzip(json.dumps(d).encode())).decode()
             if len(z) <= DIAG_MAX_B64 or not klog:
                 break
             klog = klog[-len(klog) // 2:]
@@ -1349,7 +1625,7 @@ class Agent:
         self.secret_path, self.conf_path = secret_path, conf_path
         self.cred_mtimes = (_mtime(secret_path), _mtime(conf_path))
         self.col = Collector(fs, run, cfg)
-        self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"])
+        self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"], link_lost_duty=cfg["GPU_FAN_LINK_LOST"])
         self.hub = UsbHub(fs, cfg)
         self.bus = BusOwner(fs, run, cfg)
         self.ctl = Controller(cfg, self.fan, run, self.col)
@@ -1598,11 +1874,51 @@ def set_conf(path, kv):
 
 
 
+def install_service(fs, run, here):
+    """the unit or the init script from HERE in place, on at boot, (re)started"""
+    svc = Init(fs, run)
+    if svc.kind == "systemd":
+        dst = fs.p(UNIT)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(os.path.join(here, "reimu-hostd.service"), dst)
+        os.chmod(dst, 0o644)
+        os.sync()  # a BMC reboot resets this host: no empty files
+        run(["systemctl", "daemon-reload"], timeout=60)
+        run(["systemctl", "enable", "reimu-hostd.service"], timeout=60)
+        run(["systemctl", "restart", "reimu-hostd.service"], timeout=60)
+        return
+    d = next((x for x in INIT_DIRS if fs.exists(x)), INIT_DIRS[0])
+    os.makedirs(fs.p(d), exist_ok=True)
+    dst = fs.p(d + "/reimu-hostd")
+    shutil.copy(os.path.join(here, "reimu-hostd.init"), dst)
+    os.chmod(dst, 0o755)
+    os.sync()
+    if not svc.enable("reimu-hostd"):
+        log_error("no update-rc.d, chkconfig, insserv or rc3.d directory: the agent will NOT start at boot")
+    svc.ctl("restart", "reimu-hostd")
+
+
+def remove_service(fs, run):
+    svc = Init(fs, run)
+    if svc.kind == "systemd":
+        run(["systemctl", "disable", "--now", "reimu-hostd.service"], timeout=60)
+        if fs.exists(UNIT):
+            os.remove(fs.p(UNIT))
+        run(["systemctl", "daemon-reload"], timeout=60)
+        return
+    svc.ctl("stop", "reimu-hostd")
+    svc.remove_boot("reimu-hostd")
+    s = svc.script("reimu-hostd")
+    if s:
+        os.remove(fs.p(s))
+
+
 def do_install(pstr):
     if os.geteuid() != 0:
         raise SystemExit("run with sudo")
     here = os.path.dirname(os.path.abspath(__file__))
-    for f in ("reimu-hostd.service", "reimu-hostd.conf"):
+    svc = Init(Fs(), run_cmd)
+    for f in ("reimu-hostd.service" if svc.kind == "systemd" else "reimu-hostd.init", "reimu-hostd.conf"):
         if not os.path.exists(os.path.join(here, f)):
             raise SystemExit("%s must be next to %s" % (f, __file__))
     os.makedirs(LIB, exist_ok=True)
@@ -1615,25 +1931,19 @@ def do_install(pstr):
         pair(pstr, Fs())
     if load_secret().get("KEY"):
         bus_owner(Fs(), run_cmd, "install", load_config())
-    shutil.copy(os.path.join(here, "reimu-hostd.service"), UNIT)
-    os.chmod(UNIT, 0o644)
-    os.sync()  # a BMC reboot resets this host: no empty files
-    subprocess.call(["systemctl", "daemon-reload"])
-    subprocess.call(["systemctl", "enable", "reimu-hostd.service"])
-    subprocess.call(["systemctl", "restart", "reimu-hostd.service"])
+    install_service(Fs(), run_cmd, here)
     time.sleep(3)
-    subprocess.call(["systemctl", "--no-pager", "status", "reimu-hostd.service"])
+    print(svc.status("reimu-hostd")[1])
 
 
 def do_uninstall():
     if os.geteuid() != 0:
         raise SystemExit("run with sudo")
-    subprocess.call(["systemctl", "disable", "--now", "reimu-hostd.service"])
+    remove_service(Fs(), run_cmd)
     bus_owner(Fs(), run_cmd, "remove", load_config())
-    for f in (UNIT, os.path.join(LIB, "reimu-hostd.py"), SECRET):
+    for f in (os.path.join(LIB, "reimu-hostd.py"), SECRET):
         if os.path.exists(f):
             os.remove(f)
-    subprocess.call(["systemctl", "daemon-reload"])
     log("removed (%s kept)" % CONF)
 
 
@@ -1653,11 +1963,20 @@ def main(argv):
     elif cmd == "hub-rule":
         if len(argv) < 3 or argv[2] not in ("install", "remove"):
             raise SystemExit("usage: reimu-hostd.py hub-rule install|remove")
-        hub_rule(fs, run, argv[2])
+        try:
+            hub_rule(fs, run, argv[2])
+        except OSError as e:
+            print("the udev rule: %s" % e)
+            return 1
     elif cmd == "bus-owner":
         if len(argv) < 3 or argv[2] not in ("install", "remove"):
             raise SystemExit("usage: reimu-hostd.py bus-owner install|remove")
-        bus_owner(fs, run, argv[2], cfg)
+        try:
+            if not bus_owner(fs, run, argv[2], cfg):
+                return 1
+        except OSError as e:
+            log_error("the BMC's I2C buses: %s" % e)
+            return 1
     elif cmd == "restore-auto":
         f = GpuFan(fs)
         f.touched = True
@@ -1675,7 +1994,7 @@ def main(argv):
         print("config %s: BMC_MAC=%s BMC_IPV4=%s BMC=%s port %d" % (conf, cfg["BMC_MAC"], cfg["BMC_IPV4"], cfg["BMC"], cfg["BMC_PORT"]))
         print("paired: %s" % ("yes, certificate %s…" % s["FINGERPRINT"][:16] if s.get("KEY") else "no"))
         print("link-local candidates: %s" % ", ".join(fmt_cand(c) for c in candidates(cfg, fs, [])))
-        subprocess.call(["systemctl", "--no-pager", "status", "reimu-hostd.service"])
+        print(Init(fs, run).status("reimu-hostd")[1])
     elif cmd == "run":
         s = load_secret(secret)
         if not s.get("KEY") or not s.get("FINGERPRINT"):

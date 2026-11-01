@@ -21,14 +21,20 @@ const held = { ctrl: false, alt: false };
 const narrow = () => window.matchMedia && matchMedia("(max-width: 700px)").matches;
 const touch = () => (window.matchMedia && matchMedia("(pointer: coarse)").matches) || navigator.maxTouchPoints > 0;
 // The host formats its output for 80 columns and never learns the size of
-// a serial terminal. On a narrow screen the font shrinks until 80 columns
-// fit (not below MIN_PX); wider lines pan sideways.
+// a serial terminal: its shell wraps and repositions at 80, so the terminal
+// has 80 columns whatever the window (hostSize below is the one exception). The
+// font shrinks until they fit (not below MIN_PX); wider lines pan sideways.
 const MIN_COLS = 80;
 // ...and for 24 rows, what a serial tty with no size means to vim, less...: in
 // a shorter terminal their cursor addresses clamp to the last row and the
 // screen falls apart. A short window scrolls over the 24 rows instead.
 const MIN_ROWS = 24;
 const MIN_PX = 6;
+// what this page told a port's host with «Размер под окно»: port -> {rows, cols}.
+// Outlives a reconnection and leaving the page, not a reload (nothing asks the host).
+const hostSize = new Map();
+// a desktop scrollbar on the right of the terminal
+const SCROLLBAR_PX = 16;
 // input sent and not a byte back for this long: the host is stuck
 const NO_REPLY_MS = 5000;
 
@@ -41,7 +47,6 @@ function charRatio() {
 
 // font size (px) for `cols` characters in `width` px, at most the chosen size
 function fitPx(width, cols) {
-  if (!narrow()) return prefs.fontSize;
   const px = Math.floor((width / (cols * charRatio())) * 2) / 2;
   return Math.max(MIN_PX, Math.min(prefs.fontSize, px));
 }
@@ -50,7 +55,7 @@ function fitLog(p) {
   // the time column counts too: "10:20:24.528 " or with the date
   const tsCols = !prefs.time ? 0 : prefs.date ? 25 : 14;
   const width = (p.logWrap.clientWidth || p.body.clientWidth || innerWidth) - 16;
-  p.view.setFont(fitPx(width, MIN_COLS + tsCols), termFont(), narrow() ? MIN_COLS + tsCols : 0);
+  p.view.setFont(narrow() ? fitPx(width, MIN_COLS + tsCols) : prefs.fontSize, termFont(), narrow() ? MIN_COLS + tsCols : 0);
 }
 
 // the cursor's row in view when the terminal is taller than its window
@@ -63,18 +68,38 @@ function followCursor(p) {
   else if (y + rowPx > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = y + rowPx - wrap.clientHeight;
 }
 
+const termWidth = (p) => p.termWrap.clientWidth - 8 - (narrow() ? 0 : SCROLLBAR_PX);
+
 function fitTerm(p) {
-  const px = fitPx(p.termWrap.clientWidth - 8, MIN_COLS);
+  const host = hostSize.get(p.index) || { rows: MIN_ROWS, cols: MIN_COLS };
+  const px = fitPx(termWidth(p), host.cols);
   if (p.term.options.fontSize !== px) p.term.options.fontSize = px;
   // one resize to the final size: a fit to fewer rows first would lose the
   // rows below them on the alternate screen (a running vim)
   const dim = p.fit.proposeDimensions();
   if (dim && dim.cols > 0 && dim.rows > 0) {
-    const cols = narrow() ? Math.max(dim.cols, MIN_COLS) : dim.cols;
-    const rows = Math.max(dim.rows, MIN_ROWS);
-    if (cols !== p.term.cols || rows !== p.term.rows) p.term.resize(cols, rows);
+    const rows = Math.max(dim.rows, host.rows);
+    if (host.cols !== p.term.cols || rows !== p.term.rows) p.term.resize(host.cols, rows);
   }
   followCursor(p);
+}
+
+// «Размер под окно»: only on a click, typed like the user's own command, since
+// a serial line has no other way to tell the host
+function sizeToWindow(p) {
+  if (!p.term || !p.client.connected || !p.client.info || !p.client.info.online) {
+    toast("Порт недоступен: размер не изменён", "err");
+    return;
+  }
+  p.term.options.fontSize = prefs.fontSize;
+  const dim = p.fit.proposeDimensions();
+  if (!dim || !(dim.rows > 0)) return;
+  const cols = Math.max(Math.floor(termWidth(p) / (charRatio() * prefs.fontSize)), MIN_COLS);
+  const rows = Math.max(dim.rows, MIN_ROWS);
+  p.client.write(`stty rows ${rows} cols ${cols}\r`);
+  hostSize.set(p.index, { rows, cols });
+  fitTerm(p);
+  p.term.focus();
 }
 
 // Shell prompts draw icons from Nerd Fonts (Unicode private use area). With
@@ -291,6 +316,7 @@ export async function mount(el) {
         h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-time" }), "время"),
         h("label", { class: "inline small" }, h("input", { type: "checkbox", id: "con-date" }), "дата"),
         h("select", { id: "con-baud", title: "Скорость порта" }, BAUDS.map((b) => h("option", { value: b }, `${b}`))),
+        h("button", { class: "btn small", id: "con-winsize", title: "Напечатать в порт команду stty rows … cols … и Enter и растянуть терминал на ширину окна. Хост не знает размер окна: без этого терминал держит его 80 колонок. Команда печатается в то, что сейчас запущено на порту: нажимайте в приглашении shell. После нового входа на порт — ещё раз." }, "Размер под окно"),
         h("button", { class: "btn small", id: "con-break", title: "Послать BREAK (SysRq на Linux)" }, "Break"),
         h("button", { class: "btn small", id: "con-download", title: "Скачать историю с метками времени" }, "Скачать"),
         h("button", { class: "btn small", id: "con-clear", title: "Очистить историю порта на BMC" }, "Очистить"),
@@ -327,6 +353,7 @@ export async function mount(el) {
 
   const $ = (id) => el.querySelector("#" + id);
   $("con-more").addEventListener("click", () => el.classList.toggle("con-extra-open"));
+  $("con-winsize").addEventListener("click", () => active && sizeToWindow(active));
   const showKeys = () => {
     const on = touch() && prefs.keys;
     keys.classList.toggle("hidden", !on);
@@ -457,9 +484,13 @@ function watchReplies(p) {
     clearInterval(p.silentTick);
     const was = p.silentSince;
     p.waitSince = p.silentSince = 0;
-    if (p.lastInput && !isExec(p)) {
+    if ((p.lastInput || hostSize.has(p.index)) && !isExec(p)) {
       p.tail = ((p.tail || "") + (p.loginDec ||= new TextDecoder()).decode(ev.detail.bytes, { stream: true })).slice(-200);
-      if (/login:\s*$/i.test(p.tail)) p.ended = Date.now();
+      if (/login:\s*$/i.test(p.tail)) {
+        if (p.lastInput) p.ended = Date.now();
+        // a new login: the tty was closed, getty starts it at 24x80 again
+        if (hostSize.delete(p.index) && p.term && p === active) fitTerm(p);
+      }
     }
     if (was && p === active) updateStatus();
   });
@@ -609,6 +640,7 @@ function setMode(mode) {
   active.logPane.classList.toggle("hidden", term);
   active.termWrap.classList.toggle("hidden", !term);
   ["con-search", "con-only", "con-tz", "con-date", "con-time"].forEach((id) => (root.querySelector("#" + id).disabled = term));
+  root.querySelector("#con-winsize").disabled = !term;
   if (term) {
     if (!active.term) createTerminal(active);
     requestAnimationFrame(() => {
