@@ -26,7 +26,7 @@ const HARNESS = `<!doctype html><html><head><meta charset="utf-8"><link rel="sty
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open(fix, { width = 1300, height = 900, view, led = { Asserted: false }, html = HARNESS, block } = {}) {
+async function open(fix, { width = 1300, height = 900, view, led = { Asserted: false }, html = HARNESS, block, slow = 0 } = {}) {
   const ctx = await browser.newContext({ locale: "ru-RU", viewport: { width, height } });
   const page = await ctx.newPage();
   const s = { page, errors: [], fix };
@@ -37,6 +37,13 @@ async function open(fix, { width = 1300, height = 900, view, led = { Asserted: f
     const p = new URL(route.request().url()).pathname;
     s.requests = (s.requests || 0) + (p === `${P}/sensors` ? 1 : 0);
     if (block && block.test(p)) return route.fulfill({ status: 404, body: "" });
+    // the live answers of a slow BMC, how many at a time, how many cycles
+    if (slow && (p === LED || p.startsWith(`${P}/`) || p.endsWith("/EthernetInterfaces/eth0"))) {
+      s.inflight = (s.inflight || 0) + 1;
+      s.peak = Math.max(s.peak || 0, s.inflight);
+      await new Promise((r) => setTimeout(r, slow));
+      s.inflight--;
+    }
     if (p === "/harness.html") return route.fulfill({ contentType: "text/html", body: html });
     if (p === "/js/app.js") return route.fulfill({ contentType: "text/javascript", body: 'export const appState = { power: "On", user: "root" };' });
     if (p === "/redfish/v1/Systems/system") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ Model: "M", MemorySummary: { TotalSystemMemoryGiB: 125 } }) });
@@ -333,6 +340,16 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   const index = fs.readFileSync(path.join(WWW, "index.html"), "utf8");
   const app = fs.readFileSync(path.join(WWW, "js/app.js"), "utf8");
   check(!/data-page="map"/.test(index) && !/pages\/map|"map"/.test(app), "no «Карта» in the menu, no route");
+}
+
+// a slow BMC, a cycle longer than the period: one request at a time, the next cycle after it
+{
+  const s = await open(clone(FIX), { slow: 1200 });
+  await ready(s);
+  await s.page.waitForTimeout(13000);
+  check(s.peak === 1, `one live request at a time on a slow BMC (peak ${s.peak})`);
+  check(s.requests === 2, `the next cycle waits for the one before and the period (${s.requests} cycles in 19 s)`);
+  await s.page.context().close();
 }
 
 // a phone

@@ -82,12 +82,21 @@ export async function mount(el) {
   setView(loadView());
   await refresh();
   if (root !== el) return false;
-  timer = setInterval(refresh, 5000);
+  timer = setTimeout(() => poll(el), 5000);
   return true;
 }
 
+// the next cycle only after this one: a slow BMC gets no queue of requests
+async function poll(el) {
+  try {
+    await refresh();
+  } finally {
+    if (root === el) timer = setTimeout(() => poll(el), 5000);
+  }
+}
+
 export function unmount() {
-  clearInterval(timer);
+  clearTimeout(timer);
   if (scene) scene.destroy();
   scene = null;
   root = null;
@@ -253,11 +262,11 @@ function shapeOf(m) {
 
 // ------------------------------------------------------------------ the page
 async function refresh() {
-  const [sensors, fans, host, eth, led] = await Promise.all([
-    json(`${P}/sensors`), json(`${P}/fans`), json(`${P}/hostlink`),
-    api.get("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0").catch(() => null),
-    api.get("/xyz/openbmc_project/led/groups/enclosure_identify").then((r) => r.data).catch(() => null),
-  ]);
+  const sensors = await json(`${P}/sensors`);
+  const fans = await json(`${P}/fans`);
+  const host = await json(`${P}/hostlink`);
+  const eth = await api.get("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0").catch(() => null);
+  const led = await api.get("/xyz/openbmc_project/led/groups/enclosure_identify").then((r) => r.data).catch(() => null);
   if (!root) return;
   const uid = led && led.Asserted !== undefined ? { known: true, on: !!led.Asserted } : { known: false, on: false };
   model = buildModel(sensors, fans, host, eth, uid);
