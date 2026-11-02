@@ -1,9 +1,11 @@
-# The A/B firmware for REIMU-5564. Push to reimu-ci: a build, the result as an
-# artifact. A tag reimu-*: the same, and a pre-release with it.
+# The A/B firmware for REIMU-5564. By hand (Actions, Run workflow): a build, the
+# result as an artifact. A tag reimu-*: the same, and a pre-release with it.
+# The cache of the sstate is read by a tag only from the default branch: a build
+# by hand on it keeps the builds of tags short.
 name: reimu build
 on:
+  workflow_dispatch:
   push:
-    branches: [reimu-ci]
     tags: ['reimu-*']
 permissions:
   contents: write
