@@ -6,7 +6,7 @@
 //   BASE=https://127.0.0.1:3443 OUT=dir node agent-install.qemu.mjs
 // AGENT_DISK=on (a virtual hub: QEMU's ast2500 has one, the board) | error (no USB device controller)
 import { chromium } from "playwright";
-import { BASE, OUT } from "./common.mjs";
+import { BASE, OUT, loginReady, traceRequests } from "./common.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import tls from "node:tls";
@@ -32,7 +32,8 @@ const browser = await chromium.launch({ executablePath: process.env.CHROME || un
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1400, height: 1000 }, locale: "ru-RU", acceptDownloads: true });
 await ctx.grantPermissions(["clipboard-read", "clipboard-write"], { origin: BASE }).catch(() => {});
 const page = await ctx.newPage();
-// what did not load: an app that does not start says nothing else
+traceRequests(page);
+  // what did not load: an app that does not start says nothing else
 page.on("requestfailed", (r) => console.log(`  request failed: ${r.url()} ${r.failure() && r.failure().errorText}`));
 page.on("response", (r) => r.status() >= 400 && console.log(`  answer ${r.status()}: ${r.request().method()} ${r.url()}`));
 page.on("console", (m) => m.type() === "error" && console.log(`  console: ${m.text()}`));
@@ -44,6 +45,7 @@ const pairOf = (cmd) => (cmd.match(/--pair '(reimu1:[A-Za-z0-9_-]+)'/) || [])[1]
 const out = {};
 try {
   await page.goto(BASE + "/");
+  await loginReady(page);
   await page.fill("#login-pass", "0penBmc");
   await page.click("#login-form button[type=submit]");
   await page.waitForSelector("#app:not(.hidden)");

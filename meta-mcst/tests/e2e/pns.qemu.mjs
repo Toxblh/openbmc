@@ -5,7 +5,7 @@
 //   node pns.qemu.mjs write     PNS_IMAGE: upload, check, write, the new version shown
 //   node pns.qemu.mjs restore   the newest backup written back
 import { chromium } from "playwright";
-import { BASE, OUT } from "./common.mjs";
+import { BASE, OUT, loginReady, traceRequests } from "./common.mjs";
 import fs from "node:fs";
 
 const mode = process.argv[2] || "write";
@@ -18,7 +18,8 @@ const check = (c, w) => {
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, args: ["--ignore-certificate-errors"] });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1400, height: 1000 }, locale: "ru-RU" });
 const page = await ctx.newPage();
-// what did not load: an app that does not start says nothing else
+traceRequests(page);
+  // what did not load: an app that does not start says nothing else
 page.on("requestfailed", (r) => console.log(`  request failed: ${r.url()} ${r.failure() && r.failure().errorText}`));
 page.on("response", (r) => r.status() >= 400 && console.log(`  answer ${r.status()}: ${r.request().method()} ${r.url()}`));
 page.on("console", (m) => m.type() === "error" && console.log(`  console: ${m.text()}`));
@@ -30,7 +31,8 @@ page.on("dialog", (d) => {
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 await page.goto(BASE + "/");
-await page.fill("#login-pass", "0penBmc");
+await loginReady(page);
+  await page.fill("#login-pass", "0penBmc");
 await page.click("#login-form button[type=submit]");
 await page.waitForSelector("#app:not(.hidden)");
 await page.goto(`${BASE}/#/hardware`);

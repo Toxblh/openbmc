@@ -10,7 +10,7 @@
 // over the rows, no sideways scroll of the page, the top bar inside the
 // window; the ECC card per controller. Screenshots OUT/layout-*.png.
 import { chromium } from "playwright";
-import { BASE, OUT } from "./common.mjs";
+import { BASE, OUT, loginReady, traceRequests } from "./common.mjs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -83,6 +83,7 @@ const SIZES = [[1400, 1000], [768, 1024], [390, 844]];
 for (const [w, hgt] of SIZES) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt }, locale: "ru-RU", isMobile: w < 500, hasTouch: w < 500 });
   const page = await ctx.newPage();
+  traceRequests(page);
   // what did not load: an app that does not start says nothing else
   page.on("requestfailed", (r) => console.log(`  request failed: ${r.url()} ${r.failure() && r.failure().errorText}`));
   page.on("response", (r) => r.status() >= 400 && console.log(`  answer ${r.status()}: ${r.request().method()} ${r.url()}`));
@@ -101,7 +102,8 @@ for (const [w, hgt] of SIZES) {
   const at = `${w}×${hgt}`;
   try {
     await page.goto(BASE + "/#/host");
-    await page.fill("#login-pass", "0penBmc");
+    await loginReady(page);
+  await page.fill("#login-pass", "0penBmc");
     await page.click("#login-form button[type=submit]");
     await page.waitForSelector("#app:not(.hidden)");
     await page.goto(BASE + "/#/host");
