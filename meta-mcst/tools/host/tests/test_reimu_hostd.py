@@ -345,6 +345,40 @@ class TestInventory(Base):
         self.assertEqual(g["vram_total"], 8 << 30)
         self.assertEqual(g["vbios"], "113-D1820201-101")
 
+    def test_map_topology(self):
+        """what the board map shows slots with: PCI parents, a disk's port, USB without serials"""
+        t = self.t
+        d = "/sys/devices/pci0000:00/0000:00:00.0"
+        t.put(d + "/0000:01:08.0/vendor", "0x1fff")
+        t.put(d + "/0000:01:08.0/0000:08:00.0/vendor", "0x1002")
+        t.link("/sys/bus/pci/devices/0000:01:08.0", d + "/0000:01:08.0")
+        t.link("/sys/bus/pci/devices/0000:08:00.0", d + "/0000:01:08.0/0000:08:00.0")
+        ata = d + "/0000:01:03.0/ata4/host3/target3:0:0/3:0:0:0"
+        t.put(ata + "/model", "NT-512")
+        t.put("/sys/block/sdz/size", "2048")
+        t.link("/sys/block/sdz/device", ata)
+        usb = d + "/0000:01:0b.1/usb4/4-1/4-1:1.0/host8/target8:0:0/8:0:0:0"
+        t.put(usb + "/model", "Ultra Fit")
+        t.put("/sys/block/sdy/size", "2048")
+        t.link("/sys/block/sdy/device", usb)
+        for n, vals in (("4-1", {"idVendor": "0781", "idProduct": "5583", "product": "Ultra Fit", "speed": "480", "maxchild": "0", "serial": "SECRET"}),
+                        ("4-4", {"idVendor": "1d6b", "idProduct": "0107", "product": "USB Virtual Hub", "speed": "480", "maxchild": "5"}),
+                        ("usb4", {"idVendor": "1d6b", "idProduct": "0002", "product": "EHCI", "speed": "480", "maxchild": "4"})):
+            for k, v in vals.items():
+                t.put("/sys/bus/usb/devices/%s/%s" % (n, k), v)
+        inv = self.inv()
+        pci = {x["slot"]: x for x in inv["pci"]}
+        self.assertEqual(pci["0000:08:00.0"]["parent"], "0000:01:08.0")
+        self.assertEqual(pci["0000:01:08.0"]["parent"], "0000:00:00.0")
+        disks = {x["name"]: x for x in inv["disks"]}
+        self.assertEqual(disks["sdz"]["bus"], {"pci": "0000:01:03.0", "ata": 4})
+        self.assertEqual(disks["sdy"]["bus"]["usb"], "4-1")
+        usbs = {x["name"]: x for x in inv["usb"]}
+        self.assertEqual(sorted(usbs), ["4-1", "4-4"])
+        self.assertEqual(usbs["4-1"], {"name": "4-1", "id": "0781:5583", "product": "Ultra Fit", "speed": 480, "hub": False})
+        self.assertTrue(usbs["4-4"]["hub"])
+        self.assertNotIn("SECRET", json.dumps(inv["usb"]))
+
     def test_inventory_is_json(self):
         json.dumps(self.inv())
 
