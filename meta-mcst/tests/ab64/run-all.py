@@ -172,6 +172,8 @@ def main():
                                   "node", os.path.join(e2e, "pns-blank.stub.mjs")]))
     jobs.append(Job("ota_page", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                  "node", os.path.join(e2e, "ota.stub.mjs")]))
+    jobs.append(Job("map", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                            "node", os.path.join(e2e, "map.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

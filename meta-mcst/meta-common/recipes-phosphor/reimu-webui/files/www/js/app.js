@@ -7,6 +7,7 @@ const pages = {
   console: () => import("./pages/console.js"),
   media: () => import("./pages/media.js"),
   sensors: () => import("./pages/sensors.js"),
+  map: () => import("./pages/map.js"),
   hardware: () => import("./pages/hardware.js"),
   host: () => import("./pages/host.js"),
   logs: () => import("./pages/journal.js"),

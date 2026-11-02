@@ -1,0 +1,839 @@
+{
+"sensors": {
+"version": 1,
+"now": 1793608226,
+"platform": "on",
+"sensors": [
+{
+"kind": "temp",
+"group": "FAN Control (X38), (X39,X40)",
+"name": "Internal Temp",
+"src": "2-004c",
+"value": 44.0,
+"warn": 70.0,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "FAN Control (X38), (X39,X40)",
+"name": "IOHUB Temp",
+"src": "2-004c",
+"value": 56.875,
+"warn": 105.0,
+"crit": 110.0,
+"status": "ok"
+},
+{
+"kind": "fan",
+"group": "FAN Control (X38), (X39,X40)",
+"name": "вентилятор",
+"src": "2-004c",
+"value": 0.0,
+"status": "ok"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 0",
+"src": "2-002e",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 1",
+"src": "2-002e",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 2",
+"src": "2-002e",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 3",
+"src": "2-002e",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 4",
+"src": "2-002e",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 5",
+"src": "2-002c",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 6",
+"src": "2-002c",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 7",
+"src": "2-002c",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 8",
+"src": "2-002c",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "fan",
+"group": "Вентиляторы (EMC2305)",
+"name": "вентилятор 9",
+"src": "2-002c",
+"value": null,
+"duty": 42,
+"status": "na"
+},
+{
+"kind": "temp",
+"group": "CPU FAN Control (X37)",
+"name": "Internal Temp",
+"src": "6-004c",
+"value": 41.0,
+"warn": 70.0,
+"status": "ok"
+},
+{
+"kind": "fan",
+"group": "CPU FAN Control (X37)",
+"name": "вентилятор",
+"src": "6-004c",
+"value": 915.0,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Power Control",
+"name": "температура",
+"src": "6-0060",
+"value": 23.0,
+"warn": 70.0,
+"crit": 85.0,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "Power Control",
+"name": "вход",
+"src": "6-0060",
+"value": 0.0,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "Power Control",
+"name": "выход",
+"src": "6-0060",
+"value": 1.069,
+"status": "ok"
+},
+{
+"kind": "curr",
+"group": "Power Control",
+"name": "ток выхода",
+"src": "6-0060",
+"value": 0.13,
+"status": "ok"
+},
+{
+"kind": "power",
+"group": "Power Control",
+"name": "мощность выхода",
+"src": "6-0060",
+"value": 0.139,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+1V2_01 (in +12V)",
+"name": "вход",
+"src": "6-0045",
+"value": 12.031,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+1V2_01 (in +12V)",
+"name": "выход (обратная связь)",
+"src": "6-0045",
+"value": 0.52,
+"status": "ok"
+},
+{
+"kind": "curr",
+"group": "+1V2_01 (in +12V)",
+"name": "ток выхода",
+"src": "6-0045",
+"value": 2.688,
+"status": "ok"
+},
+{
+"kind": "power",
+"group": "+1V2_01 (in +12V)",
+"name": "мощность выхода",
+"src": "6-0045",
+"value": 1.289,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "+1V2_01 (in +12V)",
+"name": "температура",
+"src": "6-0045",
+"value": 65.0,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+1V2_23 (in +12V)",
+"name": "вход",
+"src": "6-0046",
+"value": 12.031,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+1V2_23 (in +12V)",
+"name": "выход (обратная связь)",
+"src": "6-0046",
+"value": 0.516,
+"status": "ok"
+},
+{
+"kind": "curr",
+"group": "+1V2_23 (in +12V)",
+"name": "ток выхода",
+"src": "6-0046",
+"value": 3.188,
+"status": "ok"
+},
+{
+"kind": "power",
+"group": "+1V2_23 (in +12V)",
+"name": "мощность выхода",
+"src": "6-0046",
+"value": 1.676,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "+1V2_23 (in +12V)",
+"name": "температура",
+"src": "6-0046",
+"value": 57.0,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+UNCORE (in +12V)",
+"name": "вход",
+"src": "6-0044",
+"value": 12.031,
+"status": "ok"
+},
+{
+"kind": "in",
+"group": "+UNCORE (in +12V)",
+"name": "выход (обратная связь)",
+"src": "6-0044",
+"value": 0.52,
+"status": "ok"
+},
+{
+"kind": "curr",
+"group": "+UNCORE (in +12V)",
+"name": "ток выхода",
+"src": "6-0044",
+"value": 4.5,
+"status": "ok"
+},
+{
+"kind": "power",
+"group": "+UNCORE (in +12V)",
+"name": "мощность выхода",
+"src": "6-0044",
+"value": 2.32,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "+UNCORE (in +12V)",
+"name": "температура",
+"src": "6-0044",
+"value": 69.0,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "ядра 0, 1",
+"src": "5-0020",
+"value": 60.5,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "ядра 2, 3",
+"src": "5-0021",
+"value": 60.125,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "ядра 4, 5",
+"src": "5-0022",
+"value": 57.875,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "ядра 6, 7",
+"src": "5-0023",
+"value": 58.25,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "контроллеры памяти 0, 1",
+"src": "5-0024",
+"value": 51.375,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "контроллеры памяти 2, 3",
+"src": "5-0025",
+"value": 51.125,
+"status": "ok"
+},
+{
+"kind": "temp",
+"group": "Процессор 0",
+"name": "системный коммутатор",
+"src": "5-0026",
+"value": 59.375,
+"status": "ok"
+}
+]
+},
+"fans": {
+"zones": [
+{
+"id": "cpu",
+"fans": [
+{
+"dev": "6-004c",
+"duty": 43.1
+}
+]
+},
+{
+"id": "board",
+"fans": [
+{
+"dev": "2-004c",
+"duty": 42.2
+},
+{
+"dev": "2-002c",
+"duty": 42.2
+},
+{
+"dev": "2-002e",
+"duty": 42.2
+}
+]
+}
+]
+},
+"host": {
+"agent": {
+"connected": true,
+"version": "1.0"
+},
+"heartbeat": {
+"state": "ok",
+"age": 0
+},
+"paired": true,
+"sensors": {
+"Host_GPU_Edge": 29,
+"Host_GPU_Junction": 29,
+"Host_GPU_Memory": 34,
+"Host_GPU_Fan": 1493,
+"Host_GPU_Fan_PWM": 40,
+"Host_GPU_Power": 10,
+"Host_Disk_Max": null
+},
+"inventory": {
+"pci": [
+{
+"slot": "0000:00:00.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8017",
+"name": "Virtual Bridge",
+"parent": null
+},
+{
+"slot": "0000:01:00.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8000",
+"name": "PCI Bridge",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:01.0",
+"class": "020000",
+"vendor": "1fff",
+"device": "8016",
+"driver": "l_e1000",
+"name": "Gigabit Ethernet Controller",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:01.1",
+"class": "020000",
+"vendor": "1fff",
+"device": "8016",
+"driver": "l_e1000",
+"name": "Gigabit Ethernet Controller",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:01.2",
+"class": "020000",
+"vendor": "1fff",
+"device": "8016",
+"name": "Gigabit Ethernet Controller",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:02.0",
+"class": "01018f",
+"vendor": "1fff",
+"device": "800b",
+"name": "IDE controller",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:02.1",
+"class": "070200",
+"vendor": "1fff",
+"device": "8018",
+"driver": "i2c_spi",
+"name": "I2C SPI",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:02.2",
+"class": "078000",
+"vendor": "1fff",
+"device": "8019",
+"driver": "serial_zilog",
+"name": "Parallel and Serial",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:02.3",
+"class": "040100",
+"vendor": "1fff",
+"device": "800a",
+"driver": "snd_hda_intel",
+"name": "HD Audio",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:02.4",
+"class": "078000",
+"vendor": "1fff",
+"device": "8014",
+"name": "GPIO MPV",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:03.0",
+"class": "010601",
+"vendor": "1fff",
+"device": "801a",
+"driver": "ahci",
+"name": "SATA",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:03.1",
+"class": "010601",
+"vendor": "1fff",
+"device": "801a",
+"driver": "ahci",
+"name": "SATA",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:04.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8010",
+"name": "PCI-Express x4",
+"link": {
+"speed": "2.5 GT/s PCIe",
+"width": 1,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 4
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:05.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8010",
+"name": "PCI-Express x4",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 1,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 4
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:06.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8010",
+"name": "PCI-Express x4",
+"link": {
+"speed": "2.5 GT/s PCIe",
+"width": 1,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 4
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:07.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8010",
+"name": "PCI-Express x4",
+"link": {
+"speed": "2.5 GT/s PCIe",
+"width": 1,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 4
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:08.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8011",
+"name": "PCI-Express x16",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 8,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:09.0",
+"class": "060400",
+"vendor": "1fff",
+"device": "8011",
+"name": "PCI-Express x16",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 4,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:0a.0",
+"class": "0c0310",
+"vendor": "1fff",
+"device": "8008",
+"driver": "ohci-pci",
+"name": "USB 2.0 ohci",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:0a.1",
+"class": "0c0320",
+"vendor": "1fff",
+"device": "801e",
+"driver": "ehci-pci",
+"name": "USB 2.0 ehci",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:0b.0",
+"class": "0c0310",
+"vendor": "1fff",
+"device": "8008",
+"driver": "ohci-pci",
+"name": "USB 2.0 ohci",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:0b.1",
+"class": "0c0320",
+"vendor": "1fff",
+"device": "801e",
+"driver": "ehci-pci",
+"name": "USB 2.0 ehci",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:01:0c.0",
+"class": "000000",
+"vendor": "1fff",
+"device": "800e",
+"driver": "acpi-spmc",
+"name": "SPMC",
+"parent": "0000:00:00.0"
+},
+{
+"slot": "0000:04:00.0",
+"class": "060400",
+"vendor": "1a03",
+"device": "1150",
+"name": "AST1150 PCI-to-PCI Bridge",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 1,
+"max_speed": "5.0 GT/s PCIe",
+"max_width": 1
+},
+"parent": "0000:01:05.0"
+},
+{
+"slot": "0000:05:00.0",
+"class": "030000",
+"vendor": "1a03",
+"device": "2000",
+"driver": "ast",
+"name": "ASPEED Graphics Family",
+"parent": "0000:04:00.0"
+},
+{
+"slot": "0000:08:00.0",
+"class": "060400",
+"vendor": "1002",
+"device": "1478",
+"name": "Navi 10 XL Upstream Port of PCI Express Switch",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 8,
+"max_speed": "16.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:01:08.0"
+},
+{
+"slot": "0000:09:00.0",
+"class": "060400",
+"vendor": "1002",
+"device": "1479",
+"name": "Navi 10 XL Downstream Port of PCI Express Switch",
+"link": {
+"speed": "16.0 GT/s PCIe",
+"width": 16,
+"max_speed": "16.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:08:00.0"
+},
+{
+"slot": "0000:0a:00.0",
+"class": "030000",
+"vendor": "1002",
+"device": "731f",
+"driver": "amdgpu",
+"name": "Navi 10 [Radeon RX 5600 OEM/5600 XT / 5700/5700 XT]",
+"link": {
+"speed": "16.0 GT/s PCIe",
+"width": 16,
+"max_speed": "16.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:09:00.0"
+},
+{
+"slot": "0000:0a:00.1",
+"class": "040300",
+"vendor": "1002",
+"device": "ab38",
+"driver": "snd_hda_intel",
+"name": "Navi 10 HDMI Audio",
+"link": {
+"speed": "16.0 GT/s PCIe",
+"width": 16,
+"max_speed": "16.0 GT/s PCIe",
+"max_width": 16
+},
+"parent": "0000:09:00.0"
+},
+{
+"slot": "0000:0b:00.0",
+"class": "010802",
+"vendor": "144d",
+"device": "a808",
+"driver": "nvme",
+"name": "NVMe SSD Controller SM981/PM981/PM983",
+"link": {
+"speed": "5.0 GT/s PCIe",
+"width": 4,
+"max_speed": "8.0 GT/s PCIe",
+"max_width": 4
+},
+"parent": "0000:01:09.0"
+}
+],
+"disks": [
+{
+"name": "nvme0n1",
+"model": "Samsung SSD 970 PRO 512GB",
+"size": 512110190592,
+"transport": "nvme",
+"bus": {
+"pci": "0000:0b:00.0"
+}
+},
+{
+"name": "sda",
+"model": "NT-512 2280",
+"size": 512110190592,
+"transport": "ata/scsi",
+"bus": {
+"pci": "0000:01:03.0",
+"ata": 4
+}
+},
+{
+"name": "sdb",
+"model": "Ultra Fit",
+"size": 15376318464,
+"transport": "ata/scsi",
+"bus": {
+"pci": "0000:01:0b.1",
+"usb": "4-1"
+}
+}
+],
+"nics": [
+{
+"name": "enp1s1f0",
+"carrier": false,
+"speed": null,
+"state": "down",
+"pci": "0000:01:01.0"
+},
+{
+"name": "enp1s1f1",
+"carrier": true,
+"speed": 100,
+"state": "up",
+"pci": "0000:01:01.1"
+}
+],
+"usb": [
+{
+"name": "4-1",
+"id": "0781:5583",
+"product": "Ultra Fit",
+"speed": 480,
+"hub": false
+},
+{
+"name": "4-3",
+"id": "1d6b:0104",
+"product": "USB Emulation Device",
+"speed": 480,
+"hub": false
+},
+{
+"name": "4-4",
+"id": "1d6b:0107",
+"product": "USB Virtual Hub",
+"speed": 480,
+"hub": true
+},
+{
+"name": "4-4.1",
+"id": "1d6b:0104",
+"product": "virtual_input",
+"speed": 480,
+"hub": false
+}
+],
+"gpu": {
+"name": "Navi 10 [Radeon RX 5600 OEM/5600 XT / 5700/5700 XT]",
+"slot": "0000:0a:00.0"
+},
+"memory": {
+"total_mib": 128798,
+"ecc": "unknown",
+"dimms": [],
+"controllers": []
+}
+}
+},
+"pns": {
+"version": 1,
+"fruXml": "<fruinfo><board_info_area><product_name>1E8CB-uATX</product_name><part_number>TVGI.469555.445</part_number></board_info_area></fruinfo>",
+"devtree": "/ {\n\tmodel = \"1E8SV-uATX TVGI.469555.445\";\n};"
+},
+"eth": {
+"LinkStatus": "LinkUp",
+"SpeedMbps": 0
+}
+}

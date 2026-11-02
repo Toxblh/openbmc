@@ -271,6 +271,9 @@ class Fs:
         return self.un(os.path.realpath(self.p(path)))
 
 
+PCI_ADDR = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+
+
 def _natkey(s):
     return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)]
 
@@ -504,7 +507,7 @@ class Collector:
     # ---- inventory
     def inventory(self):
         return {"os": self.os_info(), "cpu": self.cpu(), "memory": self.memory(), "pci": self.pci(),
-                "disks": self.disks(), "nics": self.nics(), "gpu": self.gpu_info(),
+                "disks": self.disks(), "nics": self.nics(), "gpu": self.gpu_info(), "usb": self.usb(),
                 "bmc_usb_hub": bmc_usb_hub_state(self.fs), "i2c_owner": bus_owner_state(self.fs, self.cfg),
                 "agent": {"version": VERSION, "proto": PROTO}}
 
@@ -582,6 +585,9 @@ class Collector:
             e = {"slot": slot, "vendor": hx("vendor"), "device": hx("device"), "class": hx("class"),
                  "subsys": "%s:%s" % (hx("subsystem_vendor"), hx("subsystem_device")), "rev": hx("revision"),
                  "driver": self.fs.link_name(d + "/driver"), "numa": self.fs.int(d + "/numa_node", -1)}
+            parent = os.path.basename(os.path.dirname(self.fs.realpath(d)))
+            if PCI_ADDR.fullmatch(parent):
+                e["parent"] = parent
             sp = self.fs.read(d + "/current_link_speed")
             if sp and sp != "Unknown":
                 e["link"] = {"speed": sp, "width": self.fs.int(d + "/current_link_width"),
@@ -591,6 +597,31 @@ class Collector:
             if n:
                 e["name"], e["vendor_name"], e["class_name"] = n.get("Device"), n.get("Vendor"), n.get("Class")
             out.append(e)
+        return out
+
+    def _disk_bus(self, dev):
+        """where a disk hangs: its PCI function, the ATA port or USB device"""
+        path = self.fs.realpath(dev)
+        fns = PCI_ADDR.findall(path)
+        bus = {"pci": fns[-1]} if fns else {}
+        m = re.search(r"/ata(\d+)/", path)
+        if m:
+            bus["ata"] = int(m.group(1))
+        usb = re.findall(r"/(\d+-[\d.]+)(?=/)", path)
+        if usb:
+            bus["usb"] = usb[-1]
+        return bus or None
+
+    def usb(self):
+        """USB devices past the root hubs, no serial numbers"""
+        out = []
+        for d in self.fs.glob("/sys/bus/usb/devices/*"):
+            name = os.path.basename(d)
+            if name.startswith("usb") or ":" in name or not self.fs.exists(d + "/idVendor"):
+                continue
+            out.append({"name": name, "id": "%s:%s" % (self.fs.read(d + "/idVendor"), self.fs.read(d + "/idProduct")),
+                        "product": self.fs.read(d + "/product"), "speed": self.fs.int(d + "/speed"),
+                        "hub": (self.fs.int(d + "/maxchild") or 0) > 0})
         return out
 
     def _disk_dirs(self):
@@ -615,7 +646,8 @@ class Collector:
                         "firmware": self.fs.read(dev + "/firmware_rev") or self.fs.read(dev + "/rev"),
                         "size": (self.fs.int(b + "/size") or 0) * 512,
                         "rotational": self.fs.read(b + "/queue/rotational") == "1",
-                        "transport": "nvme" if name.startswith("nvme") else ("mmc" if name.startswith("mmc") else "ata/scsi")})
+                        "transport": "nvme" if name.startswith("nvme") else ("mmc" if name.startswith("mmc") else "ata/scsi"),
+                        "bus": self._disk_bus(dev)})
         return out
 
     def _addrs(self):
@@ -651,6 +683,7 @@ class Collector:
             out.append({"name": name, "mac": self.fs.read(n + "/address"), "state": self.fs.read(n + "/operstate"),
                         "carrier": self.fs.read(n + "/carrier") == "1", "speed": sp if sp and sp > 0 else None,
                         "mtu": self.fs.int(n + "/mtu"), "driver": self.fs.link_name(n + "/device/driver"),
+                        "pci": self.fs.link_name(n + "/device"),
                         "addrs": addrs.get(name, [])})
         return out
 
