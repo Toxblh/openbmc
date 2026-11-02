@@ -132,6 +132,9 @@ async function shot(s, name) { if (SHOTS) { await s.page.waitForTimeout(1000); a
   const usbp = await pop(s, "X4");
   check(!(await s.page.locator("#sv, svg").first().innerHTML()).includes("…"), "no name cut with an ellipsis");
   check(/USB нижний[\s\S]*Ultra Fit/.test(usbp), `USB by port number (${usbp.replace(/\n/g, " ").slice(0, 140)})`);
+  // the BMC's load
+  check(/LA 0\.42/.test(await s.page.locator(".bs-part[data-id=BMC]").last().textContent()), "the BMC's load average in a cloud at its chip");
+  check(/0\.42 \/ 0\.30 \/ 0\.25/.test(await pop(s, "BMC")), "all three in its popover");
   // fans, UID
   check(/1\d{3} об\/мин|\d+ об\/мин/.test(text) && /\d+ %/.test(text), "fans: speed and percent in clouds");
   check((await s.page.locator(".bs-part[data-id='X5']").getAttribute("opacity")) === "0.35", "a fan not connected is dim");

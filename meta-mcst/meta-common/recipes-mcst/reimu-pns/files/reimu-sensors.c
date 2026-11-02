@@ -537,6 +537,11 @@ void sensors_json(struct buf *b)
 {
     struct dt t;
     struct out o = { b, 0 };
+    double la[3];
+    FILE *lf = fopen("/proc/loadavg", "r");
+    if (lf && fscanf(lf, "%lf %lf %lf", &la[0], &la[1], &la[2]) == 3)
+        buf_printf(b, "\"bmc\":{\"load\":[%.2f,%.2f,%.2f]},", la[0], la[1], la[2]);
+    if (lf) fclose(lf);
     buf_str(b, "\"sensors\":[");
     const char *file = getenv("REIMU_DTB");
     if (dt_load(&t, file ? file : DTB_FILE))

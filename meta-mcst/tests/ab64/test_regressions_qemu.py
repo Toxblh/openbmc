@@ -189,6 +189,11 @@ def t_mcinfo(b):
     check(rc == 0 and got == want, "[29] mc info Firmware Revision %s for %s (want %s)" % (got, v, want))
 
 
+def t_bmc_load(b):
+    o = b.out("busctl get-property xyz.openbmc_project.Reimu.Pns /xyz/openbmc_project/reimu/sensors xyz.openbmc_project.Reimu.Sensors Json 2>&1 | head -c 200")
+    check(bool(re.search(r'bmc.{1,6}load.{1,6}\[[0-9.]+,[0-9.]+,[0-9.]+\]', o)), "the BMC's load average in the sensors' Json (%s)" % o[:100])
+
+
 def t_ssh(b):
     s, j = IR.get("/redfish/v1/Managers/bmc/NetworkProtocol")
     ssh = (j.get("SSH") or {}).get("ProtocolEnabled") if s == 200 else None
@@ -220,7 +225,7 @@ def g_base():
         IR.wait_redfish()
         IR.wait_ipmi()
         subprocess.run(["curl", "-ks", "-o", "/dev/null", "https://127.0.0.1:%d/" % T.HTTPS])  # bmcweb: its certificate
-        for fn in (t_locale, t_kvmcert, t_overheatd, t_uhf, t_truststore, t_mcinfo, t_ssh, t_dhcp, t_fans):
+        for fn in (t_locale, t_kvmcert, t_overheatd, t_uhf, t_truststore, t_mcinfo, t_bmc_load, t_ssh, t_dhcp, t_fans):
             try:
                 fn(b)
             except Exception as e:  # one check that breaks doesn't stop the others

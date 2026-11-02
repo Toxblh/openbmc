@@ -234,7 +234,7 @@ function buildModel(sensors, fans, host, eth, uid) {
 
   const part = id.part ? id.part.replace(/^TVGI/, "ТВГИ") : null;
   return {
-    on, inv, sensors: sensorsOut, fans: fanOut, pcie, sata, m2, net, usb: usbModel, uid,
+    on, inv, bmcLoad: (sensors && sensors.bmc && sensors.bmc.load) || null, sensors: sensorsOut, fans: fanOut, pcie, sata, m2, net, usb: usbModel, uid,
     mem: { total: sumGb || (totalMib ? Math.round(totalMib / 1024) : null), slots, modules: modules || null, same: !!same, kind: modules && modules.length ? moduleKind(modules[0]) : "" },
     board: { serial: id.serial, part, vendor: id.vendor, model: board.name },
   };
@@ -242,9 +242,10 @@ function buildModel(sensors, fans, host, eth, uid) {
 
 // what the drawing depends on; values alone change in place
 function shapeOf(m) {
+  // (the BMC's load: there or not, its value changes in place)
   const pick = (o, f) => Object.entries(o).map(([k, v]) => [k, ...f(v)]);
   return JSON.stringify([
-    m.sensors.map((s) => s.id), pick(m.fans, (f) => [f.conn]), pick(m.pcie, (d) => [d.state, d.width, d.dev]),
+    !!m.bmcLoad, m.sensors.map((s) => s.id), pick(m.fans, (f) => [f.conn]), pick(m.pcie, (d) => [d.state, d.width, d.dev]),
     pick(m.sata, (d) => [d.state, d.dev]), pick(m.m2, (d) => [d.state, d.dev, d.size]),
     pick(m.net, (d) => [d.known, d.link, d.speed]), m.usb.X4.map((u) => !!u), m.uid.on, pick(m.mem.slots, (d) => [d.state, d.size]),
   ]);
@@ -271,6 +272,7 @@ async function refresh() {
     shape = s;
   } else {
     for (const t of model.sensors) scene.setValue(`S:${t.id}`, t);
+    if (model.bmcLoad) scene.setValue("B:load", `LA ${model.bmcLoad[0].toFixed(2)}`);
     for (const [fid, f] of Object.entries(model.fans)) if (f.conn) scene.setValue(`F:${fid}`, fanText(f));
     scene.refreshPopover();
   }
@@ -328,6 +330,7 @@ function info(pid) {
   if (pid === "PN") return { title: "Партномер", sub: "из FRU", rows: [["Значение", m.board.part || "нет данных"]] };
   if (pid === "BOARD") return { title: m.board.model, sub: "244 × 244 мм", rows: [["Процессор", "Эльбрус-8СВ"], m.board.serial ? ["Серийный номер", m.board.serial] : null] };
   const f = board.fixed[pid];
+  if (f && pid === "BMC" && m.bmcLoad) return { title: f[0], sub: f[1], rows: [["Load Average", m.bmcLoad.map((x) => x.toFixed(2)).join(" / ")]], note: "За 1, 5 и 15 минут." };
   if (!f) return null;
   const t = pid === "CPU" ? m.sensors.find((s) => s.id === "CPU") : pid === "KPI" ? m.sensors.find((s) => s.id === "KPI") : null;
   return { title: f[0], sub: f[1], rows: t ? [["Температура", `${Math.round(t.temp)} °C`]] : [] };

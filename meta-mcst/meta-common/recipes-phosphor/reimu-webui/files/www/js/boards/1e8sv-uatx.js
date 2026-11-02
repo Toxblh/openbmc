@@ -157,6 +157,7 @@ function draw(sc, m) {
     $("path", { d: ASPEED_LOGO, fill: "#e8e9ea", "fill-rule": "evenodd", transform: "translate(25.9 72.2) scale(.152)" }, t);
     txt(t, 33.5, 80.6, "AST2500", 2.3, "#e8e9ea", "middle", 500);
   }
+  if (m.bmcLoad) sc.valueCloud("B:load", "BMC", [33.5, 90, 0], "c", 0, `LA ${m.bmcLoad[0].toFixed(2)}`);
   box(part("X19", 38, 237), 30, 234, 16, 6, 0, 5, "#2c2d31");
   // the CPU
   {
@@ -233,8 +234,8 @@ function draw(sc, m) {
     if (N.X15.link) plug(g, 111, 12.3, 5.2, 8, 14, 0);
   }
   {
-    const g = port("X14", 128, 21, 15, 14, (f) => rj(f, 129.4, 5.2, 12.3, 8, N.X14.link), (f) => rj(f, 129.4, 0, 12.3, 8, N.X14.link));
-    if (N.X14.link) plug(g, 129.4, 12.3, 5.2, 8, 14, 0);
+    const g = port("X14", 128, 21, 16.7, 14, (f) => rj(f, 130.2, 5.2, 12.3, 8, N.X14.link), (f) => rj(f, 130.2, 0, 12.3, 8, N.X14.link));
+    if (N.X14.link) plug(g, 130.2, 12.3, 5.2, 8, 14, 0);
   }
   const uid = (y, h, v) => (f) => {
     $("rect", { x: 145.6, y, width: 8.8, height: h, fill: "#6f7175" }, f);
@@ -250,7 +251,7 @@ function draw(sc, m) {
   lanLabel("X4", 28.4, 24, "LAN BMC · USB ×2", "BMC");
   label("X28", [0, 90.3, 5.6], [[-30, 90.3]], "VGA", "VGA", { end: true });
   lanLabel("X15", 117, 9, "LAN GE1", "GE1");
-  lanLabel("X14", 135.5, 9, "LAN GE0", "GE0");
+  lanLabel("X14", 136.4, 9, "LAN GE0", "GE0");
 
   m.sensors.forEach((s) => sc.tempCloud(s));
 }
