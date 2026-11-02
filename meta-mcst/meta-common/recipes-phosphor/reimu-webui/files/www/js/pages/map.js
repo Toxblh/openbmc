@@ -367,7 +367,7 @@ function renderSummary() {
   const anyKnown = ps.some(([, d]) => d.state !== "unknown");
   const used = ps.reduce((a, [, d]) => a + (d.state === "busy" ? d.width : 0), 0);
   const gts = (ps.find(([, d]) => d.gts) || [null, {}])[1].gts;
-  const pcieCard = card(`PCI Express ${board.pcie.gen}`, anyKnown ? String(used) : "—", `из ${lanes} линий${gts ? ` · ${gts} ГТ/с` : ""}`,
+  const pcieCard = card(`PCI Express ${board.pcie.gen}`, anyKnown ? String(used) : "—", `из ${lanes} линий в слотах${gts ? ` · ${gts} ГТ/с` : ""}`,
     h("div", { class: "bs-pool" }, h("i", { style: { width: `${Math.round((used / lanes) * 100)}%` } })),
     ps.map(([sid, d]) => row(h("b", {}, sid), h("em", {}, `x${d.state === "busy" ? d.width : d.slot}`), h("span", { class: d.state === "busy" ? "" : "muted" }, d.state === "busy" ? d.dev : ST[d.state] === "свободно" ? "пусто" : ST[d.state]))));
 
