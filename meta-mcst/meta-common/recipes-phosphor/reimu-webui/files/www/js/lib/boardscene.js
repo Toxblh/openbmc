@@ -4,9 +4,10 @@
 // clouds of values; what stands where is in js/boards/*.js. Text from outside
 // only ever goes in through textContent.
 const NS = "http://www.w3.org/2000/svg";
-// a true isometric view: the three axes foreshortened alike by sqrt(2/3), the edges at 30 degrees
-const TH = -Math.PI / 4;
-const PH = Math.atan(Math.SQRT2);
+// An orthographic camera, turned and tilted: each axis as it shortens it, 0.96 along the rear edge,
+// 0.64 along the side, 0.82 up; the board is square, its edges on the screen are not.
+const TH = (-20 * Math.PI) / 180;
+const PH = (55 * Math.PI) / 180;
 const FLAT = (-20 * Math.PI) / 180; // the order of the parts from above: nothing there hides anything
 const VX = -330;
 const VW = 630;
@@ -103,7 +104,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function mkCam(t) {
     const th = TH * t;
     const ph = PH * t;
-    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.05 * t, ox: 0, oy: 0 };
+    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: 0 };
     const q = [[0, 0], [W, 0], [0, H], [W, H]].map((p) => P(c, p[0], p[1]));
     const xs = q.map((p) => p[0]);
     const ys = q.map((p) => p[1]);

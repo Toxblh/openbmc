@@ -464,7 +464,7 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
-// a true isometric view: the three axes foreshortened alike, the edges of the board at 30 degrees
+// the view of the board: an orthographic camera, its edges at 11.8 and 57.6 degrees, each axis as that camera shortens it
 {
   const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
   await ready(s);
@@ -489,10 +489,12 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   });
   const [a, b] = r.edges;
   const mm = (a + b) / 2 / 244;
-  check(Math.abs(a - b) / b < 0.005, `isometric: the two edges of the board of one length (${a.toFixed(2)}, ${b.toFixed(2)})`);
-  check(Math.abs(r.up - mm) / mm < 0.005, `isometric: a millimetre up as long as one along the board (${r.up.toFixed(3)}, ${mm.toFixed(3)} px, ratio ${(r.up / mm).toFixed(3)})`);
-  check(Math.abs(r.along - mm) / mm < 0.005, `isometric: a millimetre along the rear panel the same (${r.along.toFixed(3)} px)`);
-  check(r.slope.every((d) => Math.abs(d - 30) < 0.2), `isometric: the edges at 30 degrees (${r.slope.map((d) => d.toFixed(1)).join(", ")})`);
+  // an orthographic camera turned by 20 degrees and tilted by 55: what it gives, not what looks even
+  const th = (20 * Math.PI) / 180, ph = (55 * Math.PI) / 180;
+  const kx = Math.hypot(Math.cos(th), Math.sin(th) * Math.cos(ph)), ky = Math.hypot(Math.sin(th), Math.cos(th) * Math.cos(ph));
+  check(Math.abs(Math.max(a, b) / Math.min(a, b) - kx / ky) < 0.01, `the edges of the board as the camera gives them (${a.toFixed(2)}, ${b.toFixed(2)}, ratio ${kx / ky})`);
+  check(Math.abs(r.up / r.along - Math.sin(ph) / ky) < 0.01, `a millimetre up as the camera gives it (${(r.up / r.along).toFixed(3)} of one along the rear panel)`);
+  check(Math.abs(r.slope[0] - 11.8) < 0.3 && Math.abs(r.slope[1] - 57.6) < 0.3, `the edges in the directions of the chosen camera (${r.slope.map((d) => d.toFixed(1)).join(", ")})`);
   // at 45 degrees a long slot has parts behind it that are nearer by its middle
   const order = await s.page.evaluate(() => {
     const all = [...document.querySelectorAll(".bs-svg .bs-part")].map((e) => e.dataset.id);
