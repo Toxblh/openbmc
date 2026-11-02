@@ -4,12 +4,12 @@
 // clouds of values; what stands where is in js/boards/*.js. Text from outside
 // only ever goes in through textContent.
 const NS = "http://www.w3.org/2000/svg";
-// A pinhole camera, turned and tilted: each axis as it shortens it, 0.96 along the rear edge, 0.64
+// A pinhole camera, turned and tilted: each axis as it shortens it, 0.91 along the rear edge, 0.71
 // along the side, 0.82 up; the board is square, its edges on the screen are not. It looks at the
 // middle of the board from CAM_DIST mm: far enough to see the rear panel from the side, the far long
-// edge comes out 0.918 of the near one. In millimetres of the board: before the scale of the screen.
-export const CAM_DIST = 2000;
-const TH = (-20 * Math.PI) / 180;
+// edge comes out 0.870 of the near one. In millimetres of the board: before the scale of the screen.
+export const CAM_DIST = 1000;
+const TH = (-30 * Math.PI) / 180;
 const PH = (55 * Math.PI) / 180;
 const FLAT = (-20 * Math.PI) / 180; // the order of the parts from above: nothing there hides anything
 const VX = -330;
@@ -114,8 +114,11 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function mkCam(t) {
     const th = TH * t;
     const ph = PH * t;
-    // the middle of the board stands where the camera looks, the perspective goes around it
-    return { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: -3 * t };
+    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: 0 };
+    // the board in the middle of the stage, up and down: the perspective moves its corners off the middle
+    const ys = [[0, 0], [W, 0], [0, H], [W, H]].map((p) => P(c, p[0], p[1])[1]);
+    c.oy = -(Math.min(...ys) + Math.max(...ys)) / 2;
+    return c;
   }
   // A plane: a drawing in millimetres of its own, lying in the scene; at: its point in the scene.
   const planes = [];

@@ -462,12 +462,51 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
-// the view of the board: a pinhole camera, turned by 20 degrees and tilted by 55: the far edge is shorter
+// the pins of the heatsink: of two that meet on the screen the nearer is drawn over the farther
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
+  await ready(s);
+  await s.page.waitForTimeout(1000);
+  const bad = await s.page.evaluate(() => {
+    // three faces to a pin, the first box is the base
+    const f = [...document.querySelectorAll(".bs-svg .bs-part[data-id='KPI'] polygon")].slice(3).map((e) => e.getBoundingClientRect());
+    const a = [];
+    for (let i = 0; i + 2 < f.length; i += 3) a.push({ left: Math.min(f[i].left, f[i + 1].left, f[i + 2].left), right: Math.max(f[i].right, f[i + 1].right, f[i + 2].right), bottom: Math.max(f[i].bottom, f[i + 1].bottom, f[i + 2].bottom) });
+    let n = 0;
+    for (let i = 0; i < a.length; i++) for (let j = i + 1; j < a.length; j++) {
+      if (Math.min(a[i].right, a[j].right) - Math.max(a[i].left, a[j].left) > 2 && a[i].bottom > a[j].bottom + 2) n++;
+    }
+    return { n, of: a.length };
+  });
+  check(bad.of === 36 && bad.n === 0, `the heatsink: no far pin over a near one (${bad.n}, ${bad.of} pins)`);
+  await s.page.context().close();
+}
+
+// the board in the middle of the stage, up and down, in both views
+for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: stored });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const r = await s.page.evaluate(() => {
+    const st = document.querySelector(".bs-stage").getBoundingClientRect();
+    let best = null;
+    for (const e of document.querySelectorAll(".bs-svg polygon, .bs-svg path")) {
+      if (e.closest("defs, clipPath") || !e.getBoundingClientRect) continue;
+      const b = e.getBoundingClientRect();
+      if (getComputedStyle(e).display !== "none" && (!best || b.width * b.height > best.width * best.height)) best = b;
+    }
+    return { above: best.top - st.top, below: st.bottom - best.bottom, h: best.height };
+  });
+  check(Math.abs(r.above - r.below) < 8, `${v}: the board in the middle, up and down (${r.above.toFixed(1)} above, ${r.below.toFixed(1)} below)`);
+  await s.page.context().close();
+}
+
+// the view of the board: a pinhole camera, turned by 30 degrees and tilted by 55: the far edge is shorter
 {
   const { CAM_DIST: D } = await import(path.join(WWW, "js/lib/boardscene.js"));
   check(D > 0, `the camera has a distance (${D} mm)`);
   // the same camera, written here again: millimetres on the board to the screen, around the middle of the board
-  const th = (-20 * Math.PI) / 180, ph = (55 * Math.PI) / 180, S = 1.2;
+  const th = (-30 * Math.PI) / 180, ph = (55 * Math.PI) / 180, S = 1.2;
   const pin = (x, y, z = 0) => {
     const X = (x - 122) * Math.cos(th) - (y - 122) * Math.sin(th);
     const Y = (x - 122) * Math.sin(th) + (y - 122) * Math.cos(th);
@@ -496,11 +535,11 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.waitForTimeout(300);
   const [A, B, C, E] = await topOf(s, "BOARD");
   const far = len(A, B), near = len(C, E), right = len(B, C), lft = len(E, A);
-  check(D === 2000, `the camera 2000 mm from the middle of the board (${D})`);
-  check(Math.abs(far / near - 0.918) < 0.005, `far edge to near edge of the board about 0.918 (${far.toFixed(2)} / ${near.toFixed(2)} = ${(far / near).toFixed(4)})`);
+  check(D === 1000, `the camera 1000 mm from the middle of the board (${D})`);
+  check(Math.abs(far / near - 0.870) < 0.005, `far edge to near edge of the board about 0.870 (${far.toFixed(2)} / ${near.toFixed(2)} = ${(far / near).toFixed(4)})`);
   // in millimetres of the board, the scale of the screen comes after the perspective
-  check(Math.abs(far / S - 224.6) < 0.2 && Math.abs(near / S - 244.8) < 0.2, `the long edges in projected mm, 224.6 and 244.8 (${(far / S).toFixed(1)}, ${(near / S).toFixed(1)})`);
-  check(Math.abs(lft / S - 155.2) < 0.2 && Math.abs(right / S - 157.5) < 0.2, `the sides in projected mm, 155.2 and 157.5 (${(lft / S).toFixed(1)}, ${(right / S).toFixed(1)})`);
+  check(Math.abs(far / S - 208.7) < 0.2 && Math.abs(near / S - 239.9) < 0.2, `the long edges in projected mm, 208.7 and 239.9 (${(far / S).toFixed(1)}, ${(near / S).toFixed(1)})`);
+  check(Math.abs(lft / S - 173.9) < 0.2 && Math.abs(right / S - 173.6) < 0.2, `the sides in projected mm, 173.9 and 173.6 (${(lft / S).toFixed(1)}, ${(right / S).toFixed(1)})`);
   check(angle(A, B, E, C) > 0.5, `the long edges are not parallel (${angle(A, B, E, C).toFixed(2)} degrees)`);
   check(angle(A, E, B, C) > 0.5, `the short edges are not parallel (${angle(A, E, B, C).toFixed(2)} degrees)`);
   const vl = meet(A, B, E, C), vs = meet(A, E, B, C);

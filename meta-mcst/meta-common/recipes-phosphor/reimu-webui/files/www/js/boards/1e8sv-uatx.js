@@ -197,7 +197,8 @@ function draw(sc, m) {
   {
     const g = part("KPI", 176, 197);
     box(g, 158, 179, 36, 36, 0, 2.5, "#45474b");
-    for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) box(g, 159.6 + i * 6, 180.6 + j * 6, 3.2, 3.2, 2.5, 7, "#52545a");
+    // the far pins first: the view looks from the rear panel's side of the board
+    for (let i = 5; i >= 0; i--) for (let j = 0; j < 6; j++) box(g, 159.6 + i * 6, 180.6 + j * 6, 3.2, 3.2, 2.5, 7, "#52545a");
   }
   // fans
   FANS.forEach((f) => {
