@@ -28,8 +28,8 @@ const MEMROUTE = { X46: [[254, 17.5]], X44: [[205, 30.5], [254, 30.5]], X16: [[2
 
 // a D-sub, RJ45, USB on a port's face: u along the edge, v up from the board
 // Each kind of connector has one size, here, in mm, by its standard: a port says
-// only where it is. RJ45 opening, USB-A opening, DE-15 shell, its screws and flange.
-const JACK = { rj45: { w: 11.7, h: 8.2 }, usb: { w: 12.5, h: 5.1 }, vga: { w: 16.9, h: 8.3, screws: 25, flange: 30.8 } };
+// only where it is. RJ45 opening, USB-A opening; VGA as drawn in the manual: shell, opening, screw posts.
+const JACK = { rj45: { w: 11.7, h: 8.2 }, usb: { w: 12.5, h: 5.1 }, vga: { w: 18.3, h: 9.8, openW: 14.7, openH: 7.2, screws: 25, post: 2.8, hole: 1.2 } };
 
 function rj(g, cu, y, link) {
   const { w, h } = JACK.rj45, x = cu - w / 2;
@@ -44,13 +44,27 @@ function usb(g, cu, y) {
   $("rect", { x, y, width: w, height: h, rx: 0.4, fill: "#121315" }, g);
   $("rect", { x: x + 1.4, y: y + h * 0.52, width: w - 2.8, height: h * 0.3, fill: "#3a3b3e" }, g);
 }
+// the D of a shell: the wide side at +y, the corners round
+function dShape(cx, cy, w, h, r) {
+  const hw = w / 2 + 0.35, hh = h / 2, n = hw - 1.1; // the curve of a corner falls short of its point
+  const pts = [[hw, hh], [n, -hh], [-n, -hh], [-hw, hh]].map(([x, y]) => [cx + x, cy + y]);
+  const toward = (p, q) => { const l = Math.hypot(q[0] - p[0], q[1] - p[1]); return [p[0] + (q[0] - p[0]) * r / l, p[1] + (q[1] - p[1]) * r / l]; };
+  return pts.map((p, i) => {
+    const a = toward(p, pts[(i + 3) % 4]), b = toward(p, pts[(i + 1) % 4]);
+    return `${i ? "L" : "M"}${a[0]},${a[1]}Q${p[0]},${p[1]} ${b[0]},${b[1]}`;
+  }).join("") + "Z";
+}
 function vga(g, cx, cy) {
-  const hw = JACK.vga.w / 2, hh = JACK.vga.h / 2, n = hw - 1.15;
-  $("path", { d: `M${cx - hw + 0.9},${cy + hh}H${cx + hw - 0.9}Q${cx + hw + 0.3},${cy + hh} ${cx + hw},${cy + hh - 1.2}L${cx + n},${cy - hh + 1.1}Q${cx + n - 0.3},${cy - hh} ${cx + n - 1.4},${cy - hh}H${cx - n + 1.4}Q${cx - n + 0.3},${cy - hh} ${cx - n},${cy - hh + 1.1}L${cx - hw},${cy + hh - 1.2}Q${cx - hw - 0.3},${cy + hh} ${cx - hw + 0.9},${cy + hh}Z`, fill: "#121315", stroke: "#6e706d", "stroke-width": 0.35 }, g);
-  [[2, -4.58], [0, -5.725], [-2, -4.58]].forEach(([dy, x0]) => {
+  const J = JACK.vga;
+  $("path", { d: dShape(cx, cy, J.w, J.h, 3.4), fill: "#b4b6b3", stroke: "#6e706d", "stroke-width": 0.25 }, g);
+  $("path", { d: dShape(cx, cy, J.openW, J.openH, 2.4), fill: "#121315" }, g);
+  [[2, -4.58], [0, -3.435], [-2, -4.58]].forEach(([dy, x0]) => {
     for (let i = 0; i < 5; i++) $("circle", { cx: cx + x0 + i * 2.29, cy: cy + dy, r: 0.45, fill: "#8e9095" }, g);
   });
-  [-1, 1].forEach((d) => $("circle", { cx: cx + d * JACK.vga.screws / 2, cy, r: 1, fill: "#3a3b3e" }, g));
+  [-1, 1].forEach((d) => {
+    $("circle", { cx: cx + d * J.screws / 2, cy, r: J.post, fill: "#a8aaac", stroke: "#6e706d", "stroke-width": 0.25 }, g);
+    $("circle", { cx: cx + d * J.screws / 2, cy, r: J.hole, fill: "#1d1e20" }, g);
+  });
 }
 const led = (g, u, v, on, col) => {
   if (on) $("circle", { cx: u, cy: v, r: 2.6, fill: col, opacity: 0.35 }, g);
@@ -239,7 +253,7 @@ function draw(sc, m) {
   }
   const btn = (cy) => (f) => $("circle", { cx: 46.6, cy, r: 1.9, fill: "#121315", stroke: "#6e706d", "stroke-width": 0.3 }, f);
   port("BTN", 42.5, 6, 8.2, 4.7, btn(2.4), btn(1.9));
-  port("X28", 74.6, 15, 31.4, 13, (f) => vga($("g", { transform: "translate(0 6.2)" }, f), 90.3, 0), (f) => vga($("g", { transform: `translate(0 ${JACK.vga.h / 2})` }, f), 90.3, 0));
+  port("X28", 74.6, 15, 31.4, 13, (f) => vga($("g", { transform: "translate(0 5.8)" }, f), 90.3, 0), (f) => vga($("g", { transform: `translate(0 ${JACK.vga.h / 2})` }, f), 90.3, 0));
   // the two single ports are one part: same body, same place in it
   const lan = (id, y) => {
     const cu = y + 16.7 / 2;

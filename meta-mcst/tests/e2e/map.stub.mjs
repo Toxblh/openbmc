@@ -356,6 +356,41 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   await s.page.context().close();
 }
 
+// the rear panel against the drawing of the manual (ТВГИ.469555.445РЭ, sizes in mm)
+{
+  const s = await open(clone(FIX), { view: "iso" });
+  await ready(s);
+  const r = await s.page.evaluate(() => {
+    const g = document.querySelector(".bs-svg .bs-part[data-id='X28']");
+    const face = [...g.querySelectorAll("g")].find((e) => e.querySelector("path"));
+    const sh = face.querySelector("path"), b = sh.getBBox();
+    const pt = (x, y) => { const q = sh.ownerSVGElement.createSVGPoint(); q.x = x; q.y = y; return sh.isPointInFill(q); };
+    return { w: b.width, h: b.height, corner: pt(b.x + b.width - 0.5, b.y + b.height - 0.5), mid: pt(b.x + b.width / 2, b.y + b.height / 2),
+      posts: [...g.querySelectorAll("circle")].map((c) => Number(c.getAttribute("r"))) };
+  });
+  check(Math.abs(r.w - 18.3) < 0.3 && Math.abs(r.h - 9.8) < 0.3, `VGA shell 18.3 x 9.8 (${r.w.toFixed(1)} x ${r.h.toFixed(1)})`);
+  check(r.mid && !r.corner, "VGA shell with round corners");
+  check(r.posts.includes(2.8), `VGA posts of 5.6 (${[...new Set(r.posts)]})`);
+  await s.page.context().close();
+}
+
+// VGA against the rear view in the manual's drawing (sizes in mm)
+{
+  const s = await open(clone(FIX), { view: "iso" });
+  await ready(s);
+  const r = await s.page.evaluate(() => {
+    const g = document.querySelector(".bs-svg .bs-part[data-id='X28']");
+    const sh = g.querySelector("path"), b = sh.getBBox();
+    const pt = (x, y) => { const q = sh.ownerSVGElement.createSVGPoint(); q.x = x; q.y = y; return sh.isPointInFill(q); };
+    return { w: b.width, h: b.height, corner: pt(b.x + b.width - 0.5, b.y + b.height - 0.5), mid: pt(b.x + b.width / 2, b.y + b.height / 2),
+      posts: [...g.querySelectorAll("circle")].map((c) => Number(c.getAttribute("r"))) };
+  });
+  check(Math.abs(r.w - 18.3) < 0.3 && Math.abs(r.h - 9.8) < 0.3, `VGA shell 18.3 x 9.8 (${r.w.toFixed(1)} x ${r.h.toFixed(1)})`);
+  check(r.mid && !r.corner, "VGA shell with round corners");
+  check(r.posts.includes(2.8), `VGA posts of 5.6 (${[...new Set(r.posts)]})`);
+  await s.page.context().close();
+}
+
 // a slow BMC, a cycle longer than the period: one request at a time, the next cycle after it
 {
   const s = await open(clone(FIX), { slow: 1200 });
