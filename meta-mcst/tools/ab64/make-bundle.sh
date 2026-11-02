@@ -6,6 +6,7 @@ deploy=$1; out=$2
 here=$(cd "$(dirname "$0")" && pwd); tests=$here/../../tests/ab64
 ver=$(cd "$here" && git describe --dirty)
 n=reimu-ab-$ver; d=$out/$n
+python3 "$here/check-image.py" "$deploy/reimu-ab.tar"
 mkdir -p "$d"
 cp "$deploy/reimu-ab.tar" "$deploy/reimu-ab-kexec.tar" "$d/"
 cp "$here/reimu-ab-from-stock" "$here/backup-stock.sh" "$tests/board-check.sh" "$d/"

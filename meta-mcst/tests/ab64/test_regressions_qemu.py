@@ -182,8 +182,8 @@ def t_truststore(b):
 
 def t_mcinfo(b):
     v = b.out("sed -n 's/^VERSION_ID=//p' /etc/os-release").strip().strip('"')
-    m = re.match(r"reimu-(\d+)\.(\d+)\.(\d+)", v)
-    want = "%d.%02d" % (int(m.group(1)), int(m.group(2)) * 10 + int(m.group(3))) if m else "?"
+    m = re.match(r"reimu-(\d+)\.(\d)(?:\.(\d))?", v)
+    want = "%d.%d%s" % (int(m.group(1)), int(m.group(2)), m.group(3) or "0") if m else "?"
     rc, o = IR.ipmi("mc", "info")
     got = (re.search(r"Firmware Revision\s*:\s*(\S+)", o) or [None, "-"])[1]
     check(rc == 0 and got == want, "[29] mc info Firmware Revision %s for %s (want %s)" % (got, v, want))

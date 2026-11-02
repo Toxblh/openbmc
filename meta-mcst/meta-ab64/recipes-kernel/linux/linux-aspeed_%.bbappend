@@ -26,6 +26,18 @@ do_add_mcst_files () {
             ${STAGING_KERNEL_DIR}/arch/arm/boot/dts/aspeed/Makefile
 }
 
+# A fixed release. obmc-phosphor-kernel-version puts the commit of the patched
+# tree in it, and that commit is new each time the patches are applied: with a
+# cache the kernel can be rebuilt (a new initramfs) while its modules come from
+# the cache, for another release, and then no module loads. Set here, after
+# do_kernel_configme, with the auto suffix off (deleted there, it defaults to y).
+export LOCALVERSION = ""
+do_configure_prepend() {
+    sed -i '/CONFIG_LOCALVERSION/d' ${B}/.config
+    echo 'CONFIG_LOCALVERSION="-reimu"' >> ${B}/.config
+    echo '# CONFIG_LOCALVERSION_AUTO is not set' >> ${B}/.config
+}
+
 # no copy of the kernel in the rootfs' /boot (it is in the kernel partition)
 RDEPENDS_${KERNEL_PACKAGE_NAME}-base = ""
 

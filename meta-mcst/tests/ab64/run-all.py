@@ -27,6 +27,8 @@ FLASH_TEST = ("d=$(mktemp -d) && gcc -O2 -o $d/reimu-flash %s && gcc -shared -fP
 CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab_plan": ["python3", AB + "/test_ab_plan.py"], "test_ab_lock": ["python3", AB + "/test_ab_lock.py"],
                     "test_reimu_fit": ["python3", AB + "/test_reimu_fit.py"],
                     "test_pns_tool": ["python3", AB + "/test_pns_tool.py"],
+                    "test_check_image": ["python3", AB + "/test_check_image.py"],
+                    "test_ipmi_version": ["python3", AB + "/test_ipmi_version.py"],
                     "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
@@ -100,7 +102,7 @@ def run_job(job, slot, a, out, src, img):
                     job.rc = "timeout"
     try:
         os.killpg(p.pid, signal.SIGKILL)    # whatever it left, its QEMU first
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):     # EPERM on macOS: only zombies left
         pass
     if d:
         subprocess.call(["pkill", "-9", "-f", d])

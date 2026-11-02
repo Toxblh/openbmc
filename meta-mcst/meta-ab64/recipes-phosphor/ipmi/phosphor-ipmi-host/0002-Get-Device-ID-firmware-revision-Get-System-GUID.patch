@@ -1,10 +1,10 @@
 From: REIMU A/B <reimu@localhost>
 Subject: [PATCH] Get Device ID firmware revision, Get System GUID on REIMU
 
-- The BMC version is "reimu-1.0.2[-N-gHASH[-dirty]]"; convertVersion()
-  only skipped a leading "v" and std::stoi("reimu-1", 16) threw: ipmitool
-  mc info showed Firmware Revision 0.00 (stock 1.0.2 as well). Read it as
-  1.02.
+- The BMC version is "reimu-1.0.2" or "reimu-2.0-beta", with
+  [-N-gHASH][-dirty]; convertVersion() only skipped a leading "v" and
+  std::stoi("reimu-1", 16) threw: ipmitool mc info showed Firmware Revision
+  0.00 (stock 1.0.2 as well). Read them as 1.02, 2.00.
 - Get System GUID (ipmitool mc guid) wants an inventory object with
   Inventory.Item.Bmc and Common.UUID, which this board doesn't have:
   "Unspecified error". Answer the GUID derived from /etc/machine-id, as
@@ -12,36 +12,44 @@ Subject: [PATCH] Get Device ID firmware revision, Get System GUID on REIMU
 
 ---
 diff --git a/apphandler.cpp b/apphandler.cpp
-index 90818a94..ff901c00 100644
+index 90818a9..64dd5fb 100644
 --- a/apphandler.cpp
 +++ b/apphandler.cpp
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,8 @@
  #include <unistd.h>
  
  #include <algorithm>
 +#include <regex>
++#include <sstream>
  #include <app/channel.hpp>
  #include <app/watchdog.hpp>
  #include <apphandler.hpp>
-@@ -486,6 +487,17 @@ int convertVersion(std::string s, Revision& rev)
+@@ -486,6 +488,24 @@ int convertVersion(std::string s, Revision& rev)
      std::string token;
      uint16_t commits;
  
-+    // REIMU: "reimu-1.0.2[-N-gHASH[-dirty]]" -> "v1.02[-N-gHASH...]", read
-+    // below as firmware revision 1.02 (stoi threw on "reimu-1": 0.00)
++    // REIMU: "reimu-1.0.2", "reimu-2.0-beta", either with [-N-gHASH][-dirty] ->
++    // "vMAJOR.MINOR[-N-gHASH...]", read below as firmware revision 1.02, 2.00
++    // (stoi threw on "reimu-1": 0.00). MINOR goes in hex, as it is read below:
++    // x.1.5 -> "f" -> revision x.15.
 +    static const std::regex reimuVersion(
-+        "^reimu-([0-9]+)\\.([0-9])\\.([0-9])(-.*)?$");
++        "^reimu-([0-9]+)\\.([0-9])(?:\\.([0-9]))?"
++        "(?:-[a-zA-Z][a-zA-Z0-9.]*)*(-[0-9].*)?$");
 +    std::smatch m;
 +    if (std::regex_match(s, m, reimuVersion))
 +    {
-+        s = "v" + m[1].str() + "." + m[2].str() + m[3].str() +
++        std::stringstream minor;
++        minor << std::hex
++              << std::stoi(m[2].str()) * 10 +
++                     (m[3].matched ? std::stoi(m[3].str()) : 0);
++        s = "v" + m[1].str() + "." + minor.str() +
 +            (m[4].matched ? m[4].str() : std::string("-0"));
 +    }
 +
      auto location = s.find_first_of('v');
      if (location != std::string::npos)
      {
-@@ -806,12 +818,12 @@ auto ipmiAppGetSystemGuid() -> ipmi::RspType<std::array<uint8_t, 16>>
+@@ -806,12 +826,12 @@ auto ipmiAppGetSystemGuid() -> ipmi::RspType<std::array<uint8_t, 16>>
              ipmi::getDbusProperty(*busPtr, objectInfo.second, objectInfo.first,
                                    uuidInterface, uuidProperty);
      }
