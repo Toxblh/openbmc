@@ -83,6 +83,10 @@ const SIZES = [[1400, 1000], [768, 1024], [390, 844]];
 for (const [w, hgt] of SIZES) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt }, locale: "ru-RU", isMobile: w < 500, hasTouch: w < 500 });
   const page = await ctx.newPage();
+  // what did not load: an app that does not start says nothing else
+  page.on("requestfailed", (r) => console.log(`  request failed: ${r.url()} ${r.failure() && r.failure().errorText}`));
+  page.on("response", (r) => r.status() >= 400 && console.log(`  answer ${r.status()}: ${r.request().method()} ${r.url()}`));
+  page.on("console", (m) => m.type() === "error" && console.log(`  console: ${m.text()}`));
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/xyz/openbmc_project/reimu/hostlink", (r) =>

@@ -32,6 +32,10 @@ const browser = await chromium.launch({ executablePath: process.env.CHROME || un
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1400, height: 1000 }, locale: "ru-RU", acceptDownloads: true });
 await ctx.grantPermissions(["clipboard-read", "clipboard-write"], { origin: BASE }).catch(() => {});
 const page = await ctx.newPage();
+// what did not load: an app that does not start says nothing else
+page.on("requestfailed", (r) => console.log(`  request failed: ${r.url()} ${r.failure() && r.failure().errorText}`));
+page.on("response", (r) => r.status() >= 400 && console.log(`  answer ${r.status()}: ${r.request().method()} ${r.url()}`));
+page.on("console", (m) => m.type() === "error" && console.log(`  console: ${m.text()}`));
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
 const card = (title) => page.locator(".card", { has: page.locator("h3", { hasText: title }) });
