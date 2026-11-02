@@ -247,11 +247,12 @@ function draw(sc, m) {
     $("rect", { x: -20, y: u + w / 2 + dy - 1, width: 21 + v + h * 0.6, height: 2, fill: "#6a6c71" }, t);
   };
   const N = m.net;
+  const USB1_Z = 3.3; // the first USB of X4 over the board; the openings of X14, X15 at the same height
   {
     const u = 28.5, H = JACK.usb.h, gap = 1; // from above the three lie side by side from the edge
-    const g = port("X4", 20, 26, 17, 30.5, (f) => { usb(f, u, 3.3); usb(f, u, 11.4); rj(f, u, 20.3, N.X4.link); },
+    const g = port("X4", 20, 26, 17, 30.5, (f) => { usb(f, u, USB1_Z); usb(f, u, 11.4); rj(f, u, 20.3, N.X4.link); },
       (f) => { usb(f, u, 0); usb(f, u, H + gap); rj(f, u, 2 * (H + gap), N.X4.link); });
-    if (m.usb.X4[0]) usbPlug(g, u, 3.3, 30.5, 0, 3.1);
+    if (m.usb.X4[0]) usbPlug(g, u, USB1_Z, 30.5, 0, 3.1);
     if (m.usb.X4[1]) usbPlug(g, u, 11.4, 30.5, H + gap, -3.1);
     if (N.X4.link) plug(g, u, 20.3, 30.5, 2 * (H + gap));
   }
@@ -261,8 +262,8 @@ function draw(sc, m) {
   // the two single ports are one part: same body, same place in it
   const lan = (id, y) => {
     const cu = y + 16.7 / 2;
-    const g = port(id, y, 21, 16.7, 14, (f) => rj(f, cu, 5.2, N[id].link), (f) => rj(f, cu, 0, N[id].link));
-    if (N[id].link) plug(g, cu, 5.2, 14, 0);
+    const g = port(id, y, 21, 16.7, 14, (f) => rj(f, cu, USB1_Z, N[id].link), (f) => rj(f, cu, 0, N[id].link));
+    if (N[id].link) plug(g, cu, USB1_Z, 14, 0);
   };
   lan("X15", 108.8);
   lan("X14", 128);

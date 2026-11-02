@@ -482,6 +482,16 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
+// X14, X15: the opening in the 3D views at the height of the first USB of X4, from above at the edge
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800 });
+  await ready(s);
+  const ys = await s.page.evaluate(() => ["X14", "X15"].map((id) => [...document.querySelectorAll(`.bs-svg .bs-part[data-id='${id}'] rect[fill='#121315']`)].slice(0, 2).map((r) => Number(r.getAttribute("y")))));
+  // the first two of that fill are the jacks, side and top; a plug adds its own after them
+  check(ys.every((a) => a.length === 2 && a[0] === 3.3 && a[1] === 0), `X14, X15: the opening at 3.3 in the 3D views, at 0 from above (${JSON.stringify(ys)})`);
+  await s.page.context().close();
+}
+
 // the pins of the heatsink: of two that meet on the screen the nearer is drawn over the farther
 {
   const s = await open(clone(FIX), { width: 1400, height: 800, view: "persp" });
