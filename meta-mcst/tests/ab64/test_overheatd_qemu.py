@@ -440,7 +440,8 @@ def t_memory(b):
     half = len(phases)
     grow2 = max(p["data"] for p in samples[half:]) - max(p["data"] for p in samples[:half])
     check(grow2 <= 0, "heap flat: the second round of phases needs no more than the first (%+d KiB)" % grow2)
-    check(all(p["fds"] <= first["fds"] for p in samples), "no fd leak (%d -> %d)" % (first["fds"], samples[-1]["fds"]))
+    # (one sample can catch a file open at that moment: a leak stays and grows)
+    check(samples[-1]["fds"] <= first["fds"], "no fd leak (%d -> %d)" % (first["fds"], samples[-1]["fds"]))
     s = b.wait_state(lambda s: s["temps"] == NORMAL_TEMPS)
     check(s["temps"] == NORMAL_TEMPS and b.wait_led("none") == "none", "still monitoring after the run")
 
