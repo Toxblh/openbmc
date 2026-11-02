@@ -28,6 +28,7 @@ CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab
                     "test_reimu_fit": ["python3", AB + "/test_reimu_fit.py"],
                     "test_pns_tool": ["python3", AB + "/test_pns_tool.py"],
                     "test_check_image": ["python3", AB + "/test_check_image.py"],
+                    "test_ota_tool": ["python3", AB + "/test_ota_tool.py"],
                     "test_ipmi_version": ["python3", AB + "/test_ipmi_version.py"],
                     "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
@@ -169,6 +170,8 @@ def main():
                                      "node", os.path.join(e2e, "console-size.stub.mjs")]))
     jobs.append(Job("pns_blank", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                   "node", os.path.join(e2e, "pns-blank.stub.mjs")]))
+    jobs.append(Job("ota_page", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                 "node", os.path.join(e2e, "ota.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

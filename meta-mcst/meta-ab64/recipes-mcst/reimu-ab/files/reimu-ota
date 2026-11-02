@@ -1,0 +1,83 @@
+#!/bin/sh
+# reimu-ota check          the list of releases into $RUN/releases.json (the web page reads it)
+# reimu-ota fetch TAG      TAG.tar of that release, checked by TAG.tar.sha256, into
+#                          /tmp/images: reimu-abd takes it from there as any upload
+# Lines for reimu-abd: "PROGRESS n" and messages; the exit status says how it went.
+# /etc/reimu-ota.conf can set REPO (a fork), API, DL.
+RUN=/run/reimu-ota WORK=/tmp/reimu-ota IMAGES=/tmp/images REPO=Toxblh/openbmc PROTO="=https" MAX=$((64 * 1024 * 1024))
+API= DL=
+[ -r "${REIMU_OTA_CONF:-/etc/reimu-ota.conf}" ] && . "${REIMU_OTA_CONF:-/etc/reimu-ota.conf}"
+API=${API:-https://api.github.com/repos/$REPO/releases?per_page=30}
+DL=${DL:-https://github.com/$REPO/releases/download}
+
+die() { echo "$*"; exit 1; }
+
+why() {
+    case $1 in
+        6) echo "BMC не находит адрес сервера: проверьте DNS и шлюз" ;;
+        7) echo "нет соединения с сервером: проверьте выход BMC в интернет" ;;
+        18) echo "файл скачан не до конца" ;;
+        22) echo "сервер ответил ошибкой (нет файла или лимит запросов GitHub, попробуйте позже)" ;;
+        23) echo "не хватает места в памяти BMC" ;;
+        28) echo "сервер не ответил вовремя" ;;
+        35 | 51 | 58 | 60 | 77) echo "сертификат сервера не прошёл проверку: проверьте время на BMC" ;;
+        63) echo "файл больше допустимого" ;;
+        *) echo "ошибка curl $1" ;;
+    esac
+}
+
+get() { curl --fail --silent --show-error --location --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 20 "$@"; }
+
+check() {
+    mkdir -p "$RUN" || die "нет каталога $RUN"
+    get --max-time 60 --max-filesize 4000000 -H 'Accept: application/vnd.github+json' -o "$RUN/.releases" "$API" 2>/dev/null
+    rc=$?
+    [ $rc = 0 ] || { rm -f "$RUN/.releases"; die "Проверка не удалась: $(why $rc)"; }
+    [ "$(head -c 1 "$RUN/.releases")" = "[" ] || { rm -f "$RUN/.releases"; die "Проверка не удалась: неожиданный ответ сервера"; }
+    mv "$RUN/.releases" "$RUN/releases.json"
+}
+
+fetch() {
+    tag=$1
+    case $tag in
+        reimu-[0-9]*) ;;
+        *) die "Неверное имя версии" ;;
+    esac
+    case $tag in
+        *[!A-Za-z0-9.-]*) die "Неверное имя версии" ;;
+    esac
+    trap 'rm -rf "$WORK"' EXIT
+    rm -rf "$WORK"
+    mkdir -p "$WORK" "$IMAGES" || die "нет каталога $WORK"
+    get --max-time 60 --max-filesize 4096 -o "$WORK/sha" "$DL/$tag/$tag.tar.sha256" 2>/dev/null
+    rc=$?
+    [ $rc = 0 ] || die "Контрольная сумма не скачана: $(why $rc)"
+    want=$(cut -d' ' -f1 "$WORK/sha")
+    [ ${#want} = 64 ] && case $want in *[!0-9a-f]*) false ;; esac || die "Контрольная сумма: неожиданный ответ сервера"
+
+    size=$(get --max-time 60 -I "$DL/$tag/$tag.tar" 2>/dev/null | tr -d '\r' | sed -n 's/^[Cc]ontent-[Ll]ength: *//p' | tail -1)
+    echo "Скачивание $tag"
+    get --max-time 1800 --max-filesize "$MAX" -o "$WORK/$tag.tar" "$DL/$tag/$tag.tar" 2>/dev/null &
+    pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        if [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null; then
+            n=$({ wc -c < "$WORK/$tag.tar"; } 2>/dev/null)
+            echo "PROGRESS $((${n:-0} / (size / 100 + 1)))"
+        fi
+        sleep 2
+    done
+    wait $pid
+    rc=$?
+    [ $rc = 0 ] || die "Образ не скачан: $(why $rc)"
+    got=$(sha256sum "$WORK/$tag.tar" | cut -d' ' -f1)
+    [ "$got" = "$want" ] || die "Контрольная сумма образа не совпала: файл не установлен"
+    echo "PROGRESS 100"
+    # on one file system: reimu-abd sees it whole
+    mv "$WORK/$tag.tar" "$IMAGES/ota-$tag.tar" || die "Образ не передан на установку"
+}
+
+case $1 in
+    check) check ;;
+    fetch) fetch "$2" ;;
+    *) echo "usage: reimu-ota check | fetch TAG" >&2; exit 2 ;;
+esac

@@ -24,8 +24,14 @@
  * xyz.openbmc_project.Reimu.Ab, property Json:
  *   {"booted", "next", "pending", "tries", "slots": {"a", "b"}, "running",
  *    "job": {"state": running|ok|failed, "progress", "message", "version",
- *            "started", "finished"}, "upload": {"ok", "message", "time"}}
+ *            "started", "finished"}, "upload": {"ok", "message", "time"},
+ *    "ota": {"state": null|checking|checked|downloading|failed, "progress",
+ *            "message", "tag", "checked"}}
  *   method Refresh() -> s   re-read the slots ("reimu-ab status")
+ *   method OtaCheck() -> s  fetch the list of releases (reimu-ota check)
+ *   method OtaInstall(s tag) -> s  fetch that release into IMAGES (reimu-ota
+ *                           fetch); from there it goes as an upload, then installs
+ *   property OtaReleases    the list as GitHub gave it, JSON
  *
  * Copyright (c) 2026 MCST REIMU contributors. Licensed under GPLv2.
  */
@@ -142,6 +148,16 @@ static struct
     pid_t pid;
     struct buf out;
 } job;
+/* reimu-ota: the check, or the download of an update */
+static struct
+{
+    const char *state; /* NULL: none yet */
+    int progress, checking, install; /* install: its file not yet seen in IMAGES */
+    char message[512], tag[128];
+    time_t checked;
+    pid_t pid;
+    struct buf out;
+} ota;
 static struct
 {
     int ok;
@@ -529,6 +545,17 @@ static int check_update(const char *path, char *version, size_t vsz, char *why, 
     return 0;
 }
 
+static void start_install(struct image *im);
+
+/* what became of the file reimu-ota put in IMAGES */
+static void ota_file_refused(const char *why)
+{
+    if (!ota.install) return;
+    ota.install = 0;
+    ota.state = "failed";
+    snprintf(ota.message, sizeof(ota.message), "%s", why);
+}
+
 static void new_file(const char *name)
 {
     char path[256], version[128], why[256];
@@ -542,6 +569,7 @@ static void new_file(const char *name)
         snprintf(last_upload.message, sizeof(last_upload.message), "Идёт установка другого образа");
         last_upload.ok = 0;
         log_error("xyz.openbmc_project.Software.Image.Error.BusyFailure", last_upload.message, path);
+        ota_file_refused(last_upload.message);
         return;
     }
     if (check_update(path, version, sizeof(version), why, sizeof(why)))
@@ -552,6 +580,17 @@ static void new_file(const char *name)
         last_upload.ok = 0;
         fprintf(stderr, "reimu-abd: %s: %s\n", path, why);
         log_error("xyz.openbmc_project.Software.Image.Error.ImageFailure", why, path);
+        ota_file_refused(last_upload.message);
+        return;
+    }
+    if (ota.install && strcmp(version, ota.tag))
+    {
+        unlink(path);
+        snprintf(last_upload.message, sizeof(last_upload.message), "В образе версия %s, ожидалась %s", version, ota.tag);
+        last_upload.ok = 0;
+        fprintf(stderr, "reimu-abd: %s: %s\n", path, last_upload.message);
+        log_error("xyz.openbmc_project.Software.Image.Error.ImageFailure", last_upload.message, path);
+        ota_file_refused(last_upload.message);
         return;
     }
     /* one upload at a time: a newer one replaces it */
@@ -568,6 +607,13 @@ static void new_file(const char *name)
     last_upload.ok = 1;
     fprintf(stderr, "reimu-abd: %s: update %s, %s\n", path, version, upload.id);
     if (add_image(&upload, &upload_slots, 1) < 0) remove_upload();
+    else if (ota.install)
+    {
+        ota.install = 0;
+        ota.state = NULL; /* from here on it is the job, as for an upload */
+        upload.requested = "Active";
+        start_install(&upload);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -689,6 +735,149 @@ static void start_install(struct image *im)
 }
 
 /* ------------------------------------------------------------------ */
+/* reimu-ota                                                           */
+
+static sd_event_source *ota_io, *ota_child;
+
+static const char *reimu_ota(void)
+{
+    const char *e = getenv("REIMU_OTA");
+    return e && *e ? e : "/usr/sbin/reimu-ota";
+}
+
+static void ota_line(char *l)
+{
+    int p;
+    if (sscanf(l, "PROGRESS %d", &p) == 1) ota.progress = p < 0 ? 0 : p > 100 ? 100 : p;
+    else if (*l) snprintf(ota.message, sizeof(ota.message), "%s", l);
+}
+
+static int on_ota_out(sd_event_source *s, int fd, uint32_t revents, void *ud)
+{
+    (void)s; (void)revents; (void)ud;
+    char tmp[1024];
+    ssize_t n = read(fd, tmp, sizeof(tmp));
+    if (n <= 0)
+    {
+        if (n < 0 && errno == EAGAIN) return 0;
+        ota_io = sd_event_source_unref(ota_io);
+        close(fd);
+        return 0;
+    }
+    badd(&ota.out, tmp, n);
+    char *nl;
+    while (ota.out.s && (nl = memchr(ota.out.s, '\n', ota.out.len)))
+    {
+        *nl = 0;
+        ota_line(ota.out.s);
+        size_t rest = ota.out.len - (nl + 1 - ota.out.s);
+        memmove(ota.out.s, nl + 1, rest);
+        ota.out.len = rest;
+        ota.out.s[rest] = 0;
+    }
+    return 0;
+}
+
+static int on_ota_exit(sd_event_source *s, const siginfo_t *si, void *ud)
+{
+    (void)s; (void)ud;
+    while (ota_io) on_ota_out(NULL, sd_event_source_get_io_fd(ota_io), 0, NULL);
+    ota.out.len = 0;
+    ota.pid = 0;
+    ota_child = sd_event_source_unref(ota_child);
+    int ok = si->si_code == CLD_EXITED && si->si_status == 0;
+    if (!ok)
+    {
+        ota.install = 0;
+        ota.state = "failed";
+        if (!ota.message[0]) snprintf(ota.message, sizeof(ota.message), "reimu-ota завершился с ошибкой");
+    }
+    else if (ota.checking)
+    {
+        ota.state = "checked";
+        ota.checked = time(NULL);
+        ota.message[0] = 0;
+    }
+    /* else: the file is in IMAGES, new_file goes on or has gone on (inotify can come first) */
+    fprintf(stderr, "reimu-abd: ota: %s: %s\n", ok ? "ok" : "failed", ota.message);
+    return 0;
+}
+
+static const char *ota_start(const char *mode, const char *tag)
+{
+    int pfd[2];
+    if (ota.pid || ota.install) return "Обновление уже проверяется или скачивается";
+    if (job.state && !strcmp(job.state, "running")) return "Идёт установка другого образа";
+    if (pipe2(pfd, O_CLOEXEC)) return "pipe";
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
+        execl(reimu_ota(), "reimu-ota", mode, tag, (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    if (pid < 0)
+    {
+        close(pfd[0]);
+        return "fork";
+    }
+    ota.pid = pid;
+    ota.progress = 0;
+    ota.message[0] = 0;
+    ota.checking = tag == NULL;
+    ota.install = tag != NULL;
+    ota.state = tag ? "downloading" : "checking";
+    snprintf(ota.tag, sizeof(ota.tag), "%s", tag ? tag : "");
+    sd_event_add_io(ev, &ota_io, pfd[0], EPOLLIN, on_ota_out, NULL);
+    sd_event_add_child(ev, &ota_child, pid, WEXITED, on_ota_exit, NULL);
+    return NULL;
+}
+
+static int ota_reply(sd_bus_message *m, const char *err)
+{
+    struct buf j = { 0 };
+    bprintf(&j, "{\"ok\":%s,\"message\":", err ? "false" : "true");
+    bjson(&j, err ? err : "ok");
+    badd(&j, "}", 1);
+    int k = sd_bus_reply_method_return(m, "s", j.s);
+    free(j.s);
+    return k;
+}
+
+static int m_ota_check(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+    (void)ud; (void)e;
+    return ota_reply(m, ota_start("check", NULL));
+}
+
+static int m_ota_install(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+    (void)ud; (void)e;
+    const char *tag;
+    int r = sd_bus_message_read(m, "s", &tag);
+    if (r < 0) return r;
+    return ota_reply(m, ota_start("fetch", tag));
+}
+
+static int p_ota_releases(sd_bus *b, const char *path, const char *iface, const char *prop, sd_bus_message *r, void *ud,
+                          sd_bus_error *e)
+{
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)e;
+    struct buf j = { 0 };
+    char tmp[4096];
+    FILE *f = fopen("/run/reimu-ota/releases.json", "r");
+    size_t n;
+    while (f && (n = fread(tmp, 1, sizeof(tmp), f)) > 0) badd(&j, tmp, n);
+    if (f) fclose(f);
+    int k = sd_bus_message_append(r, "s", j.s ? j.s : "[]");
+    free(j.s);
+    return k;
+}
+
+/* ------------------------------------------------------------------ */
 /* the web UI object                                                   */
 
 static int p_ab_json(sd_bus *b, const char *path, const char *iface, const char *prop, sd_bus_message *r, void *ud,
@@ -728,6 +917,16 @@ static int p_ab_json(sd_bus *b, const char *path, const char *iface, const char 
         badd(&j, "}", 1);
     }
     else badd(&j, "null", 4);
+    badd(&j, ",\"ota\":", 7);
+    if (ota.state)
+    {
+        bprintf(&j, "{\"state\":\"%s\",\"progress\":%d,\"checked\":%lld,\"tag\":", ota.state, ota.progress, (long long)ota.checked);
+        bjson(&j, ota.tag);
+        badd(&j, ",\"message\":", 11);
+        bjson(&j, ota.message);
+        badd(&j, "}", 1);
+    }
+    else badd(&j, "null", 4);
     badd(&j, "}", 1);
     int k = sd_bus_message_append(r, "s", j.s ? j.s : "{}");
     free(j.s);
@@ -745,6 +944,9 @@ static const sd_bus_vtable ab_vt[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_PROPERTY("Json", "s", p_ab_json, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
     SD_BUS_METHOD("Refresh", "", "s", m_refresh, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_PROPERTY("OtaReleases", "s", p_ota_releases, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
+    SD_BUS_METHOD("OtaCheck", "", "s", m_ota_check, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("OtaInstall", "s", "s", m_ota_install, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END
 };
 

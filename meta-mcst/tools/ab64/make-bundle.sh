@@ -1,6 +1,8 @@
 #!/bin/sh
 # make-bundle.sh DEPLOY_DIR OUT: the package to install on another board, from
-# a finished build: reimu-ab-<version>.tar.gz, its .sha256, RELEASE.md.
+# a finished build: reimu-ab-<version>.tar.gz, its .sha256, RELEASE.md, and the
+# update alone for a board already on this firmware: <version>.tar, its .sha256
+# (the web upload takes it, and reimu-ota finds it by this name).
 set -eu
 deploy=$1; out=$2
 here=$(cd "$(dirname "$0")" && pwd); tests=$here/../../tests/ab64
@@ -15,7 +17,20 @@ chmod +x "$d/reimu-ab-from-stock" "$d/backup-stock.sh"
 (cd "$d" && sha256sum reimu-ab.tar reimu-ab-kexec.tar reimu-ab-from-stock backup-stock.sh board-check.sh > SHA256SUMS)
 tar -C "$out" -czf "$out/$n.tar.gz" "$n"
 (cd "$out" && sha256sum "$n.tar.gz" > "$n.tar.gz.sha256")
-sed -n '1,/^## Прочитайте/p' "$d/README.md" | sed '$d' > "$out/RELEASE.md"
+cp "$deploy/reimu-ab.tar" "$out/$ver.tar"
+(cd "$out" && sha256sum "$ver.tar" > "$ver.tar.sha256")
+# what changed, the web page shows it up to the marker. A tag must have its section.
+awk -v v="## $ver" '$0 == v { on = 1; next } /^## / { on = 0 } on' "$here/CHANGELOG.ru.md" | sed '/./,$!d' > "$out/CHANGES"
+case $ver in
+    *-g*) ;;
+    *) [ -s "$out/CHANGES" ] || { echo "make-bundle.sh: no section for $ver in CHANGELOG.ru.md" >&2; exit 1; } ;;
+esac
+{
+    cat "$out/CHANGES"
+    printf '\n<!-- ota-end -->\n\n'
+    sed -n '1,/^## Прочитайте/p' "$d/README.md" | sed '$d'
+} > "$out/RELEASE.md"
+rm -f "$out/CHANGES"
 printf 'Инструкция: `README.md` внутри архива.\n\n```\n%s\n```\n' "$(cat "$d/SHA256SUMS")" >> "$out/RELEASE.md"
 rm -rf "$d"
 ls -la "$out"

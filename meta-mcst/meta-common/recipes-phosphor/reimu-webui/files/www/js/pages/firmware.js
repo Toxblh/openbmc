@@ -8,6 +8,7 @@
 // goes into the slot that isn't running, read back, and boots next.
 
 import { api, h, toast, fmtBytes } from "../api.js";
+import { newerReleases, changesOf, isPrerelease } from "../lib/ota.js";
 
 const FW = "/xyz/openbmc_project/reimu/firmware";
 const AB = "/xyz/openbmc_project/reimu/ab";
@@ -42,6 +43,19 @@ export function firmwareCard(mgr, onReboot) {
   let timer = null;
   let alive = true;
   let last = null;
+  // updates from the releases: the list as last fetched, what the page chose
+  const ota = { releases: null, loaded: 0, showPre: null };
+
+  async function loadReleases(o) {
+    if (!o || o.state !== "checked" || o.checked === ota.loaded) return;
+    try {
+      const r = await api.get(AB);
+      ota.releases = JSON.parse(r.data.OtaReleases);
+      ota.loaded = o.checked;
+    } catch (e) {
+      toast(`Список версий не прочитан: ${e.message}`, "err");
+    }
+  }
 
   async function refresh() {
     clearTimeout(timer);
@@ -54,13 +68,16 @@ export function firmwareCard(mgr, onReboot) {
       return;
     }
     if (st === undefined) st = null;
+    if (st && st.ab) await loadReleases(st.ab.ota);
+    if (!alive) return;
     const lastJob = last && (last.ab ? last.ab.job : last.job);
     const wasRunning = lastJob && lastJob.state === "running";
     last = st;
     card.replaceChildren(...render(st));
     // follow a running job, and look once more after it ended (results)
     const job = st && (st.ab ? st.ab.job : st.job);
-    if (job && job.state === "running") timer = setTimeout(refresh, 2000);
+    const o = st && st.ab && st.ab.ota;
+    if ((job && job.state === "running") || (o && (o.state === "checking" || o.state === "downloading"))) timer = setTimeout(refresh, 2000);
     else if (wasRunning) timer = setTimeout(refresh, 1500);
   }
   function stop() {
@@ -139,6 +156,7 @@ export function firmwareCard(mgr, onReboot) {
       }
       out.push(row);
     }
+    if (st && st.ab) out.push(otaSection(st.ab, ota, refresh));
     out.push(uploadSection(st, backup, onReboot));
     return out;
   }
@@ -184,6 +202,67 @@ function renderAb(ab, onReboot) {
   return out;
 }
 
+// the BMC itself asks for the releases and downloads the update; the file goes
+// the way of an upload (reimu-abd), so the reboot is the same button after it
+function otaSection(ab, ota, refresh) {
+  const o = ab.ota;
+  const busy = (o && (o.state === "checking" || o.state === "downloading")) || (ab.job && ab.job.state === "running");
+  const call = async (name, data) => {
+    try {
+      const r = await api.post(`${AB}/action/${name}`, { data });
+      const { ok, message } = JSON.parse(r.data);
+      if (!ok) toast(message, "err");
+    } catch (e) {
+      toast(`Ошибка: ${e.message}`, "err");
+    }
+    setTimeout(refresh, 300);
+  };
+  const check = h("button", { class: "btn small" }, o && o.state === "checking" ? "Проверяю…" : "Проверить обновления");
+  check.disabled = busy;
+  check.addEventListener("click", () => call("OtaCheck", []));
+  const out = [h("h3", {}, "Обновление из интернета"), h("div", { class: "row" }, check)];
+
+  if (o && o.state === "failed") out.push(h("div", { class: "alert err" }, o.message));
+  if (o && o.state === "downloading") {
+    out.push(
+      h("div", { class: "small" }, `Скачивание ${o.tag}`),
+      h("div", { class: "progress" }, h("div", { style: { width: `${o.progress || 0}%` } })),
+    );
+  }
+  if (ota.releases) {
+    const showPre = ota.showPre === null ? isPrerelease(ab.running) : ota.showPre;
+    const pre = h("input", { type: "checkbox" });
+    pre.checked = showPre;
+    pre.addEventListener("change", () => {
+      ota.showPre = pre.checked;
+      refresh();
+    });
+    out.push(h("label", { class: "small" }, pre, " Показывать бета-версии"));
+    const list = newerReleases(ota.releases, ab.running, showPre);
+    if (!list.length) out.push(h("p", { class: "muted small" }, `Установлена последняя версия: ${ab.running}`));
+    for (const r of list) {
+      out.push(
+        h(
+          "div",
+          { class: "section" },
+          h("div", {}, h("b", {}, r.tag_name), " ", r.prerelease ? h("span", { class: "badge warn" }, "бета") : null, " ", h("span", { class: "muted small" }, r.published_at ? new Date(r.published_at).toLocaleDateString() : "")),
+          h("div", { class: "small", style: { whiteSpace: "pre-wrap" } }, changesOf(r.body) || "Описания нет."),
+        ),
+      );
+    }
+    if (list.length) {
+      const tag = list[0].tag_name;
+      const go = h("button", { class: "btn primary small" }, `Скачать и установить ${tag}`);
+      go.disabled = busy;
+      go.addEventListener("click", () => {
+        if (confirm(`BMC скачает ${tag} и запишет в слот, который сейчас не работает. Текущая прошивка останется для отката. Чтобы запустить новую, потом нужно перезагрузить BMC: это жёстко сбросит хост. Продолжить?`)) call("OtaInstall", [tag]);
+      });
+      out.push(h("div", { class: "row" }, go));
+    }
+  }
+  return h("div", { class: "section" }, ...out);
+}
+
 function uploadSection(st, backup, onReboot) {
   const file = h("input", { type: "file", accept: ".tar,.mtd.tar,application/x-tar" });
   const job = st && st.ab && st.ab.job;
@@ -196,7 +275,7 @@ function uploadSection(st, backup, onReboot) {
     const f = file.files[0];
     if (!f) return;
     const head = new Uint8Array(await f.slice(257, 262).arrayBuffer());
-    if (String.fromCharCode(...head) !== "ustar") return toast(st && st.ab ? "Это не tar-архив обновления (нужен reimu-ab.tar)" : "Это не tar-архив образа (нужен obmc-phosphor-image-*.static.mtd.tar)", "err");
+    if (String.fromCharCode(...head) !== "ustar") return toast(st && st.ab ? "Это не tar-архив обновления (нужен файл вида reimu-2.0.tar из релиза)" : "Это не tar-архив образа (нужен obmc-phosphor-image-*.static.mtd.tar)", "err");
     const guard = st && st.ab
       ? "Образ будет записан в слот, который сейчас не работает (каждый блок читается обратно), и запустится после перезагрузки BMC. Если он не заработает, BMC вернётся к текущему слоту."
       : st && st.strap && st.dual ? "Текущий образ будет сохранён на резервный чип, новый должен пройти проверку после перезагрузки, иначе BMC вернётся к резервному." : "Резервного чипа нет: при неудачном обновлении BMC придётся восстанавливать программатором.";
@@ -243,7 +322,7 @@ function uploadSection(st, backup, onReboot) {
     bar,
     note,
     h("p", { class: "muted small" }, st && st.ab
-        ? "Также из консоли BMC: reimu-ab install reimu-ab.tar. Прошивка ПНС — на странице «Оборудование» (или reimu-pns-flash в консоли)."
+        ? "Также из консоли BMC: reimu-ab install ФАЙЛ.tar. Прошивка ПНС — на странице «Оборудование» (или reimu-pns-flash в консоли)."
         : st && st.dual !== undefined
           ? "Также из консоли: firmware-updater <URL образа>. Прошивка ПНС — на странице «Оборудование»."
           : "Также из консоли BMC: reimu-ab install reimu-ab.tar (A/B) или firmware-updater <URL образа>. Прошивка ПНС — на странице «Оборудование» (или reimu-pns-flash в консоли)."),

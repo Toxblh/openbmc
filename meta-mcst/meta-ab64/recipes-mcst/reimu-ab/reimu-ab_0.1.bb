@@ -7,7 +7,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
 inherit systemd
 DEPENDS = "systemd"
-RDEPENDS_${PN} += "u-boot-fw-utils-aspeed kexec-tools"
+RDEPENDS_${PN} += "u-boot-fw-utils-aspeed kexec-tools curl ca-certificates"
 SYSTEMD_SERVICE_${PN} = "reimu-ab.service reimu-abd.service"
 
 SRC_URI = " \
@@ -16,6 +16,7 @@ SRC_URI = " \
             file://reimu-flash.c \
             file://reimu-fit.c \
             file://reimu-ab \
+            file://reimu-ota \
             file://reimu-ab.env \
             file://reimu-ab.service \
             file://reimu-watchdog.conf \
@@ -28,7 +29,7 @@ S = "${WORKDIR}"
 do_install() {
   install -d ${D}/usr/sbin ${D}/usr/share/reimu-ab ${D}${systemd_system_unitdir} \
              ${D}${systemd_unitdir}/system.conf.d ${D}${sysconfdir}/dbus-1/system.d
-  install -m 755 reimu-flash reimu-fit reimu-ab reimu-abd ${D}/usr/sbin
+  install -m 755 reimu-flash reimu-fit reimu-ab reimu-ota reimu-abd ${D}/usr/sbin
   install -m 644 reimu-abd.service ${D}${systemd_system_unitdir}
   install -m 644 xyz.openbmc_project.Software.BMC.Updater.conf ${D}${sysconfdir}/dbus-1/system.d
   install -m 644 reimu-ab.env ${D}/usr/share/reimu-ab

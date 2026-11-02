@@ -443,6 +443,108 @@ def login_as(pw, cmd="true"):
                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
 
 
+class OtaServer:
+    """the releases for reimu-ota, on this machine: 10.0.2.2 from QEMU"""
+    def __init__(self):
+        import http.server, threading
+        routes = self.routes = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _go(self, send):
+                code, body = routes.get(self.path, (404, b""))
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if send:
+                    self.wfile.write(body)
+
+            def do_GET(self):
+                self._go(True)
+
+            def do_HEAD(self):
+                self._go(False)
+
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.port = self.srv.server_port
+
+    def release(self, tag, blob):
+        self.routes["/dl/%s/%s.tar" % (tag, tag)] = (200, blob)
+        self.routes["/dl/%s/%s.tar.sha256" % (tag, tag)] = (200, (hashlib.sha256(blob).hexdigest() + "  x\n").encode())
+
+
+def t_ota():
+    b = Bmc("ota", fresh("ota")).start()
+    srv = OtaServer()
+    rest = "curl -sk -u root:0penBmc -H 'Content-Type: application/json' https://127.0.0.1/xyz/openbmc_project/reimu/ab"
+
+    def call(name, *args):
+        o = b.out("%s/action/%s -X POST -d '%s'" % (rest, name, json.dumps({"data": list(args)})))
+        return json.loads(json.loads(o)["data"])
+
+    def state():
+        return json.loads(json.loads(b.out(rest))["data"]["Json"])
+
+    def wait(cond, secs):
+        st = None
+        for i in range(secs // 2):
+            st = state()
+            if cond(st):
+                return st
+            time.sleep(2)
+        return st
+
+    try:
+        check(b.wait_ssh(), "up")
+        ver = b.out("sed -n 's/^VERSION_ID=//p' /etc/os-release").strip().strip('"')
+        b.ssh("flash_eraseall /dev/mtd6")
+        b.out("cat > /etc/reimu-ota.conf <<E\nAPI=http://10.0.2.2:%d/api\nDL=http://10.0.2.2:%d/dl\nPROTO==http\nE" % (srv.port, srv.port))
+        check(b.out("command -v curl; ls /etc/ssl/certs/ca-certificates.crt").count("/") >= 2, "curl and the CA list in the image")
+
+        srv.routes["/api"] = (200, json.dumps([{"tag_name": "reimu-9.9", "assets": []}]).encode())
+        check(call("OtaCheck")["ok"], "the check through REST, as the page does it")
+        st = wait(lambda s: s["ota"] and s["ota"]["state"] != "checking", 60)
+        check(st["ota"]["state"] == "checked", "checked (%s)" % st["ota"])
+        l = json.loads(json.loads(b.out(rest))["data"]["OtaReleases"])
+        check(l and l[0]["tag_name"] == "reimu-9.9", "the list for the page")
+
+        srv.routes.pop("/api")
+        call("OtaCheck")
+        st = wait(lambda s: s["ota"]["state"] != "checking", 60)
+        check(st["ota"]["state"] == "failed" and st["ota"]["message"], "a failed check says why (%s)" % st["ota"]["message"])
+
+        srv.release("reimu-8.8", b"not a firmware" * 1000)
+        check(call("OtaInstall", "reimu-8.8")["ok"], "install asked")
+        st = wait(lambda s: s["ota"] and s["ota"]["state"] == "failed", 90)
+        check(st["ota"] and st["ota"]["state"] == "failed", "not an image: refused (%s)" % (st["ota"] or {}).get("message"))
+
+        blob = open(os.path.join(W, "reimu-ab.tar"), "rb").read()
+        srv.release("reimu-9.9", blob)
+        call("OtaInstall", "reimu-9.9")
+        st = wait(lambda s: s["ota"] and s["ota"]["state"] == "failed", 120)
+        check(st["ota"] and "ожидалась" in st["ota"]["message"], "another version in the file: refused (%s)" % (st["ota"] or {}).get("message"))
+        e = benv(b, "reimu_slot", "reimu_pending")
+        check(e.get("reimu_slot") == "a" and e.get("reimu_pending", "0") == "0", "nothing installed by these (%s)" % e)
+
+        srv.release(ver, blob)
+        check(call("OtaInstall", ver)["ok"], "the right one asked")
+        check(not call("OtaCheck")["ok"], "a second start refused while it runs")
+        st = wait(lambda s: (s["ota"] and s["ota"]["state"] == "failed") or (s["job"] and s["job"]["state"] != "running" and not s["ota"]), 600)
+        check(st["job"] and st["job"]["state"] == "ok", "downloaded and written (%s)" % st["job"])
+        e = benv(b, "reimu_slot", "reimu_pending")
+        check(e == {"reimu_slot": "b", "reimu_pending": "1"}, "slot B next, pending (%s)" % e)
+        check(not b.out("ls /tmp/reimu-ota /tmp/images 2>/dev/null").replace("/tmp/images:", "").strip(), "nothing left in RAM")
+        b.ssh("reboot")
+        check(b.wait_console(r"reimu\.slot=b", 300, len(b.console()) - 10) is not None, "U-Boot boots slot B")
+        check(b.wait_ssh(), "up again")
+        check(ab_state(b) == "kernel=b rofs=b state=ok", "running slot B (%s)" % ab_state(b))
+    finally:
+        srv.srv.shutdown()
+        b.stop()
+
+
 def t_settings():
     """root password, a network file, the ssh host key and /var/lib/ipmi survive updates to the other slot and back"""
     b = Bmc("settings", fresh("settings")).start()
@@ -1048,7 +1150,7 @@ def t_solcut():
         check(o.startswith("A/B"), "power cut %s: an A/B slot boots" % label)
 
 
-TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update), ("settings", t_settings),
+TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update), ("ota", t_ota), ("settings", t_settings),
          ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("fallback", t_fallback),
          ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("solcut", t_solcut), ("restorecut", t_restorecut),
          ("restorecut-a", t_restorecut_a), ("stock", t_stock)]

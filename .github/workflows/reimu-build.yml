@@ -49,4 +49,4 @@ jobs:
           cd out
           ls -la
           gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --prerelease --verify-tag \
-            --title "$GITHUB_REF_NAME" --notes-file RELEASE.md *.tar.gz *.sha256
+            --title "$GITHUB_REF_NAME" --notes-file RELEASE.md *.tar *.tar.gz *.sha256
