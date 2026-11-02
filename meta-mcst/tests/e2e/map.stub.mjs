@@ -419,7 +419,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
-    check(r.bottom < r.win && r.h <= 560, `a tall window: the map no higher than the board needs (${r.h})`);
+    check(r.bottom < r.win && r.h <= 720, `a tall window: the map no higher than the board needs (${r.h})`);
     await s.page.setViewportSize({ width: 1300, height: 700 });
     await s.page.waitForTimeout(300);
     const r2 = await fits(s);
@@ -439,9 +439,29 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
-    check(r.stage === "", `a phone: the height not set (${r.stage})`);
+    check(Math.abs(r.h - 390 * 345 / 630) < 30, `a phone: the height by its width (${r.h})`);
     await s.page.context().close();
   }
+}
+
+// the switch of the view changes no size: neither the map nor what is under it moves
+for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
+  const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const size = () => s.page.evaluate(() => ({
+    h: Math.round(document.querySelector(".bs-stage").getBoundingClientRect().height),
+    card: Math.round(document.getElementById("map-summary").getBoundingClientRect().top),
+    fs: document.querySelector(".bs-svg [font-size]") && [...document.querySelectorAll(".bs-svg g[font-size]")].map((e) => e.getAttribute("font-size")).join(),
+  }));
+  const a = await size();
+  const seen = new Set();
+  await s.page.locator("[data-view-btn='top']").click();
+  for (let i = 0; i < 8; i++) { const r = await size(); seen.add(JSON.stringify(r)); await s.page.waitForTimeout(120); }
+  await s.page.locator("[data-view-btn='iso']").click();
+  for (let i = 0; i < 8; i++) { const r = await size(); seen.add(JSON.stringify(r)); await s.page.waitForTimeout(120); }
+  check(seen.size === 1 && seen.has(JSON.stringify(a)), `${w}x${wh}: the views of one size, labels too (${[...seen].join(" ")})`);
+  await s.page.context().close();
 }
 
 // zoom by the buttons

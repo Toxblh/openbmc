@@ -58,7 +58,6 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   };
   const clouds = {}; // id -> set(value)
   let T = view === "iso" ? 1 : 0;
-  let viewTo = T;
   // the zoom, the middle of the view from the middle of the board, the height given to the stage
   let Z = 1;
   let PX = 0;
@@ -358,15 +357,14 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   // screen pixels in a unit of the board at zoom 1
   const pxScale = () => {
     const w = stage.clientWidth || 600;
-    return boxH ? Math.min(w / VW, boxH / heightOf(T)) : w / VW;
+    return Math.min(w / VW, boxH / heightOf(T));
   };
   function fit() {
     const w = stage.clientWidth || 600;
-    const max = maxHeight();
-    boxH = max ? Math.min(max, (w * heightOf(viewTo)) / VW) : null;
-    stage.style.height = boxH ? `${boxH.toFixed(0)}px` : "";
-    SV.classList.toggle("boxed", !!boxH);
-    FS = Math.max(5.2, 7.5 / pxScale());
+    // one size for both views, the higher of them: a switch moves nothing on the page
+    boxH = Math.min(maxHeight() || Infinity, (w * heightOf(0)) / VW);
+    stage.style.height = `${boxH.toFixed(0)}px`;
+    FS = Math.max(5.2, 7.5 / (boxH / heightOf(0)));
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
     labels.forEach((l) => setLines(l.tx, comp ? l.short : l.full));
@@ -374,11 +372,10 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   }
   function setView(v) {
     const to = v === "iso" ? 1 : 0;
-    viewTo = to;
     cancelAnimationFrame(raf);
     if (reducedMotion()) {
       T = to;
-      fit();
+      render();
       return;
     }
     const from = T;
@@ -389,7 +386,6 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       T = from + (to - from) * k;
       render();
       if (k < 1) raf = requestAnimationFrame(step);
-      else fit();
     };
     raf = requestAnimationFrame(step);
   }
