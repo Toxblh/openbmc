@@ -324,12 +324,11 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   check((s.requests || 0) <= 1, `unmounted while loading: no timer left (${s.requests})`);
   await s.page.context().close();
 }
-// the menu: no page of its own, an old bookmark goes on
+// the menu: no page of its own
 {
   const index = fs.readFileSync(path.join(WWW, "index.html"), "utf8");
   const app = fs.readFileSync(path.join(WWW, "js/app.js"), "utf8");
-  check(!/data-page="map"/.test(index) && !/pages\/map/.test(app), "no «Карта» in the menu");
-  check(/name === "map"[\s\S]{0,40}location\.replace\("#\/hardware"\)/.test(app), "#/map goes to the hardware page");
+  check(!/data-page="map"/.test(index) && !/pages\/map|"map"/.test(app), "no «Карта» in the menu, no route");
 }
 
 // a phone
