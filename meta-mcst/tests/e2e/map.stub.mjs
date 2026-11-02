@@ -342,6 +342,20 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   check(!/data-page="map"/.test(index) && !/pages\/map|"map"/.test(app), "no «Карта» in the menu, no route");
 }
 
+// the CPU: no substrate around the lid, its textolite is of the same size
+{
+  const s = await open(clone(FIX), { view: "top" });
+  await ready(s);
+  const r = await s.page.evaluate(() => {
+    const g = document.querySelector(".bs-svg .bs-part[data-id='CPU']");
+    const a = [...g.querySelectorAll("polygon, rect, path")].filter((e) => !e.closest("svg svg")).map((e) => e.getBoundingClientRect());
+    const l = g.querySelector("svg svg, svg").getBoundingClientRect();
+    return { w: Math.max(...a.map((b) => b.width)) / l.width, h: Math.max(...a.map((b) => b.height)) / l.height };
+  });
+  check(r.w < 1.02 && r.h < 1.02, `nothing of the CPU wider than its lid (${r.w.toFixed(2)} x ${r.h.toFixed(2)})`);
+  await s.page.context().close();
+}
+
 // a slow BMC, a cycle longer than the period: one request at a time, the next cycle after it
 {
   const s = await open(clone(FIX), { slow: 1200 });

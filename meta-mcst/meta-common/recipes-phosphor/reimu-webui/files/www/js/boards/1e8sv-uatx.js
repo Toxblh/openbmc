@@ -169,7 +169,8 @@ function draw(sc, m) {
   // the CPU
   {
     const g = part("CPU", 131.5, 80);
-    box(g, 97, 53, 69, 54, 0, 1, "#232427");
+    // its textolite is of the size of the lid, nothing sticks out on the board
+    box(g, 102, 58, 59, 44, 0, 1, "#232427");
     box(g, 102, 58, 59, 44, 1, 1.5, "#b4b6b3");
     const inner = $("g", { transform: "translate(102 58) scale(0.1475 0.14667)" }, top(g, 2.5));
     const doc = new DOMParser().parseFromString(LID, "image/svg+xml");
