@@ -27,23 +27,30 @@ const FANS = [
 const MEMROUTE = { X46: [[254, 17.5]], X44: [[205, 30.5], [254, 30.5]], X16: [[205, 136.5], [254, 136.5]], X45: [[205, 160], [254, 160]] };
 
 // a D-sub, RJ45, USB on a port's face: u along the edge, v up from the board
-function rj(g, x, y, w, h, link) {
+// Each kind of connector has one size, here, in mm, by its standard: a port says
+// only where it is. RJ45 opening, USB-A opening, DE-15 shell, its screws and flange.
+const JACK = { rj45: { w: 11.7, h: 8.2 }, usb: { w: 12.5, h: 5.1 }, vga: { w: 16.9, h: 8.3, screws: 25, flange: 30.8 } };
+
+function rj(g, cu, y, link) {
+  const { w, h } = JACK.rj45, x = cu - w / 2;
   $("rect", { x, y, width: w, height: h, rx: 0.5, fill: "#121315" }, g);
   for (let i = 0; i < 8; i++) $("rect", { x: x + w * 0.2 + i * (w * 0.6 / 7) - 0.15, y: y + h - 2.2, width: 0.3, height: 1.6, fill: "#c9b26a" }, g);
   $("rect", { x: x + w / 2 - 2, y, width: 4, height: 1.4, fill: "#2a2b2e" }, g);
   $("rect", { x: x + 0.6, y: y + h + 0.6, width: 1.6, height: 1, rx: 0.2, fill: link ? "#30d158" : "#3a3b3e" }, g);
   $("rect", { x: x + w - 2.2, y: y + h + 0.6, width: 1.6, height: 1, rx: 0.2, fill: link ? "#ff9f0a" : "#3a3b3e" }, g);
 }
-function usb(g, x, y, w, h) {
+function usb(g, cu, y) {
+  const { w, h } = JACK.usb, x = cu - w / 2;
   $("rect", { x, y, width: w, height: h, rx: 0.4, fill: "#121315" }, g);
   $("rect", { x: x + 1.4, y: y + h * 0.52, width: w - 2.8, height: h * 0.3, fill: "#3a3b3e" }, g);
 }
 function vga(g, cx, cy) {
-  $("path", { d: `M${cx - 7},${cy + 3.4}H${cx + 7}Q${cx + 8.3},${cy + 3.4} ${cx + 8},${cy + 2.2}L${cx + 7},${cy - 2.3}Q${cx + 6.7},${cy - 3.4} ${cx + 5.6},${cy - 3.4}H${cx - 5.6}Q${cx - 6.7},${cy - 3.4} ${cx - 7},${cy - 2.3}L${cx - 8},${cy + 2.2}Q${cx - 8.3},${cy + 3.4} ${cx - 7},${cy + 3.4}Z`, fill: "#121315", stroke: "#6e706d", "stroke-width": 0.35 }, g);
-  [[1.8, -4.6], [0, -5.75], [-1.8, -4.6]].forEach(([dy, x0]) => {
-    for (let i = 0; i < 5; i++) $("circle", { cx: cx + x0 + i * 2.3, cy: cy + dy, r: 0.45, fill: "#8e9095" }, g);
+  const hw = JACK.vga.w / 2, hh = JACK.vga.h / 2, n = hw - 1.15;
+  $("path", { d: `M${cx - hw + 0.9},${cy + hh}H${cx + hw - 0.9}Q${cx + hw + 0.3},${cy + hh} ${cx + hw},${cy + hh - 1.2}L${cx + n},${cy - hh + 1.1}Q${cx + n - 0.3},${cy - hh} ${cx + n - 1.4},${cy - hh}H${cx - n + 1.4}Q${cx - n + 0.3},${cy - hh} ${cx - n},${cy - hh + 1.1}L${cx - hw},${cy + hh - 1.2}Q${cx - hw - 0.3},${cy + hh} ${cx - hw + 0.9},${cy + hh}Z`, fill: "#121315", stroke: "#6e706d", "stroke-width": 0.35 }, g);
+  [[2, -4.58], [0, -5.725], [-2, -4.58]].forEach(([dy, x0]) => {
+    for (let i = 0; i < 5; i++) $("circle", { cx: cx + x0 + i * 2.29, cy: cy + dy, r: 0.45, fill: "#8e9095" }, g);
   });
-  [-10.5, 10.5].forEach((d) => $("circle", { cx: cx + d, cy, r: 1, fill: "#3a3b3e" }, g));
+  [-1, 1].forEach((d) => $("circle", { cx: cx + d * JACK.vga.screws / 2, cy, r: 1, fill: "#3a3b3e" }, g));
 }
 const led = (g, u, v, on, col) => {
   if (on) $("circle", { cx: u, cy: v, r: 2.6, fill: col, opacity: 0.35 }, g);
@@ -118,8 +125,8 @@ function draw(sc, m) {
     box(g, 210, 80, 22, 9, 0, 3, "#131416");
     slot(top(g, 3), 210, 80, 22, 9, 0.3, busy, false);
     if (busy) {
-      box(only($("g", {}, g), true), 211, 4, 20, 77.5, 1.5, 2, "#1b1c1f");
-      box(only($("g", {}, g), false), 211, 4, 20, 80.5, 1.5, 2, "#1b1c1f");
+      box(only($("g", {}, g), true), 210, 4, 22, 77.5, 1.5, 2, "#1b1c1f");
+      box(only($("g", {}, g), false), 210, 4, 22, 80.5, 1.5, 2, "#1b1c1f");
       const t = top(g, 3.5);
       $("rect", { x: 213.5, y: 16, width: 15, height: 40, rx: 0.8, fill: "#303135" }, t);
       $("rect", { x: 213.5, y: 62, width: 15, height: 9, rx: 0.5, fill: "#3a3b40" }, t);
@@ -197,7 +204,8 @@ function draw(sc, m) {
     return g;
   };
   // a cable in a LAN port with a link: a plug at the edge, a short cord out
-  const plug = (g, u, w, z, h, hh, v) => {
+  const plug = (g, cu, z, hh, v) => {
+    const { w, h } = JACK.rj45, u = cu - w / 2;
     const a = only($("g", {}, g), true);
     box(a, -7, u + 0.6, 7, w - 1.2, z + 0.5, h - 1, "#d9dadd");
     box(a, -22, u + w / 2 - 1.3, 15, 2.6, z + h / 2 - 1.3, 2.6, "#c2c4c8");
@@ -209,7 +217,8 @@ function draw(sc, m) {
     $("rect", { x: 1 + v + h * 0.3, y: u + w * 0.3, width: h * 0.4, height: w * 0.4, rx: 0.3, fill: "#b5b7bb" }, t);
   };
   // a USB cable; dy: its cord from above moved aside from the LAN one
-  const usbPlug = (g, u, w, z, h, hh, v, dy) => {
+  const usbPlug = (g, cu, z, hh, v, dy) => {
+    const { w, h } = JACK.usb, u = cu - w / 2;
     const a = only($("g", {}, g), true);
     box(a, -6, u + 1, 6, w - 2, z + 0.4, h - 0.8, "#2c2e32");
     box(a, -20, u + w / 2 - 1, 14, 2, z + h / 2 - 1, 2, "#3a3c41");
@@ -220,23 +229,24 @@ function draw(sc, m) {
   };
   const N = m.net;
   {
-    const g = port("X4", 20, 26, 17, 30.5, (f) => { usb(f, 22, 3, 12.3, 5.8); usb(f, 22, 11.2, 12.3, 5.8); rj(f, 22, 19.7, 12.3, 9.6, N.X4.link); },
-      (f) => { usb(f, 22, 0, 12.3, 5.8); usb(f, 22, 6.8, 12.3, 5.8); rj(f, 22, 13.6, 12.3, 9.6, N.X4.link); });
-    if (m.usb.X4[0]) usbPlug(g, 22, 12.3, 3, 5.8, 30.5, 0, 3.1);
-    if (m.usb.X4[1]) usbPlug(g, 22, 12.3, 11.2, 5.8, 30.5, 6.8, -3.1);
-    if (N.X4.link) plug(g, 22, 12.3, 19.7, 9.6, 30.5, 13.6);
+    const u = 28.5, H = JACK.usb.h, gap = 1; // from above the three lie side by side from the edge
+    const g = port("X4", 20, 26, 17, 30.5, (f) => { usb(f, u, 3.3); usb(f, u, 11.4); rj(f, u, 20.3, N.X4.link); },
+      (f) => { usb(f, u, 0); usb(f, u, H + gap); rj(f, u, 2 * (H + gap), N.X4.link); });
+    if (m.usb.X4[0]) usbPlug(g, u, 3.3, 30.5, 0, 3.1);
+    if (m.usb.X4[1]) usbPlug(g, u, 11.4, 30.5, H + gap, -3.1);
+    if (N.X4.link) plug(g, u, 20.3, 30.5, 2 * (H + gap));
   }
   const btn = (cy) => (f) => $("circle", { cx: 46.6, cy, r: 1.9, fill: "#121315", stroke: "#6e706d", "stroke-width": 0.3 }, f);
   port("BTN", 42.5, 6, 8.2, 4.7, btn(2.4), btn(1.9));
-  port("X28", 74.6, 15, 31.4, 13, (f) => vga($("g", { transform: "translate(0 5.6)" }, f), 90.3, 0), (f) => vga($("g", { transform: "translate(0 3.4)" }, f), 90.3, 0));
-  {
-    const g = port("X15", 108.8, 21, 16.7, 14, (f) => rj(f, 111, 5.2, 12.3, 8, N.X15.link), (f) => rj(f, 111, 0, 12.3, 8, N.X15.link));
-    if (N.X15.link) plug(g, 111, 12.3, 5.2, 8, 14, 0);
-  }
-  {
-    const g = port("X14", 128, 21, 16.7, 14, (f) => rj(f, 130.2, 5.2, 12.3, 8, N.X14.link), (f) => rj(f, 130.2, 0, 12.3, 8, N.X14.link));
-    if (N.X14.link) plug(g, 130.2, 12.3, 5.2, 8, 14, 0);
-  }
+  port("X28", 74.6, 15, 31.4, 13, (f) => vga($("g", { transform: "translate(0 6.2)" }, f), 90.3, 0), (f) => vga($("g", { transform: `translate(0 ${JACK.vga.h / 2})` }, f), 90.3, 0));
+  // the two single ports are one part: same body, same place in it
+  const lan = (id, y) => {
+    const cu = y + 16.7 / 2;
+    const g = port(id, y, 21, 16.7, 14, (f) => rj(f, cu, 5.2, N[id].link), (f) => rj(f, cu, 0, N[id].link));
+    if (N[id].link) plug(g, cu, 5.2, 14, 0);
+  };
+  lan("X15", 108.8);
+  lan("X14", 128);
   const uid = (y, h, v) => (f) => {
     $("rect", { x: 145.6, y, width: 8.8, height: h, fill: "#6f7175" }, f);
     led(f, 150, v, m.uid.on, "#0a84ff");
@@ -248,10 +258,10 @@ function draw(sc, m) {
     const s = !d.known ? "неизвестно" : d.link ? (d.speed ? `${d.speed} Мбит/с` : "линк есть") : "нет линка";
     label(id, [d.link ? -22 : 0, y, z], [[-30, y]], `${name} · ${s}`, short, { end: true, dot: d.known ? (d.link ? "on" : "off") : null, dim: !d.link });
   };
-  lanLabel("X4", 28.4, 24, "LAN BMC · USB ×2", "BMC");
+  lanLabel("X4", 28.5, 24, "LAN BMC · USB ×2", "BMC");
   label("X28", [0, 90.3, 5.6], [[-30, 90.3]], "VGA", "VGA", { end: true });
-  lanLabel("X15", 117, 9, "LAN GE1", "GE1");
-  lanLabel("X14", 136.4, 9, "LAN GE0", "GE0");
+  lanLabel("X15", 117.15, 9, "LAN GE1", "GE1");
+  lanLabel("X14", 136.35, 9, "LAN GE0", "GE0");
 
   m.sensors.forEach((s) => sc.tempCloud(s));
 }

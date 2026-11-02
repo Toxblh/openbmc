@@ -663,6 +663,12 @@ static char *sensors_doc(int force)
     if (!strcmp(platform, "on") && cached && now - cached_at < SENS_CACHE_S && !force) return strdup(cached);
     struct buf b = { 0 };
     buf_printf(&b, "{\"version\":1,\"now\":%lld,\"platform\":\"%s\",", (long long)now, platform);
+    /* the BMC's own load: there with the host off as well */
+    double la[3];
+    FILE *lf = fopen("/proc/loadavg", "r");
+    if (lf && fscanf(lf, "%lf %lf %lf", &la[0], &la[1], &la[2]) == 3)
+        buf_printf(&b, "\"bmc\":{\"load\":[%.2f,%.2f,%.2f]},", la[0], la[1], la[2]);
+    if (lf) fclose(lf);
     if (!strcmp(platform, "on")) sensors_json(&b);
     else buf_str(&b, "\"sensors\":[]");
     buf_str(&b, "}");
