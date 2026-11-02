@@ -24,6 +24,12 @@ do_add_mcst_files () {
     grep -q mcst-reimu-5564 ${STAGING_KERNEL_DIR}/arch/arm/boot/dts/aspeed/Makefile ||
         echo 'dtb-$(CONFIG_ARCH_ASPEED) += aspeed-bmc-mcst-reimu-5564.dtb' >> \
             ${STAGING_KERNEL_DIR}/arch/arm/boot/dts/aspeed/Makefile
+    # no "+" of a tree that isn't a clean tag: make-mod-scripts prepares the tree
+    # for out-of-tree modules with no LOCALVERSION set, they would get RELEASE+
+    # and not load
+    sed -i 's/^elif \[ "${LOCALVERSION+set}" != "set" \]; then$/elif false; then/' ${STAGING_KERNEL_DIR}/scripts/setlocalversion
+    grep -q '^elif false; then$' ${STAGING_KERNEL_DIR}/scripts/setlocalversion ||
+        bbfatal "setlocalversion: the plus sign not removed"
 }
 
 # A fixed release. obmc-phosphor-kernel-version puts the commit of the patched
@@ -31,7 +37,6 @@ do_add_mcst_files () {
 # cache the kernel can be rebuilt (a new initramfs) while its modules come from
 # the cache, for another release, and then no module loads. Set here, after
 # do_kernel_configme, with the auto suffix off (deleted there, it defaults to y).
-export LOCALVERSION = ""
 do_configure_prepend() {
     sed -i '/CONFIG_LOCALVERSION/d' ${B}/.config
     echo 'CONFIG_LOCALVERSION="-reimu"' >> ${B}/.config

@@ -48,7 +48,8 @@ def main():
     inc = open(TREE + "/meta-phosphor/recipes-phosphor/ipmi/phosphor-ipmi-host.inc").read()
     rev = re.search(r'^SRCREV\s*=\s*"(\w+)"', inc, re.M).group(1)
     with tempfile.TemporaryDirectory() as d:
-        src = subprocess.check_output(["git", "-c", "safe.directory=*", "-C", GIT, "show", rev + ":apphandler.cpp"])
+        open(d + "/.gitconfig", "w").write("[safe]\n\tdirectory = *\n")     # the cache is the builder's
+        src = subprocess.check_output(["git", "-C", GIT, "show", rev + ":apphandler.cpp"], env=dict(os.environ, HOME=d))
         open(d + "/apphandler.cpp", "wb").write(src)
         subprocess.check_call(["patch", "-s", "-p1", "-d", d, "-i", PATCH])
         s = open(d + "/apphandler.cpp").read()

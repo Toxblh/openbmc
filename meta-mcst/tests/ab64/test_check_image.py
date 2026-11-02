@@ -10,12 +10,16 @@ mksq = SQ[0] if SQ else "mksquashfs"
 bad = 0
 
 
-def case(name, kernel_release, module_dirs, want_rc, want_text):
+def case(name, kernel_release, module_dirs, want_rc, want_text, vermagic=None, extra=False):
     global bad
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(d + "/r/etc")
         for m in module_dirs:
             os.makedirs(d + "/r/lib/modules/" + m + "/kernel")
+            open(d + "/r/lib/modules/" + m + "/kernel/a.ko", "wb").write(b"\0vermagic=" + m.encode() + b" mod_unload ARMv6 p2v8 \0")
+            if vermagic:
+                os.makedirs(d + "/r/lib/modules/" + m + "/updates")
+                open(d + "/r/lib/modules/" + m + "/updates/l-pcs-i2c.ko", "wb").write(b"\0vermagic=" + vermagic.encode() + b" mod_unload \0")
         subprocess.check_call([mksq, d + "/r", d + "/image-rofs", "-comp", "gzip", "-quiet", "-no-progress"], stdout=subprocess.DEVNULL)
         v = b"Linux version " + kernel_release.encode() + b" (gcc) #1\n" if kernel_release else b"nothing here"
         kern = b"\0" * 4096 + b"\xfd7zXZ\0 stub" + b"\0" * 100 + lzma.compress(os.urandom(200000) + v, format=lzma.FORMAT_XZ)
@@ -36,5 +40,6 @@ case("kernel and modules of different builds: refused", R + "-46c826b", [R + "-0
 case("two module trees: refused", R, [R, R + "-x"], 1, "modules")
 case("no module tree: refused", R, [], 1, "modules")
 case("no release in the kernel: refused", None, [R], 1, "release")
+case("an out-of-tree module for RELEASE+: refused", R, [R], 1, "l-pcs-i2c.ko", vermagic=R + "+")
 print("%d failed" % bad)
 sys.exit(1 if bad else 0)

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """check-image.py REIMU-AB-TAR: the kernel and the rootfs of an update are of one
-build: the release in the kernel is the only directory in /lib/modules. A cached
-build can mix them, and then no module loads on the board, with no error at the
-build or at the update."""
+build: the release in the kernel is the only directory in /lib/modules and the
+vermagic of every module there. A cached build can mix them, an out-of-tree
+module can be built for "RELEASE+", and then the module doesn't load on the
+board, with no error at the build or at the update."""
 import glob, lzma, os, re, shutil, subprocess, sys, tarfile, tempfile
 
 
@@ -30,13 +31,23 @@ def kernel_release(b):
             return m.group(1).decode()
 
 
-def module_dirs(rofs):
+def modules(rofs, d):
+    """{release directory: {module: its vermagic release}}"""
     tool = os.environ.get("UNSQUASHFS") or shutil.which("unsquashfs")
     if not tool:
         found = glob.glob("/work/build*/tmp/sysroots-components/x86_64/squashfs-tools-native/usr/sbin/unsquashfs")
         tool = found[0] if found else fail("no unsquashfs")
-    o = subprocess.check_output([tool, "-ls", rofs], text=True, stderr=subprocess.DEVNULL)
-    return sorted(set(re.findall(r"^squashfs-root/lib/modules/([^/\n]+)$", o, re.M)))
+    subprocess.run([tool, "-no-progress", "-d", d, rofs, "lib/modules"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = {}
+    top = os.path.join(d, "lib/modules")
+    for rel in os.listdir(top) if os.path.isdir(top) else []:
+        res[rel] = {}
+        for root, _, names in os.walk(os.path.join(top, rel)):
+            for n in names:
+                if n.endswith(".ko"):
+                    m = re.search(rb"vermagic=(\S+)", open(os.path.join(root, n), "rb").read())
+                    res[rel][n] = m.group(1).decode() if m else None
+    return res
 
 
 def main():
@@ -46,12 +57,17 @@ def main():
                 with open(os.path.join(d, n), "wb") as f:
                     shutil.copyfileobj(t.extractfile(n), f)
         rel = kernel_release(open(os.path.join(d, "image-kernel"), "rb").read())
-        mods = module_dirs(os.path.join(d, "image-rofs"))
+        mods = modules(os.path.join(d, "image-rofs"), os.path.join(d, "r"))
     if not rel:
         fail("no release found in the kernel")
-    if mods != [rel]:
-        fail("kernel %s, modules in the rootfs for %s" % (rel, mods or "nothing"))
-    print("check-image: kernel and modules %s" % rel)
+    if sorted(mods) != [rel]:
+        fail("kernel %s, modules in the rootfs for %s" % (rel, sorted(mods) or "nothing"))
+    if not mods[rel]:
+        fail("kernel %s, no modules in its directory" % rel)
+    wrong = {n: v for n, v in mods[rel].items() if v != rel}
+    if wrong:
+        fail("kernel %s, modules built for another: %s" % (rel, wrong))
+    print("check-image: kernel and %d modules %s" % (len(mods[rel]), rel))
 
 
 main()
