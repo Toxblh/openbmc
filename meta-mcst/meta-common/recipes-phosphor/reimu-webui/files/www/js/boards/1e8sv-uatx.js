@@ -145,7 +145,9 @@ function draw(sc, m) {
       $("rect", { x: 213.5, y: 16, width: 15, height: 40, rx: 0.8, fill: "#303135" }, t);
       $("rect", { x: 213.5, y: 62, width: 15, height: 9, rx: 0.5, fill: "#3a3b40" }, t);
       $("circle", { cx: 221, cy: 6.5, r: 1.2, fill: "#000", stroke: "#6e706d", "stroke-width": 0.3 }, t);
-      $("text", { "font-size": 2.8, fill: "#a0a2a7", "text-anchor": "middle", "font-weight": 500, transform: "translate(222 36) rotate(-90)" }, t).textContent = clip(d.short, 22);
+      // along the module; in the isometric view from the top corner down, so not upside down
+      $("text", { "font-size": 2.8, fill: "#a0a2a7", "text-anchor": "middle", "font-weight": 500, transform: "translate(222 36) rotate(-90)" }, only($("g", {}, t), false)).textContent = clip(d.short, 22);
+      $("text", { "font-size": 2.8, fill: "#a0a2a7", "text-anchor": "middle", "font-weight": 500, transform: "translate(220 36) rotate(90)" }, only($("g", {}, t), true)).textContent = clip(d.short, 22);
     }
     label("X48", [232, 84.5, 3], [[254, 84.5]], busy ? `X48 · ${d.dev} · ${d.size}` : `X48 · ${d.state === "empty" ? "пусто" : "неизвестно"}`, busy ? `X48 · ${d.size}` : "X48 · —", { dim: !busy });
   }

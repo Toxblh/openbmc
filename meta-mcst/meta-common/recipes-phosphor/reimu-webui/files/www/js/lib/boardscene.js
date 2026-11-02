@@ -4,8 +4,10 @@
 // clouds of values; what stands where is in js/boards/*.js. Text from outside
 // only ever goes in through textContent.
 const NS = "http://www.w3.org/2000/svg";
-const TH = (-20 * Math.PI) / 180;
-const PH = (55 * Math.PI) / 180;
+// a true isometric view: the three axes foreshortened alike by sqrt(2/3), the edges at 30 degrees
+const TH = -Math.PI / 4;
+const PH = Math.atan(Math.SQRT2);
+const FLAT = (-20 * Math.PI) / 180; // the order of the parts from above: nothing there hides anything
 const VX = -330;
 const VW = 630;
 export const ZOOMS = [1, 1.5, 2, 3, 4];
@@ -37,11 +39,27 @@ export function tempColor(t, status) {
 
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// Parts far to near, for a view from the side of x = 0, y = max. By their places on the board, not by
+// their middles: a long slot is in front of what stands behind any part of it. Two parts matter only
+// if a line of sight can pass both: x + y of them overlap.
+function depthOrder(parts) {
+  const far = (a, b) => a.fp && b.fp && a.fp[0] + a.fp[1] < b.fp[2] + b.fp[3] && b.fp[0] + b.fp[1] < a.fp[2] + a.fp[3]
+    && (a.fp[0] >= b.fp[2] || a.fp[3] <= b.fp[1]);
+  const left = [...parts].sort((a, b) => a.k - b.k);
+  const out = [];
+  while (left.length) {
+    const i = left.findIndex((p) => !left.some((q) => q !== p && far(q, p)));
+    out.push(left.splice(Math.max(i, 0), 1)[0]);
+  }
+  return out;
+}
+
 export function createScene(stage, { size = [244, 244], view = "iso", info = () => null, maxHeight = () => null } = {}) {
   const [W, H] = size;
   const R = []; // what follows the camera
   const parts = [];
   const labels = [];
+  const pills = []; // the clouds of values: their rectangles at a camera, what moved them off another
   // a long callout goes on several lines, by words
   const setLines = (tx, str) => {
     const lines = [];
@@ -85,12 +103,12 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function mkCam(t) {
     const th = TH * t;
     const ph = PH * t;
-    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: 0 };
+    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.05 * t, ox: 0, oy: 0 };
     const q = [[0, 0], [W, 0], [0, H], [W, H]].map((p) => P(c, p[0], p[1]));
     const xs = q.map((p) => p[0]);
     const ys = q.map((p) => p[1]);
     c.ox = -(Math.min(...xs) + Math.max(...xs)) / 2;
-    c.oy = -(Math.min(...ys) + Math.max(...ys)) / 2 + 8 * t;
+    c.oy = -(Math.min(...ys) + Math.max(...ys)) / 2 - 3 * t;
     return c;
   }
   const Mtop = (c, z) => [c.s * c.ct, c.s * c.st * c.cp, -c.s * c.st, c.s * c.ct * c.cp, c.ox, -c.s * z * c.sp + c.oy];
@@ -115,7 +133,17 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     return t;
   };
 
+  // the part a thing is drawn in grows by its place on the board: the order in depth goes by that
+  const partOf = new WeakMap();
+  const grow = (g, x0, y0, x1, y1) => {
+    let n = g;
+    while (n && !partOf.has(n)) n = n.parentNode;
+    if (!n) return;
+    const q = partOf.get(n);
+    q.fp = q.fp ? [Math.min(q.fp[0], x0), Math.min(q.fp[1], y0), Math.max(q.fp[2], x1), Math.max(q.fp[3], y1)] : [x0, y0, x1, y1];
+  };
   function box(g, x, y, w, h, z0, hh, col, tf) {
+    grow(g, x, y, x + w, y + h);
     const pl = $("polygon", { fill: shade(col, 0.78) }, g);
     const pf = $("polygon", { fill: shade(col, 0.6) }, g);
     const pt = $("polygon", { fill: tf || col, stroke: "rgba(255,255,255,.06)", "stroke-width": 0.35 }, g);
@@ -135,6 +163,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     return pt;
   }
   function cyl(g, cx, cy, r, z0, h, col) {
+    grow(g, cx - r, cy - r, cx + r, cy + r);
     const side = $("polygon", { fill: shade(col, 0.7) }, g);
     const tp = $("polygon", { fill: col, stroke: "rgba(255,255,255,.08)", "stroke-width": 0.4 }, g);
     R.push((c) => {
@@ -236,7 +265,9 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function part(id, cx, cy) {
     const g = $("g", { class: "bs-part" });
     if (id) g.dataset.id = id;
-    parts.push({ g, k: cx * Math.sin(TH) + cy * Math.cos(TH) });
+    const q = { g, k: cx * Math.sin(FLAT) + cy * Math.cos(FLAT), fp: null };
+    partOf.set(g, q);
+    parts.push(q);
     return g;
   }
   function label(id, anc, route, full, short, o = {}) {
@@ -245,7 +276,8 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const ln = $("polyline", { class: "bs-line" }, g);
     const dot = o.dot ? $("circle", { r: 1.3, class: `bs-dot ${o.dot}` }, g) : null;
     const tx = $("text", { class: `bs-lbl${o.dim ? " dim" : ""}`, "text-anchor": o.end ? "end" : "start", "dominant-baseline": "middle" }, g);
-    labels.push({ tx, full, short });
+    const l = { tx, full, short, route, end: !!o.end, dot: !!o.dot, dm: 0 };
+    labels.push(l);
     const place = (X, Y) => {
       tx.setAttribute("x", X);
       tx.setAttribute("y", Y);
@@ -257,7 +289,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     };
     R.push((c) => {
       const a = P(c, anc[0], anc[1], anc[2] || 0);
-      const ps = route.map((p) => P(c, p[0], p[1]));
+      const ps = route.map((p, i) => P(c, p[0], p[1] + (i === route.length - 1 ? l.dm * c.t : 0)));
       ln.setAttribute("points", pts(a, ...ps));
       const L = ps[ps.length - 1];
       const d = o.end ? -1 : 1;
@@ -268,29 +300,41 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       } else place(L[0] + 3 * d, L[1]);
     });
   }
+  // the line of a cloud moved off its place, none when it stands there
+  const moved = (ln, p, x, y, off, c) => ln.setAttribute("points", Math.hypot(off[0], off[1]) * c.t > 0.5 ? pts(p, [x, y]) : "");
   // a temperature on the board: a marker (dashed: the place is approximate), a cloud, a halo
   function tempCloud(s) {
     const g = $("g", { class: "bs-part" }, LB);
     g.dataset.id = `S:${s.id}`;
+    const ln = $("polyline", { class: "bs-line" }, g);
     const mk = s.side !== "c" ? $("circle", { r: 1.6, "stroke-width": 0.7 }, g) : null;
     const rc = $("rect", { rx: 3.5, class: "bs-pill" }, g);
     const tx = $("text", { "font-weight": 600, "text-anchor": "middle", "dominant-baseline": "middle" }, g);
+    const pill = {
+      off: [0, 0],
+      rect(c) {
+        const p = P(c, s.at[0], s.at[1], s.z || 0);
+        const w = FS * 2.9;
+        return { x: p[0] + (mk ? (s.side === "l" ? -1 : 1) * (w / 2 + 2.4) : 0), y: p[1], w, h: FS * 1.45 };
+      },
+    };
+    pills.push(pill);
     R.push((c) => {
       const p = P(c, s.at[0], s.at[1], s.z || 0);
-      const w = FS * 2.9;
-      const h = FS * 1.45;
-      let x = p[0];
+      const { x: x0, y: y0, w, h } = pill.rect(c);
+      const x = x0 + pill.off[0] * c.t;
+      const y = y0 + pill.off[1] * c.t;
+      moved(ln, p, x, y, pill.off, c);
       if (mk) {
         mk.setAttribute("cx", p[0]);
         mk.setAttribute("cy", p[1]);
-        x += (s.side === "l" ? -1 : 1) * (w / 2 + 2.4);
       }
       rc.setAttribute("x", x - w / 2);
-      rc.setAttribute("y", p[1] - h / 2);
+      rc.setAttribute("y", y - h / 2);
       rc.setAttribute("width", w);
       rc.setAttribute("height", h);
       tx.setAttribute("x", x);
-      tx.setAttribute("y", p[1] + FS * 0.08);
+      tx.setAttribute("y", y + FS * 0.08);
       tx.setAttribute("font-size", FS);
     });
     let halo = null;
@@ -318,16 +362,26 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function valueCloud(key, id, at, side, dy, text) {
     const g = $("g", { class: "bs-part" }, LB);
     g.dataset.id = id;
+    const ln = $("polyline", { class: "bs-line" }, g);
     const rc = $("rect", { rx: 3.5, class: "bs-pill" }, g);
     const tx = $("text", { class: "bs-pilltx", "text-anchor": "middle", "dominant-baseline": "middle", "font-weight": 600 }, g);
     tx.textContent = text;
+    const pill = {
+      off: [0, 0],
+      rect(c) {
+        const p = P(c, at[0], at[1], at[2]);
+        const fs = FS * 0.86;
+        const w = tx.textContent.length * fs * 0.58 + fs * 1.1;
+        return { x: side === "r" ? p[0] + w / 2 : p[0], y: p[1] + (dy || 0) * FS, w, h: FS * 1.45 };
+      },
+    };
+    pills.push(pill);
     R.push((c) => {
-      const p = P(c, at[0], at[1], at[2]);
       const fs = FS * 0.86;
-      const w = tx.textContent.length * fs * 0.58 + fs * 1.1;
-      const h = FS * 1.45;
-      const X = side === "r" ? p[0] + w / 2 : p[0];
-      const Y = p[1] + (dy || 0) * FS;
+      const { x: x0, y: y0, w, h } = pill.rect(c);
+      const X = x0 + pill.off[0] * c.t;
+      const Y = y0 + pill.off[1] * c.t;
+      moved(ln, P(c, at[0], at[1], at[2]), X, Y, pill.off, c);
       rc.setAttribute("x", (X - w / 2).toFixed(2));
       rc.setAttribute("y", (Y - h / 2).toFixed(2));
       rc.setAttribute("width", w.toFixed(2));
@@ -342,7 +396,117 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     };
   }
 
+  // half the height the isometric view shows: the stage may be higher than it needs
+  const isoHalf = () => boxH / Math.min((stage.clientWidth || 600) / VW, boxH / heightOf(1)) / 2 - FS * 0.3;
+  // In the isometric view the callouts of a side stand in a column down the edge of the board, each a
+  // step from the next by its lines, moved as little as can be: the end of a leader moves along the
+  // edge, so it stays off the board. From above they stay on their routes.
+  function spreadLabels() {
+    const c = mkCam(1);
+    const lim = isoHalf();
+    for (const end of [true, false]) {
+      const a = labels.filter((l) => l.end === end).map((l) => {
+        const e = l.route[l.route.length - 1];
+        return { l, y0: P(c, e[0], e[1])[1], h: l.tx.children.length * FS * 1.25 + FS * 0.3 };
+      }).sort((p, q) => p.y0 - q.y0);
+      // runs of callouts that touch: a run stands around the mean of where its callouts want to be
+      const runs = [];
+      for (const q of a) {
+        let r = { items: [q], sum: q.y0, h: q.h };
+        const mid = (x) => x.sum / x.items.length;
+        while (runs.length) {
+          const b = runs[runs.length - 1];
+          if (mid(b) + b.h / 2 <= mid(r) - r.h / 2) break;
+          runs.pop();
+          // the mean of the middles of the callouts, each counted where it stands in the run
+          let off = 0;
+          const offs = [...b.items, ...r.items].map((it) => { const o = off + it.h / 2; off += it.h; return o; });
+          const items = [...b.items, ...r.items];
+          r = { items, sum: items.reduce((t, it, n) => t + it.y0 - offs[n] + off / 2, 0), h: off };
+        }
+        runs.push(r);
+      }
+      for (const r of runs) {
+        let y = r.sum / r.items.length - r.h / 2;
+        for (const it of r.items) {
+          it.y = y + it.h / 2;
+          y += it.h;
+        }
+      }
+      // inside what is shown
+      a.forEach((q, i) => {
+        q.y = Math.max(q.y, i ? a[i - 1].y + (a[i - 1].h + q.h) / 2 : -lim + q.h / 2);
+      });
+      for (let i = a.length - 1; i >= 0; i--) {
+        a[i].y = Math.min(a[i].y, i < a.length - 1 ? a[i + 1].y - (a[i + 1].h + a[i].h) / 2 : lim - a[i].h / 2);
+      }
+      a.forEach((q) => {
+        q.l.dm = (q.y - q.y0) / (c.s * c.ct * c.cp);
+      });
+    }
+  }
+  // In the isometric view a cloud of a value that falls on another or on a callout moves off it, as
+  // little as can be, with a line to its place. From above they stay where they are.
+  function spreadClouds() {
+    const c = mkCam(1);
+    const lim = isoHalf();
+    const fixed = labels.map((l) => {
+      const e = l.route[l.route.length - 1];
+      const p = P(c, e[0], e[1] + l.dm);
+      const w = Math.max(0, ...[...l.tx.children].map((t) => t.textContent.length)) * FS * 0.56;
+      const from = p[0] + (l.end ? -1 : 1) * (l.dot ? 6.5 : 3);
+      return { x: from + ((l.end ? -1 : 1) * w) / 2, y: p[1], w, h: l.tx.children.length * FS * 1.25 };
+    });
+    const free = pills.map((q) => {
+      q.off = [0, 0];
+      return { q, ...q.rect(c) };
+    });
+    const pad = FS * 0.12;
+    const apart = (a, b, ka, kb) => {
+      const ox = (a.w + b.w) / 2 + pad - Math.abs(a.x - b.x);
+      const oy = (a.h + b.h) / 2 + pad - Math.abs(a.y - b.y);
+      if (ox <= 0 || oy <= 0) return false;
+      if (ox < oy) {
+        const d = a.x < b.x ? -1 : 1;
+        a.x += d * ox * ka;
+        b.x -= d * ox * kb;
+      } else {
+        const d = a.y < b.y ? -1 : 1;
+        a.y += d * oy * ka;
+        b.y -= d * oy * kb;
+      }
+      return true;
+    };
+    for (let n = 0; n < 80; n++) {
+      let moved = false;
+      free.forEach((a, i) => {
+        free.slice(i + 1).forEach((b) => {
+          moved = apart(a, b, 0.5, 0.5) || moved;
+        });
+        fixed.forEach((b) => {
+          moved = apart(a, b, 1, 0) || moved;
+        });
+        a.x = Math.max(VX + a.w / 2, Math.min(VX + VW - a.w / 2, a.x));
+        a.y = Math.max(-lim + a.h / 2, Math.min(lim - a.h / 2, a.y));
+      });
+      if (!moved) break;
+    }
+    free.forEach((a) => {
+      const r = a.q.rect(c);
+      a.q.off = [a.x - r.x, a.y - r.y];
+    });
+  }
+
+  // the parts in the order of the view: a camera on its way goes by the isometric one
+  let flatOrder = [];
+  let isoOrder = [];
+  let inOrder = null;
   function render() {
+    const order = T > 0 ? isoOrder : flatOrder;
+    if (order !== inOrder) {
+      order.forEach((p) => sceneG.appendChild(p.g));
+      inOrder = order;
+    }
     cam = mkCam(T);
     for (const f of R) f(cam);
     const h = heightOf(T);
@@ -353,7 +517,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     SV.setAttribute("viewBox", [VX + VW / 2 + PX - vw / 2, PY - vh / 2, vw, vh].map((n) => Number(n.toFixed(2))).join(" "));
     SV.classList.toggle("zoomed", Z > 1);
   }
-  const heightOf = (t) => 345 - 85 * t;
+  const heightOf = (t) => 345 - 80 * t;
   // screen pixels in a unit of the board at zoom 1
   const pxScale = () => {
     const w = stage.clientWidth || 600;
@@ -368,6 +532,8 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
     labels.forEach((l) => setLines(l.tx, comp ? l.short : l.full));
+    spreadLabels();
+    spreadClouds();
     render();
   }
   function setView(v) {
@@ -504,7 +670,8 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     svg: SV, plate, part, label, tempCloud, valueCloud, box, cyl, fanGlyph, slot, card, top, left, front, only, txt,
     // everything drawn: in order of depth, then to the screen
     finish() {
-      parts.sort((a, b) => a.k - b.k).forEach((p) => sceneG.appendChild(p.g));
+      flatOrder = [...parts].sort((a, b) => a.k - b.k);
+      isoOrder = depthOrder(parts);
       ro.observe(stage);
       addEventListener("resize", fit);
       fit();

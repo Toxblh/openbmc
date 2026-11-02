@@ -464,6 +464,84 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
+// a true isometric view: the three axes foreshortened alike, the edges of the board at 30 degrees
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const r = await s.page.evaluate(() => {
+    const scr = (e, p) => { const m = e.getScreenCTM(); return [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f]; };
+    // the plate: the largest polygon of the board
+    const area = (q) => q.reduce((a, p, i) => { const n = q[(i + 1) % q.length]; return a + p[0] * n[1] - n[0] * p[1]; }, 0) / 2;
+    let best = null;
+    for (const e of document.querySelectorAll(".bs-svg .bs-part[data-id='BOARD'] polygon")) {
+      if (e.getAttribute("filter")) continue;
+      const q = [...e.points].map((p) => scr(e, p));
+      if (q.length === 4 && (!best || Math.abs(area(q)) > Math.abs(area(best)))) best = q;
+    }
+    const len = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const edges = best.map((p, i) => len(p, best[(i + 1) % 4]));
+    const slope = best.map((p, i) => { const n = best[(i + 1) % 4]; return Math.abs((Math.atan2(n[1] - p[1], n[0] - p[0]) * 180) / Math.PI); }).map((a) => (a > 90 ? 180 - a : a));
+    // a plane of the rear panel: its first axis along the edge of the board, its second up
+    const pl = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X28'] g[transform^='matrix']")].find((g) => g.transform.baseVal[0].matrix.c === 0);
+    const m = pl.getScreenCTM();
+    return { edges, slope, along: Math.hypot(m.a, m.b), up: Math.hypot(m.c, m.d) };
+  });
+  const [a, b] = r.edges;
+  const mm = (a + b) / 2 / 244;
+  check(Math.abs(a - b) / b < 0.005, `isometric: the two edges of the board of one length (${a.toFixed(2)}, ${b.toFixed(2)})`);
+  check(Math.abs(r.up - mm) / mm < 0.005, `isometric: a millimetre up as long as one along the board (${r.up.toFixed(3)}, ${mm.toFixed(3)} px, ratio ${(r.up / mm).toFixed(3)})`);
+  check(Math.abs(r.along - mm) / mm < 0.005, `isometric: a millimetre along the rear panel the same (${r.along.toFixed(3)} px)`);
+  check(r.slope.every((d) => Math.abs(d - 30) < 0.2), `isometric: the edges at 30 degrees (${r.slope.map((d) => d.toFixed(1)).join(", ")})`);
+  // at 45 degrees a long slot has parts behind it that are nearer by its middle
+  const order = await s.page.evaluate(() => {
+    const all = [...document.querySelectorAll(".bs-svg .bs-part")].map((e) => e.dataset.id);
+    return { x5: all.indexOf("X5"), x46: all.indexOf("X46"), x54: all.indexOf("X54"), x48: all.indexOf("X48") };
+  });
+  check(order.x5 < order.x46, `isometric: a fan connector behind a memory slot drawn before it (${order.x5}, ${order.x46})`);
+  // the name on the M.2 module reads from the top corner down, not upside down
+  const m2 = await s.page.evaluate(() => {
+    const t = [...document.querySelectorAll(".bs-part[data-id='X48'] text")].find((e) => e.textContent === "NT-512" && Number(e.closest("g[opacity]").getAttribute("opacity")) === 1);
+    const m = t.getScreenCTM();
+    return m.a;
+  });
+  check(m2 > 0, `isometric: the name on the M.2 module not upside down (${m2.toFixed(2)})`);
+  await s.page.context().close();
+}
+
+// the callouts in the isometric view, in the sizes of a window: none cut, none on another, none on the board
+for (const [w, wh] of [[1000, 692], [1400, 800], [1920, 1080], [390, 844]]) {
+  const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const r = await s.page.evaluate(() => {
+    const st = document.querySelector(".bs-stage").getBoundingClientRect();
+    const name = (e) => e.closest(".bs-part").dataset.id;
+    const boxes = (q) => [...document.querySelectorAll(q)].map((e) => ({ id: name(e), b: e.getBoundingClientRect() }));
+    const lbl = boxes(".bs-svg text.bs-lbl");
+    const cloud = boxes(".bs-svg rect.bs-pill");
+    const cut = [...lbl, ...cloud].filter(({ b }) => b.left < st.left || b.right > st.right || b.top < st.top || b.bottom > st.bottom).map((x) => x.id);
+    const hit = (p, q) => p.left < q.right && q.left < p.right && p.top < q.bottom && q.top < p.bottom;
+    const over = [];
+    const all = [...lbl, ...cloud];
+    all.forEach((x, i) => all.slice(i + 1).forEach((y) => { if (hit(x.b, y.b)) over.push(`${x.id}/${y.id}`); }));
+    // the plate as a diamond on the screen: a label with a corner in it lies on the board
+    const pl = [...document.querySelectorAll(".bs-svg .bs-part[data-id='BOARD'] polygon")].filter((e) => !e.getAttribute("filter")).map((e) => {
+      const m = e.getScreenCTM();
+      return [...e.points].map((p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f]);
+    }).sort((p, q) => Math.hypot(q[0][0] - q[2][0], q[0][1] - q[2][1]) - Math.hypot(p[0][0] - p[2][0], p[0][1] - p[2][1]))[0];
+    const inside = (x, y) => pl.every((p, i) => { const n = pl[(i + 1) % 4]; return (n[0] - p[0]) * (y - p[1]) - (n[1] - p[1]) * (x - p[0]) > 0; }) || pl.every((p, i) => { const n = pl[(i + 1) % 4]; return (n[0] - p[0]) * (y - p[1]) - (n[1] - p[1]) * (x - p[0]) < 0; });
+    const onBoard = lbl.filter(({ b }) => [[b.left, b.top], [b.right, b.top], [b.left, b.bottom], [b.right, b.bottom]].some(([x, y]) => inside(x, y))).map((x) => x.id);
+    const xs = pl.map((p) => p[0]), ys = pl.map((p) => p[1]);
+    return { cut, over, onBoard, fill: [Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys)), Math.round(st.width), Math.round(st.height)] };
+  });
+  check(!r.cut.length, `${w}x${wh}: no callout cut by the stage (${r.cut})`);
+  check(!r.over.length, `${w}x${wh}: no callout on another (${r.over})`);
+  check(!r.onBoard.length, `${w}x${wh}: no callout on the board (${r.onBoard})`);
+  check(r.fill[0] > r.fill[2] * 0.45 || r.fill[1] > r.fill[3] * 0.8, `${w}x${wh}: the board fills the stage (${r.fill})`);
+  await s.page.context().close();
+}
+
 // zoom by the buttons
 {
   const s = await open(clone(FIX), { width: 1300, height: 800, view: "iso" });
