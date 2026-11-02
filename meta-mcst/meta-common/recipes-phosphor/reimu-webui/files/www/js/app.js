@@ -7,7 +7,6 @@ const pages = {
   console: () => import("./pages/console.js"),
   media: () => import("./pages/media.js"),
   sensors: () => import("./pages/sensors.js"),
-  map: () => import("./pages/map.js"),
   hardware: () => import("./pages/hardware.js"),
   host: () => import("./pages/host.js"),
   logs: () => import("./pages/journal.js"),
@@ -92,6 +91,11 @@ function route() {
 async function doRoute() {
   if (!state.loggedIn) return;
   const name = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0] || "overview").toLowerCase();
+  // the board map moved into the hardware page: old bookmarks still get there
+  if (name === "map") {
+    location.replace("#/hardware");
+    return;
+  }
   const key = pages[name] ? name : "overview";
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === key));
   const navLink = document.querySelector(`#nav a[data-page="${key}"]`);

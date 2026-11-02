@@ -1,236 +1,112 @@
-// Карта платы: одна страница на все платы, данные платы в js/boards/*.js (что
-// и где стоит, какой датчик чему соответствует). Плоский чертёж и изометрия: тот
-// же DOM под CSS transform. Тепло: ореолы вокруг настоящих датчиков, поля между
-// ними нет. Чего данные не говорят, то показано как неизвестное.
+// Карта платы, часть страницы «Оборудование»: одна на все платы. Здесь данные BMC и агента хоста в
+// модель и сводка; что и где стоит в js/boards/*.js, рисование в js/lib/boardscene.js.
+// Чего данные не говорят, то показано нейтрально, как неизвестное.
 import { api, h, fmtBytes } from "../api.js";
+import { createScene } from "../lib/boardscene.js";
 
 const BOARDS = [{ re: /1E8SV-uATX|1E8CB-uATX|TVGI\.469555\.445/i, load: () => import("../boards/1e8sv-uatx.js") }];
 const P = "/xyz/openbmc_project/reimu";
 const VIEW_KEY = "reimu-map-view";
 const json = (p) => api.get(p).then((r) => JSON.parse(r.data.Json)).catch(() => null);
-const round = (v) => (v === null || v === undefined ? "—" : Math.round(v));
-const S_NS = "http://www.w3.org/2000/svg";
+const AGENT_OLD = "Этот агент не сообщает об этом: его надо обновить.";
+const NO_AGENT = "Агент хоста не подключён, данных нет.";
 
-let root, timer, board, stage, wrap, ro, detail, summary, selected;
-let nodes = {};
-let data = {};
-const layers = { heat: true, sensors: true, fans: true, ports: true };
-
-function svg(tag, attrs) {
-  const el = document.createElementNS(S_NS, tag);
-  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
-  return el;
-}
+let root, timer, board, fanText, stage, summary, stateBox, scene, model, shape, id;
+let view = "iso";
 
 function loadView() {
   try {
-    return localStorage.getItem(VIEW_KEY) === "2d" ? "2d" : "iso";
+    return localStorage.getItem(VIEW_KEY) === "2d" ? "top" : "iso";
   } catch (e) {
     return "iso";
   }
 }
 
 function setView(v) {
-  wrap.dataset.view = v;
+  view = v;
   root.querySelectorAll("[data-view-btn]").forEach((b) => b.classList.toggle("primary", b.dataset.viewBtn === v));
   try {
-    localStorage.setItem(VIEW_KEY, v);
+    localStorage.setItem(VIEW_KEY, v === "top" ? "2d" : "iso");
   } catch (e) {
     /* a remembered view is only a convenience */
   }
+  if (scene) scene.setView(v);
 }
+
+const fruField = (xml, tag) => {
+  const m = new RegExp(`<${tag}>([^<]*)<`).exec(xml || "");
+  return m ? m[1] : null;
+};
 
 export async function identify() {
   const pns = await json(`${P}/pns`);
   if (!pns) return { name: null };
-  const fru = /<product_name>([^<]*)</.exec(pns.fruXml || "");
-  const part = /<part_number>([^<]*)</.exec(pns.fruXml || "");
-  const model = /^\s*model\s*=\s*"([^"]*)"/m.exec(pns.devtree || "");
-  return { name: (model && model[1]) || (fru && fru[1]) || null, part: part && part[1], fru: fru && fru[1] };
+  const model2 = /^\s*model\s*=\s*"([^"]*)"/m.exec(pns.devtree || "");
+  const fru = fruField(pns.fruXml, "product_name");
+  return {
+    name: (model2 && model2[1]) || fru, fru,
+    part: fruField(pns.fruXml, "part_number"),
+    serial: fruField(pns.fruXml, "serial_number"),
+    vendor: fruField(pns.fruXml, "manufacturer"),
+  };
 }
 
+// true: the map is there; a page around it goes on whatever happens here
 export async function mount(el) {
   root = el;
-  nodes = {};
-  selected = null;
-  const id = await identify();
+  scene = null;
+  shape = null;
+  id = await identify();
   const known = BOARDS.find((b) => [id.name, id.fru, id.part].some((s) => s && b.re.test(s)));
-  if (!root) return;
+  if (root !== el) return false;
   if (!known) {
     el.append(h("div", { class: "card", id: "map-unknown" }, h("h3", {}, "Карта платы"),
       id.name ? `Для платы «${id.name}» карты пока нет. Датчики есть на странице «Датчики».` : "Плата не определена: нет ни описания платы, ни данных FRU."));
-    return;
+    return false;
   }
-  board = (await known.load()).default;
-  if (!root) return;
-  build();
+  const mod = await known.load();
+  board = mod.default;
+  fanText = mod.fanText;
+  if (root !== el) return false;
+  const seg = (v, t) => h("button", { class: "btn small", dataset: { viewBtn: v }, onclick: () => setView(v) }, t);
+  stage = h("div", { class: "bs-stage" });
+  stateBox = h("div", { id: "map-state" });
+  summary = h("div", { class: "grid bs-sum", id: "map-summary" });
+  el.append(
+    h("div", { class: "row section" }, h("h3", { class: "bs-title" }, `Карта платы ${board.name}`), h("span", { class: "spacer" }), seg("iso", "Изометрия"), seg("top", "Сверху")),
+    stateBox,
+    h("div", { class: "card bs-board" }, stage),
+    summary,
+    h("p", { class: "muted small" }, `Положения по ${board.doc}. Наведите или нажмите на деталь. Пунктирный маркер: положение датчика приблизительное.`),
+  );
+  setView(loadView());
   await refresh();
+  if (root !== el) return false;
   timer = setInterval(refresh, 5000);
+  return true;
 }
 
 export function unmount() {
   clearInterval(timer);
-  if (ro) ro.disconnect();
+  if (scene) scene.destroy();
+  scene = null;
   root = null;
 }
 
-function build() {
-  const seg = (v, t) => h("button", { class: "btn small", dataset: { viewBtn: v }, onclick: () => setView(v) }, t);
-  const tog = (k, t) => {
-    const c = h("input", { type: "checkbox", checked: layers[k], onchange: () => { layers[k] = c.checked; wrap.classList.toggle(`bm-no-${k}`, !c.checked); } });
-    return h("label", { class: "small" }, c, " ", t);
-  };
-  stage = h("div", { class: "bm-stage" });
-  wrap = h("div", { class: "bm-wrap", dataset: { view: "iso" } }, stage);
-  detail = h("div", { class: "card bm-detail", id: "map-detail" });
-  summary = h("div", { id: "map-summary" });
-  root.append(
-    h("div", { class: "row section" }, h("h2", { class: "m-hide" }, `Карта платы ${board.name}`), h("span", { class: "spacer m-hide" }),
-      seg("2d", "Чертёж"), seg("iso", "3D"), tog("heat", "Тепло"), tog("sensors", "Датчики"), tog("fans", "Вентиляторы"), tog("ports", "Разъёмы")),
-    h("div", { id: "map-state" }),
-    h("div", { class: "bm-main" }, h("div", { class: "card bm-board" }, wrap, legend()), detail),
-    summary,
-  );
-  const [w, ht] = board.size;
-  const plate = svg("svg", { viewBox: `0 0 ${w} ${ht}`, class: "bm-pcb" });
-  plate.append(svg("rect", { x: 0, y: 0, width: w, height: ht, rx: 1.5, class: "bm-plate" }));
-  for (const [x, y] of board.holes) plate.append(svg("circle", { cx: x, cy: y, r: 2, class: "bm-hole" }));
-  for (const p of board.parts) plate.append(svg("rect", { x: p.rect[0], y: p.rect[1], width: p.rect[2], height: p.rect[3], class: "bm-foot" }));
-  stage.append(plate);
-  for (const t of board.temps) stage.append(nodes[`halo:${t.id}`] = h("div", { class: "bm-halo", style: { left: pc(t.at[0], w), top: pc(t.at[1], ht), "--hz": t.hz || 0.4 } }));
-  for (const p of board.parts) stage.append(nodes[p.id] = box(p, w, ht));
-  for (const t of board.temps) stage.append(nodes[`t:${t.id}`] = marker(t, w, ht));
-  setView(loadView());
-  showDetail(null);
-  const fit = () => {
-    const s = Math.min(wrap.clientWidth, 760);
-    wrap.style.setProperty("--s", `${s}px`);
-    wrap.style.setProperty("--u", `${s / w}px`);
-    wrap.classList.toggle("bm-tiny", s < 480);
-  };
-  ro = new ResizeObserver(fit);
-  ro.observe(wrap);
-  fit();
-}
-
-const pc = (v, of) => `${(v / of) * 100}%`;
-
-function box(p, w, ht) {
-  const [x, y, bw, bh] = p.rect;
-  const el = h("div", {
-    class: `bm-box t-${p.type}${p.approx ? " approx" : ""}${bw < 5 ? " vert" : ""}`, dataset: { id: p.id }, title: p.title,
-    style: { left: pc(x, w), top: pc(y, ht), width: pc(bw, w), height: pc(bh, ht), "--z": p.z },
-    onclick: () => select(p.id),
-  },
-    h("i", { class: "bm-f" }), h("i", { class: "bm-l" }),
-    h("div", { class: "bm-t" }, p.type === "fan" ? h("b", { class: "bm-spin" }) : null, h("span", { class: "bm-id" }, p.id), h("span", { class: "bm-val" })));
-  return el;
-}
-
-function marker(t, w, ht) {
-  return h("div", { class: `bm-mk${t.approx ? " approx" : ""}`, dataset: { id: t.id }, style: { left: pc(t.at[0], w), top: pc(t.at[1], ht), "--z": t.z }, onclick: () => select(`t:${t.id}`) },
-    h("i", { class: "bm-stem" }), h("span", { class: "bm-tag" }));
-}
-
-function legend() {
-  const it = (c, t) => h("span", { class: "bm-lg" }, h("i", { class: c }), t);
-  return h("div", { class: "row small muted bm-legend" }, it("s-used", "занято, есть связь"), it("s-empty", "свободно, нет линка"), it("s-unknown", "неизвестно"), it("s-approx", "≈ место приблизительное"));
-}
-
-// ------------------------------------------------------------------ the data
-async function refresh() {
-  const [sensors, fans, host, eth] = await Promise.all([
-    json(`${P}/sensors`), json(`${P}/fans`), json(`${P}/hostlink`),
-    api.get("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0").catch(() => null),
-  ]);
-  if (!root) return;
-  data = { sensors, fans, host, eth, facts: {} };
-  const facts = data.facts;
-  const list = (sensors && sensors.sensors) || [];
-  const find = (src, name) => list.find((s) => s.src === src && s.name === name);
-
-  for (const t of board.temps) {
-    const group = t.srcs ? list.filter((s) => t.srcs.test(s.src) && s.kind === "temp") : [find(t.src, t.name)].filter(Boolean);
-    const vals = group.filter((s) => s.value !== null && s.value !== undefined);
-    const v = vals.length ? Math.max(...vals.map((s) => s.value)) : null;
-    const top = vals.find((s) => s.value === v) || {};
-    showTemp(t, v, top);
-    facts[`t:${t.id}`] = { title: t.title, approx: t.approx, note: t.note, rows: vals.length ? group.map((s) => [t.srcs ? s.name : "Температура", `${s.value === null ? "—" : s.value.toFixed(1)} °C`]) : [["Температура", "нет данных"]], };
-  }
-  for (const p of board.parts.filter((x) => x.type === "fan")) showFan(p, find, fans);
-  ports(host, eth);
-  renderState(sensors, host);
-  renderSummary(host, eth);
-  if (selected) showDetail(selected);
-}
-
-function heatColor(v, s) {
-  if (s.status === "crit") return "#ff3030";
-  if (s.status === "warn") return "#ff9020";
-  const t = Math.max(0, Math.min(1, (v - 25) / 60));
-  return `hsl(${Math.round(210 - 210 * t)} 90% 55%)`;
-}
-
-function showTemp(t, v, s) {
-  const halo = nodes[`halo:${t.id}`], mk = nodes[`t:${t.id}`];
-  mk.classList.toggle("nodata", v === null);
-  mk.querySelector(".bm-tag").textContent = v === null ? "—" : `${t.approx ? "≈ " : ""}${Math.round(v)}°`;
-  if (v === null) return (halo.style.display = "none");
-  const c = heatColor(v, s);
-  const k = Math.max(0.35, Math.min(1.2, (v - 15) / 55));
-  halo.style.display = "";
-  halo.style.setProperty("--c", c);
-  halo.style.setProperty("--r", t.r * k);
-  mk.style.setProperty("--c", c);
-}
-
-function showFan(p, find, fans) {
-  const el = nodes[p.id];
-  const val = el.querySelector(".bm-val");
-  let rpm = null, duty = null, why = "";
-  if (p.noTach) {
-    const f = fans && (fans.zones || []).flatMap((z) => z.fans || []).find((x) => x.dev === p.noTach);
-    duty = f ? f.duty : null;
-    why = "Тахометра нет: обороты неизвестны, показана заданная мощность.";
-  } else {
-    const s = find(p.src, p.name);
-    rpm = s ? s.value : null;
-    duty = s ? s.duty : null;
-    if (duty === undefined) duty = null;
-    if (s && rpm === null) why = "Нет сигнала тахометра: вентилятор не подключён или не вращается.";
-    if (!s) why = "Нет данных.";
-  }
-  const spinning = rpm > 0 || (p.noTach && duty > 0);
-  el.dataset.state = rpm > 0 ? "used" : rpm === 0 || (p.noTach && duty !== null) ? "idle" : "empty";
-  val.textContent = rpm !== null ? `${rpm}` : p.noTach && duty !== null ? `${Math.round(duty)}%` : "";
-  const spin = el.querySelector(".bm-spin");
-  spin.classList.toggle("on", !!spinning);
-  if (spinning) spin.style.animationDuration = `${rpm > 0 ? Math.max(0.25, Math.min(3, 1500 / rpm)) : 1.6}s`;
-  const rows = [["Контроллер", p.chan]];
-  if (!p.noTach) rows.push(["Обороты", rpm === null ? "—" : `${rpm} об/мин`]);
-  if (duty !== null) rows.push(["Мощность", `${Math.round(duty)} %`]);
-  data.facts[p.id] = { title: p.title, rows, note: why };
-}
-
-function setPort(id, state, rows, note, value) {
-  const el = nodes[id];
-  if (!el) return;
-  el.dataset.state = state;
-  const p = board.parts.find((x) => x.id === id);
-  el.querySelector(".bm-val").textContent = value || "";
-  data.facts[id] = { title: p.title, rows, note, approx: p.approx };
-}
-
-const UNK = "Агент хоста не подключён, данных нет.";
-
-function usbOf(u) {
+// ------------------------------------------------------------------ the model
+function usbPort(u) {
   const m = /^(\d+)-(\d+)/.exec(u.name || "");
   if (!m) return null;
   const c = board.usb.roots[m[1]];
-  return c === undefined ? null : board.usb.ports[`${c}${Number(m[2]) - 1}`] || null;
+  return c === undefined ? null : `${c}${Number(m[2]) - 1}`;
 }
 
-// which root port a device hangs from: walk the "parent" of the inventory
+function usbConnector(u) {
+  const p = usbPort(u);
+  return p === null ? null : board.usb.ports[p] || null;
+}
+
+// from a device up to the root port of a slot
 function rootOf(slot, byslot, roots) {
   for (let s = slot, n = 0; s && n < 16; n++) {
     if (roots.includes(s)) return s;
@@ -239,138 +115,279 @@ function rootOf(slot, byslot, roots) {
   return null;
 }
 
-function ports(host, eth) {
-  const on = host && host.agent && host.agent.connected && host.inventory;
-  const inv = on ? host.inventory : {};
-  // the BMC's own network is there with no agent at all
-  const link = eth && eth.LinkStatus;
-  const x4rows = [["BMC LAN", link === "LinkUp" ? `есть линк${eth.SpeedMbps ? `, ${eth.SpeedMbps} Мбит/с` : ""}` : link ? "нет линка" : "неизвестно"]];
-  // X4's USB: from the agent
-  const usb = inv.usb;
-  const usbFor = (id) => (usb || []).filter((u) => usbOf(u) === id);
-  const usbRows = (id) => (usb ? (usbFor(id).length ? usbFor(id).map((u) => ["USB", u.product || u.id]) : [["USB", "ничего не определилось"]]) : [["USB", "неизвестно"]]);
-  setPort("X4", link === "LinkUp" ? "used" : link ? "empty" : "unknown", [...x4rows, ...usbRows("X4")],
-    usb ? "" : on ? "Этот агент не сообщает о USB: его надо обновить." : UNK, eth && eth.SpeedMbps ? `${eth.SpeedMbps}M` : "");
-  setPort("X19", usb ? (usbFor("X19").length ? "used" : "empty") : "unknown", usbRows("X19"), usb ? "" : on ? "Этот агент не сообщает о USB: его надо обновить." : UNK);
-
-  // host network
-  const seen = {};
-  for (const n of inv.nics || []) {
-    const id = board.nics[n.pci] || board.nics[n.name];
-    if (id) seen[id] = n;
-  }
-  for (const id of ["X14", "X15"]) {
-    const n = seen[id];
-    if (!on) setPort(id, "unknown", [["Линк", "неизвестно"]], UNK);
-    else if (!n) setPort(id, "unknown", [["Линк", "неизвестно"]], "Агент не показывает этот интерфейс.");
-    else setPort(id, n.carrier ? "used" : "empty", [["Интерфейс", n.name], ["Линк", n.carrier ? `есть${n.speed ? `, ${n.speed} Мбит/с` : ""}` : "нет"]], board.nicNote, n.carrier && n.speed ? `${n.speed}M` : "");
-  }
-
-  // disks on SATA
-  const disks = inv.disks || [];
-  const known = disks.some((d) => d.bus) || (on && disks.length === 0);
-  for (const p of board.parts.filter((x) => x.sata !== undefined)) {
-    const d = disks.find((x) => x.bus && x.bus.ata && board.ata(x.bus.ata) === p.sata);
-    if (d) setPort(p.id, "used", [["Диск", d.model || d.name], ["Объём", fmtBytes(d.size)], ["Устройство", d.name]], "");
-    else if (known) setPort(p.id, "empty", [["Диск", "не определился"]], "");
-    else setPort(p.id, "unknown", [["Диск", "неизвестно"]], on ? "Этот агент не сообщает, на каком порте диск: его надо обновить." : UNK);
-  }
-
-  // PCIe slots
+function pcieSlots(on, inv) {
   const pci = inv.pci || [];
   const byslot = Object.fromEntries(pci.map((d) => [d.slot, d]));
-  const hasTopo = pci.some((d) => d.parent);
-  const cards = {};
-  for (const d of pci) {
-    if (String(d.class).startsWith("0604")) continue;
-    const allRoots = board.pcie.groups.flatMap((g) => g.roots);
-    const r = rootOf(d.slot, byslot, allRoots);
-    if (r) (cards[r] = cards[r] || []).push(d);
+  const topo = pci.some((d) => d.parent);
+  const out = {};
+  for (const [sid, s] of Object.entries(board.pcie.slots)) {
+    const base = { slot: s.width, state: "unknown", note: !on ? NO_AGENT : !topo ? AGENT_OLD : s.inferred ? "Порт этого разъёма определён косвенно: на этих портах нет ничего встроенного." : "" };
+    if (!on || !topo) {
+      out[sid] = base;
+      continue;
+    }
+    // the device: the first that isn't a bridge or an audio function; the mode: at the
+    // root port, the device's own link is the inside of the card (a GPU's switch says x16)
+    const devs = pci.filter((d) => !String(d.class).startsWith("0604") && !String(d.class).startsWith("04") && rootOf(d.slot, byslot, s.roots));
+    const d = devs[0];
+    if (!d) {
+      out[sid] = { ...base, state: "empty" };
+      continue;
+    }
+    const link = byslot[rootOf(d.slot, byslot, s.roots)].link || {};
+    const kind = String(d.class).startsWith("03") ? "gpu" : String(d.class).startsWith("0108") ? "nvme" : "other";
+    const disk = kind === "nvme" && (inv.disks || []).find((x) => x.bus && x.bus.pci === d.slot);
+    const name = (disk && disk.model) || d.name || d.slot;
+    const inBrackets = /\[(.*)\]/.exec(name);
+    const gts = parseFloat(link.speed);
+    out[sid] = {
+      ...base, state: "busy", kind, dev: name, short: inBrackets ? inBrackets[1] : name,
+      chip: inBrackets ? name.slice(0, name.indexOf("[")).trim() : null,
+      width: Math.max(1, Math.min(link.width || s.width, s.width)), gts: Number.isNaN(gts) ? null : gts,
+      size: disk ? fmtBytes(disk.size) : null,
+    };
   }
-  data.cards = cards;
-  for (const g of board.pcie.groups) {
-    const used = g.roots.filter((r) => cards[r]);
-    const names = used.flatMap((r) => cards[r]).filter((d) => !/^0403/.test(d.class)).map((d) => d.name || `${d.vendor}:${d.device}`);
-    for (const id of g.slots) {
-      const exact = g.roots.find((r) => board.pcie.rootSlot[r] === id);
-      if (!on) setPort(id, "unknown", [["Карта", "неизвестно"]], UNK);
-      else if (!hasTopo) setPort(id, "unknown", [["Карта", "неизвестно"]], "Этот агент не сообщает топологию PCI: его надо обновить.");
-      else if (exact) setPort(id, cards[exact] ? "used" : "empty", cards[exact] ? cards[exact].map((d) => ["Карта", d.name || d.slot]) : [["Карта", "нет"]], "");
-      else if (!used.length) setPort(id, "empty", [["Карта", "не определилась"]], g.inferred ? "Порт этого разъёма определён косвенно: на этих портах нет ничего встроенного." : "");
-      else if (used.length === g.slots.length) setPort(id, "used", names.map((n) => ["Одна из карт", n]), g.slots.length > 1 ? `Обе карты в разъёмах ${g.slots.join(" и ")}. Какая в каком, система не показывает.` : "");
-      else setPort(id, "unknown", names.map((n) => ["Одна из карт", n]), `Занят один из разъёмов ${g.slots.join(", ")}, какой именно, система не показывает.`);
+  return out;
+}
+
+const moduleKind = (m) => [m.type, m.registered ? "R-DIMM" : null].filter(Boolean).join(" ");
+const moduleSpeed = (m) => (m.rated_mts ? `${m.rated_mts} МТ/с${m.configured_mts && m.configured_mts !== m.rated_mts ? ` → ${m.configured_mts}` : ""}` : null);
+
+function buildModel(sensors, fans, host, eth, uid) {
+  const on = !!(host && host.agent && host.agent.connected && host.inventory);
+  const inv = on ? host.inventory : {};
+  const list = (sensors && sensors.sensors) || [];
+  const find = (src, name) => list.find((s) => s.src === src && s.name === name);
+  const hs = (on && host.sensors) || {};
+
+  const sensorsOut = [];
+  for (const t of board.temps) {
+    const group = t.srcs ? list.filter((s) => t.srcs.test(s.src) && s.kind === "temp") : [find(t.src, t.name)].filter(Boolean);
+    const vals = group.filter((s) => s.value !== null && s.value !== undefined);
+    if (!vals.length) continue;
+    const temp = Math.max(...vals.map((s) => s.value));
+    const top = vals.find((s) => s.value === temp);
+    sensorsOut.push({ ...t, name: t.title, temp, status: top.status, rows: t.srcs ? vals.map((s) => [s.name, `${s.value.toFixed(1)} °C`]) : null });
+  }
+
+  const fanOut = {};
+  for (const f of board.fans) {
+    if (f.noTach) {
+      const z = fans && (fans.zones || []).flatMap((x) => x.fans || []).find((x) => x.dev === f.noTach);
+      const duty = z && z.duty !== undefined ? z.duty : null;
+      fanOut[f.id] = { conn: duty !== null, rpm: null, pct: duty, chan: f.chan, note: "Тахометра нет: обороты неизвестны, показана заданная мощность." };
+    } else {
+      const s = find(f.src, f.name);
+      const rpm = s && s.value !== undefined ? s.value : null;
+      fanOut[f.id] = { conn: rpm !== null, rpm, pct: null, chan: f.chan, duty: s && s.duty !== undefined ? s.duty : null, note: s ? "" : "Нет данных." };
     }
   }
 
-  // memory by slot: the system doesn't say
-  for (const p of board.parts.filter((x) => x.type === "dimm")) {
-    const edac = (inv.memory && inv.memory.dimms) || [];
-    setPort(p.id, "unknown", [["Модуль", "неизвестно"], ["Всего памяти", on && inv.memory ? fmtBytes(inv.memory.total_mib * 1048576) : "неизвестно"]],
-      edac.length ? "" : "Хост сообщает только общий объём памяти, без разбивки по разъёмам.");
+  const pcie = pcieSlots(on, inv);
+  for (const [sid, d] of Object.entries(pcie)) {
+    if (d.state === "busy" && d.kind === "gpu") {
+      d.temp = hs.Host_GPU_Edge;
+      d.rpm = hs.Host_GPU_Fan;
+      const at = board.gpuCloud(sid);
+      if (at && d.temp !== undefined && d.temp !== null) sensorsOut.push({ id: "GPU", name: d.short, title: d.short, at, z: 12, side: "c", noHalo: true, temp: d.temp, status: "ok" });
+    }
   }
-  for (const p of board.parts.filter((x) => ["chip", "power", "battery"].includes(x.type) || x.id === "X28")) {
-    data.facts[p.id] = { title: p.title, rows: [], approx: p.approx };
+
+  // disks by the port they hang from; an agent that doesn't say the port: unknown
+  const disks = inv.disks || [];
+  const ports = on && (disks.some((d) => d.bus) || disks.length === 0);
+  const portState = (ch) => {
+    const d = disks.find((x) => x.bus && x.bus.ata && board.ata(x.bus.ata) === ch);
+    if (d) return { ch, state: "busy", dev: d.model || d.name, short: (d.model || d.name).split(" ")[0], size: fmtBytes(d.size), name: d.name };
+    return { ch, state: ports ? "empty" : "unknown", note: ports ? "" : on ? AGENT_OLD : NO_AGENT };
+  };
+  const sata = Object.fromEntries(Object.entries(board.sataPorts).map(([sid, ch]) => [sid, portState(ch)]));
+  const m2 = Object.fromEntries(Object.entries(board.m2).map(([sid, ch]) => [sid, portState(ch)]));
+
+  // memory: the host's firmware lists the modules, not their slots. All slots full of
+  // one kind: which is where doesn't matter. Otherwise it isn't said, so nothing is assigned.
+  const modules = inv.memory && inv.memory.modules;
+  const ids = Object.entries(board.memory);
+  const same = modules && modules.length === ids.length && modules.every((x) => x.size_gb === modules[0].size_gb && x.part === modules[0].part && x.type === modules[0].type);
+  const slots = Object.fromEntries(ids.map(([sid, ch]) => [sid, same ? { ch, state: "busy", size: modules[0].size_gb } : { ch, state: "unknown" }]));
+  const totalMib = inv.memory && inv.memory.total_mib;
+  const sumGb = modules && modules.length ? modules.reduce((a, x) => a + x.size_gb, 0) : null;
+
+  // the network
+  const ipv4 = (addrs) => ((addrs || []).find((a) => /^\d+\.\d+\.\d+\.\d+/.test(a)) || "").split("/")[0] || null;
+  const link = eth && eth.LinkStatus;
+  const ethIp = eth && (eth.IPv4Addresses || []).map((a) => a.Address).filter(Boolean)[0];
+  const net = {
+    X4: { name: "BMC", known: !!link, link: link === "LinkUp", speed: (eth && eth.SpeedMbps) || null, ip: ethIp || null, mac: eth && eth.MACAddress ? eth.MACAddress.toUpperCase() : null, sub: "сеть BMC + USB 2.0 ×2" },
+    X15: { name: "GE1", known: false, link: false, sub: "сеть хоста GE1" },
+    X14: { name: "GE0", known: false, link: false, sub: "сеть хоста GE0" },
+  };
+  for (const n of inv.nics || []) {
+    const c = board.nics[n.pci] || board.nics[n.name];
+    if (c && net[c]) Object.assign(net[c], { known: true, link: !!n.carrier, speed: n.speed || null, ip: ipv4(n.addrs), mac: n.mac ? n.mac.toUpperCase() : null, iface: n.name });
   }
+
+  // USB: which port of a connector, by its number
+  const usb = inv.usb;
+  const usbOn = (conn, port) => (usb || []).find((u) => !u.hub && usbPort(u) === port && usbConnector(u) === conn) || null;
+  const usbModel = { known: !!usb, X4: board.usb.order.X4.map((p) => usbOn("X4", p)), X19: (usb || []).filter((u) => !u.hub && usbConnector(u) === "X19") };
+
+  const part = id.part ? id.part.replace(/^TVGI/, "ТВГИ") : null;
+  return {
+    on, inv, sensors: sensorsOut, fans: fanOut, pcie, sata, m2, net, usb: usbModel, uid,
+    mem: { total: sumGb || (totalMib ? Math.round(totalMib / 1024) : null), slots, modules: modules || null, same: !!same, kind: modules && modules.length ? moduleKind(modules[0]) : "" },
+    board: { serial: id.serial, part, vendor: id.vendor, model: board.name },
+  };
 }
 
-// ------------------------------------------------------------------ text around the map
+// what the drawing depends on; values alone change in place
+function shapeOf(m) {
+  const pick = (o, f) => Object.entries(o).map(([k, v]) => [k, ...f(v)]);
+  return JSON.stringify([
+    m.sensors.map((s) => s.id), pick(m.fans, (f) => [f.conn]), pick(m.pcie, (d) => [d.state, d.width, d.dev]),
+    pick(m.sata, (d) => [d.state, d.dev]), pick(m.m2, (d) => [d.state, d.dev, d.size]),
+    pick(m.net, (d) => [d.known, d.link, d.speed]), m.usb.X4.map((u) => !!u), m.uid.on, pick(m.mem.slots, (d) => [d.state, d.size]),
+  ]);
+}
+
+// ------------------------------------------------------------------ the page
+async function refresh() {
+  const [sensors, fans, host, eth, led] = await Promise.all([
+    json(`${P}/sensors`), json(`${P}/fans`), json(`${P}/hostlink`),
+    api.get("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0").catch(() => null),
+    api.get("/xyz/openbmc_project/led/groups/enclosure_identify").then((r) => r.data).catch(() => null),
+  ]);
+  if (!root) return;
+  const uid = led && led.Asserted !== undefined ? { known: true, on: !!led.Asserted } : { known: false, on: false };
+  model = buildModel(sensors, fans, host, eth, uid);
+  const s = shapeOf(model);
+  if (s !== shape) {
+    const pinned = scene && scene.pinned();
+    if (scene) scene.destroy();
+    scene = createScene(stage, { size: board.size, view, info });
+    board.draw(scene, model);
+    scene.finish();
+    if (pinned) scene.pin(pinned);
+    shape = s;
+  } else {
+    for (const t of model.sensors) scene.setValue(`S:${t.id}`, t);
+    for (const [fid, f] of Object.entries(model.fans)) if (f.conn) scene.setValue(`F:${fid}`, fanText(f));
+    scene.refreshPopover();
+  }
+  renderState(sensors, host);
+  renderSummary();
+}
+
+const ST = { busy: "занято", empty: "свободно", unknown: "неизвестно" };
+
+// the popover
+function info(pid) {
+  const m = model;
+  if (!m) return null;
+  if (pid.startsWith("S:")) {
+    const s = m.sensors.find((x) => x.id === pid.slice(2));
+    if (!s) return null;
+    return { title: s.name, sub: "датчик температуры", rows: [...(s.rows || [["Температура", `${Math.round(s.temp)} °C`]]), s.approx ? ["Положение", "приблизительное"] : null], note: s.note };
+  }
+  if (m.mem.slots[pid]) {
+    const d = m.mem.slots[pid];
+    const g = m.mem.modules && m.mem.same ? m.mem.modules[0] : null;
+    return { title: pid, sub: "разъём памяти", rows: [["Канал", `MC${d.ch}`], ["Состояние", ST[d.state]], d.state === "busy" ? ["Модуль", `${d.size} ГБ ${m.mem.kind}`.trim()] : null,
+      g && g.part ? ["Партномер", g.part] : null, g && moduleSpeed(g) ? ["Частота", moduleSpeed(g)] : null, m.mem.total ? ["Всего памяти", `${m.mem.total} ГБ`] : null],
+      note: d.state === "unknown" ? memNote(m) : "" };
+  }
+  if (m.pcie[pid]) {
+    const d = m.pcie[pid];
+    const r = [["Разъём", `x${d.slot} · PCIe ${board.pcie.gen}`], ["Состояние", ST[d.state]]];
+    if (d.state === "busy") {
+      r.push(["Подключение", `x${d.width}${d.gts ? ` при ${d.gts} ГТ/с` : ""}`], ["Устройство", d.dev]);
+      if (d.chip) r.push(["Чип", d.chip]);
+      if (d.size) r.push(["Объём", d.size]);
+      if (d.temp !== undefined && d.temp !== null) r.push(["Температура", `${Math.round(d.temp)} °C`]);
+      if (d.rpm !== undefined && d.rpm !== null) r.push(["Вентилятор", `${Math.round(d.rpm)} об/мин`]);
+    }
+    return { title: pid, sub: "слот PCI Express", rows: r, note: d.note };
+  }
+  if (m.m2[pid] || m.sata[pid]) {
+    const d = m.m2[pid] || m.sata[pid];
+    return { title: pid, sub: m.m2[pid] ? "M.2 SATA" : "порт SATA", rows: [["Канал", `SATA${d.ch}`], ["Состояние", ST[d.state]], d.dev ? ["Накопитель", d.dev] : null, d.size ? ["Объём", d.size] : null], note: d.note };
+  }
+  if (m.net[pid]) {
+    const d = m.net[pid];
+    const rows = [["Линк", !d.known ? "неизвестно" : d.link ? "есть" : "нет"], d.speed ? ["Скорость", `${d.speed} Мбит/с`] : null, d.iface ? ["Интерфейс", d.iface] : null, d.ip ? ["IP", d.ip] : null, d.mac ? ["MAC", d.mac] : null];
+    if (pid === "X4") m.usb.X4.forEach((u, i) => rows.push([`USB ${i ? "верхний" : "нижний"}`, !m.usb.known ? "неизвестно" : u ? u.product || u.id : "пусто"]));
+    return { title: pid, sub: d.sub, rows, note: pid === "X4" ? (m.usb.known ? "Какой порт нижний, а какой верхний, не проверено." : m.on ? AGENT_OLD : NO_AGENT) : d.known ? "Какой интерфейс в каком разъёме, выведено по нумерации, кабелем не проверено." : NO_AGENT };
+  }
+  if (m.fans[pid]) {
+    const d = m.fans[pid];
+    return { title: pid, sub: "разъём вентилятора", rows: [["Контроллер", d.chan], ["Подключён", d.conn ? "да" : "нет"], d.rpm !== null ? ["Обороты", `${d.rpm} об/мин`] : null, d.pct !== null ? ["Мощность", `${Math.round(d.pct)} %`] : d.duty !== null && d.duty !== undefined ? ["Мощность", `${Math.round(d.duty)} %`] : null], note: d.note };
+  }
+  if (pid === "UID") return { title: "UID", sub: "светодиод на задней панели", rows: [["Состояние", !m.uid.known ? "нет данных" : m.uid.on ? "горит синим" : "не горит"]] };
+  if (pid === "X19") return { title: "X19", sub: "USB 2.0, передняя панель", rows: m.usb.known ? (m.usb.X19.length ? m.usb.X19.map((u) => ["USB", u.product || u.id]) : [["USB", "пусто"]]) : [["USB", "неизвестно"]] };
+  if (pid === "SN") return { title: "Серийный номер", sub: "из FRU", rows: [["Значение", m.board.serial || "нет данных"], m.board.vendor ? ["Производитель", m.board.vendor] : null] };
+  if (pid === "PN") return { title: "Партномер", sub: "из FRU", rows: [["Значение", m.board.part || "нет данных"]] };
+  if (pid === "BOARD") return { title: m.board.model, sub: "244 × 244 мм", rows: [["Процессор", "Эльбрус-8СВ"], m.board.serial ? ["Серийный номер", m.board.serial] : null] };
+  const f = board.fixed[pid];
+  if (!f) return null;
+  const t = pid === "CPU" ? m.sensors.find((s) => s.id === "CPU") : pid === "KPI" ? m.sensors.find((s) => s.id === "KPI") : null;
+  return { title: f[0], sub: f[1], rows: t ? [["Температура", `${Math.round(t.temp)} °C`]] : [] };
+}
+
+function memNote(m) {
+  const n = m.mem.modules ? m.mem.modules.length : null;
+  const of = Object.keys(m.mem.slots).length;
+  if (!n) return "Хост сообщает только общий объём памяти, без разбивки по разъёмам.";
+  return n < of ? `Установлено ${n} из ${of}, какие разъёмы заняты, система не показывает.` : `Установлено ${n} из ${of}, модули разные: какой в каком разъёме, система не показывает.`;
+}
+
 function renderState(sensors, host) {
-  const box = root.querySelector("#map-state");
   const out = [];
   const pf = sensors && sensors.platform;
   if (!sensors) out.push(h("div", { class: "alert warn" }, "Датчики платы недоступны."));
   else if (pf === "off") out.push(h("div", { class: "alert" }, "Хост выключен: датчики платы питаются вместе с ним и не читаются."));
   else if (pf && pf !== "on") out.push(h("div", { class: "alert" }, "Хост запускается: датчики появятся через несколько секунд."));
   if (!host || !host.agent || !host.agent.connected) out.push(h("div", { class: "alert" }, "Агент хоста не подключён: занятость разъёмов неизвестна, видны датчики и порт BMC."));
-  box.replaceChildren(...out);
+  stateBox.replaceChildren(...out);
 }
 
-function renderSummary(host, eth) {
-  const on = host && host.agent && host.agent.connected && host.inventory;
-  const inv = on ? host.inventory : null;
-  const cards = [];
-  if (inv) {
-    const s = host.sensors || {};
-    const gpu = inv.gpu && inv.gpu.name;
-    const pcs = Object.values(data.cards || {}).flat().filter((d) => !/^0403/.test(d.class));
-    cards.push(h("div", { class: "card" }, h("h3", {}, "Карты расширения"),
-      pcs.length ? h("ul", { class: "bm-ul" }, pcs.map((d) => h("li", {}, d.name || d.slot, d.link ? h("span", { class: "muted small" }, ` x${d.link.width}, ${d.link.speed.replace(" PCIe", "")}`) : null))) : h("div", { class: "muted" }, inv.pci && inv.pci.some((d) => d.parent) ? "Нет" : "Неизвестно: агента надо обновить"),
-      gpu && s.Host_GPU_Edge !== undefined && s.Host_GPU_Edge !== null ? h("div", { class: "small muted" }, `GPU: ${round(s.Host_GPU_Edge)} °C, кристалл ${round(s.Host_GPU_Junction)} °C, вентилятор ${round(s.Host_GPU_Fan)} об/мин`) : null));
-    cards.push(h("div", { class: "card" }, h("h3", {}, "Диски"),
-      (inv.disks || []).length ? h("ul", { class: "bm-ul" }, inv.disks.map((d) => h("li", {}, d.model || d.name, h("span", { class: "muted small" }, ` ${fmtBytes(d.size)}, ${diskWhere(d)}`)))) : h("div", { class: "muted" }, "Нет")));
-    cards.push(h("div", { class: "card" }, h("h3", {}, "USB хоста"),
-      inv.usb ? (inv.usb.filter((u) => usbOf(u) !== "BMC" && !isBmcChild(u)).length ? h("ul", { class: "bm-ul" }, inv.usb.filter((u) => usbOf(u) !== "BMC" && !isBmcChild(u)).map((u) => h("li", {}, u.product || u.id, h("span", { class: "muted small" }, ` ${usbOf(u) || "разъём неизвестен"}`)))) : h("div", { class: "muted" }, "Ничего не подключено")) : h("div", { class: "muted" }, "Неизвестно: агента надо обновить")));
-  }
-  summary.className = cards.length ? "grid bm-sum" : "";
-  summary.replaceChildren(...cards);
-}
+function renderSummary() {
+  const m = model;
+  const row = (...c) => h("div", { class: "bs-row" }, ...c);
+  const card = (title, big, sub, ...rest) => h("div", { class: "card" }, h("div", { class: "bs-ct" }, title), h("div", { class: "bs-cv" }, big, h("span", {}, sub)), ...rest);
+  const slots = Object.entries(m.mem.slots);
+  const mg = m.mem.modules && m.mem.modules[0];
+  const memCard = card("Память", m.mem.total ? `${m.mem.total} ГБ` : "—", m.mem.kind,
+    h("div", { class: "bs-bars" }, slots.map(([sid, d]) => h("div", { class: `bs-bar ${d.state}` }, h("i"), h("b", {}, sid), d.state === "busy" ? `${d.size} ГБ` : d.state === "empty" ? "пусто" : "неизвестно"))),
+    m.mem.same && mg.part ? row(h("span", { class: "muted" }, "Партномер"), h("span", {}, mg.part)) : null,
+    m.mem.same && moduleSpeed(mg) ? row(h("span", { class: "muted" }, "Частота"), h("span", {}, moduleSpeed(mg))) : null,
+    m.mem.modules && m.mem.modules.length && !m.mem.same ? row(h("span", { class: "muted", style: { whiteSpace: "normal" } }, memNote(m))) : null);
 
-const isBmcChild = (u) => /\./.test(u.name || "") && usbOf(u) === "BMC";
+  const ps = Object.entries(m.pcie);
+  const lanes = ps.reduce((a, [, d]) => a + d.slot, 0);
+  const anyKnown = ps.some(([, d]) => d.state !== "unknown");
+  const used = ps.reduce((a, [, d]) => a + (d.state === "busy" ? d.width : 0), 0);
+  const gts = (ps.find(([, d]) => d.gts) || [null, {}])[1].gts;
+  const pcieCard = card(`PCI Express ${board.pcie.gen}`, anyKnown ? String(used) : "—", `из ${lanes} линий${gts ? ` · ${gts} ГТ/с` : ""}`,
+    h("div", { class: "bs-pool" }, h("i", { style: { width: `${Math.round((used / lanes) * 100)}%` } })),
+    ps.map(([sid, d]) => row(h("b", {}, sid), h("em", {}, `x${d.state === "busy" ? d.width : d.slot}`), h("span", { class: d.state === "busy" ? "" : "muted" }, d.state === "busy" ? d.dev : ST[d.state] === "свободно" ? "пусто" : ST[d.state]))));
 
-function diskWhere(d) {
-  if (d.bus && d.bus.ata) {
-    const p = board.parts.find((x) => x.sata === board.ata(d.bus.ata));
-    return p ? p.id : "SATA";
-  }
-  if (d.bus && d.bus.usb) return usbOf({ name: d.bus.usb }) || "USB";
-  if (d.bus && d.bus.pci) return "PCIe";
-  return "разъём неизвестен";
-}
+  const disks = [];
+  ps.forEach(([sid, d]) => { if (d.state === "busy" && d.kind === "nvme") disks.push([sid, "NVMe", d.dev, d.size]); });
+  Object.entries(m.m2).forEach(([sid, d]) => { if (d.state === "busy") disks.push([sid, "SATA", d.dev, d.size]); });
+  Object.entries(m.sata).forEach(([sid, d]) => { if (d.state === "busy") disks.push([sid, "SATA", d.dev, d.size]); });
+  for (const d of (m.inv.disks || []).filter((x) => x.bus && x.bus.usb)) disks.push([usbConnector({ name: d.bus.usb }) || "USB", "USB", d.model || d.name, fmtBytes(d.size)]);
+  const noPort = (m.inv.disks || []).filter((x) => !x.bus);
+  for (const d of noPort) disks.push(["?", d.transport || "", d.model || d.name, fmtBytes(d.size)]);
+  const word = (n) => (n % 10 === 1 && n % 100 !== 11 ? "накопитель" : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "накопителя" : "накопителей");
+  const diskCard = card("Диски", m.on ? String(disks.length) : "—", m.on ? word(disks.length) : "нет данных",
+    m.on ? disks.map((d) => row(h("b", {}, d[0]), h("em", {}, d[1]), h("span", {}, d[2], d[3] ? h("span", { class: "muted" }, ` · ${d[3]}`) : null))) : row(h("span", { class: "muted" }, NO_AGENT)));
 
-function select(id) {
-  selected = selected === id ? null : id;
-  root.querySelectorAll(".bm-sel").forEach((e) => e.classList.remove("bm-sel"));
-  if (selected && nodes[selected]) nodes[selected].classList.add("bm-sel");
-  showDetail(selected);
-}
-
-function showDetail(id) {
-  const f = id && data.facts && data.facts[id];
-  if (!f) return detail.replaceChildren(h("h3", {}, "Что где"), h("div", { class: "muted small" }, "Нажмите на разъём или датчик."), h("div", { class: "muted small bm-src" }, `Положения по ${board.doc}. Со знаком ≈ положение приблизительное: в руководстве его нет.`));
-  detail.replaceChildren(
-    h("h3", {}, f.title),
-    f.rows.length ? h("dl", { class: "kv" }, f.rows.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null,
-    f.approx ? h("div", { class: "small muted" }, "≈ Положение приблизительное: в руководстве его нет.") : null,
-    f.note ? h("div", { class: "small muted bm-src" }, f.note) : null,
-  );
+  const ns = Object.entries(m.net);
+  const up = ns.filter(([, d]) => d.link).length;
+  const netCard = card("Сеть", String(up), `из ${ns.length} с линком`,
+    ns.flatMap(([sid, d]) => [
+      row(h("i", { class: `bs-led ${d.link ? "on" : ""}` }), h("b", {}, sid), h("span", { class: d.link ? "" : "muted" }, `${d.name} · ${!d.known ? "неизвестно" : d.link ? (d.speed ? `${d.speed} Мбит/с` : "линк есть") : "нет линка"}`)),
+      d.known ? h("div", { class: "bs-addr" }, d.ip ? h("b", {}, d.ip) : h("i", {}, "нет адреса"), h("span", {}, d.mac || "")) : null,
+    ]));
+  summary.replaceChildren(memCard, pcieCard, diskCard, netCard);
 }

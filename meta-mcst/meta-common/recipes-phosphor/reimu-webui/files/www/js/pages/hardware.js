@@ -3,6 +3,7 @@
 
 import { api, h, toast, healthBadge, fmtBytes } from "../api.js";
 import { pnsFlashCard } from "./pns.js";
+import * as boardMap from "./map.js";
 
 let root, flashCard;
 
@@ -11,8 +12,19 @@ const hex = (n) => "0x" + Number(n).toString(16).padStart(8, "0");
 
 export async function mount(el) {
   root = el;
-  el.append(h("h2", {}, "Оборудование"), h("div", { id: "hw-inv", class: "grid section" }, h("div", { class: "card" }, "Загрузка…")), h("h2", {}, "Программа начального старта (ПНС)"), h("div", { id: "hw-pns" }, h("div", { class: "card" }, "Загрузка…")));
-  await Promise.all([loadInventory(), loadPns()]);
+  const mapBox = h("div", { id: "hw-map", class: "section" });
+  el.append(h("h2", {}, "Оборудование"), mapBox, h("div", { id: "hw-inv", class: "grid section" }, h("div", { class: "card" }, "Загрузка…")), h("h2", {}, "Программа начального старта (ПНС)"), h("div", { id: "hw-pns" }, h("div", { class: "card" }, "Загрузка…")));
+  await Promise.all([loadMap(mapBox), loadInventory(), loadPns()]);
+}
+
+// on its own: what happens to the map stays out of the rest of the page
+async function loadMap(box) {
+  try {
+    // its summary has the memory, and more of it than the platform card
+    if (await boardMap.mount(box)) root && root.classList.add("hw-has-map");
+  } catch (e) {
+    box.replaceChildren(h("div", { class: "muted small" }, `Карта платы недоступна: ${e.message}`));
+  }
 }
 
 async function loadInventory() {
@@ -37,8 +49,8 @@ async function loadInventory() {
           ["Версия ПНС", sys.BiosVersion],
           ["UUID", sys.UUID],
           ["Питание", { On: "включена", Off: "выключена" }[sys.PowerState] || sys.PowerState],
-          ["Память всего", sys.MemorySummary && sys.MemorySummary.TotalSystemMemoryGiB ? `${sys.MemorySummary.TotalSystemMemoryGiB} ГиБ` : undefined],
         ]),
+        sys.MemorySummary && sys.MemorySummary.TotalSystemMemoryGiB ? h("dl", { class: "kv hw-mem-total" }, h("dt", {}, "Память всего"), h("dd", {}, `${sys.MemorySummary.TotalSystemMemoryGiB} ГиБ`)) : null,
       ),
     );
   for (const c of chassis)
@@ -225,6 +237,7 @@ async function loadPns() {
 }
 
 export function unmount() {
+  boardMap.unmount();
   if (flashCard) flashCard.stop();
   flashCard = null;
   root = null;

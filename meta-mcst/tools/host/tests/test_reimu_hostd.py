@@ -6,7 +6,7 @@
 Nothing of the machine it runs on is read or written: every path goes through
 the agent's Fs(root) and every command through a recording fake runner.
 """
-import gzip, subprocess
+import gzip, struct, subprocess
 import base64
 import time, importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
 
@@ -344,6 +344,70 @@ class TestInventory(Base):
         self.assertEqual(g["slot"], GPU)
         self.assertEqual(g["vram_total"], 8 << 30)
         self.assertEqual(g["vbios"], "113-D1820201-101")
+
+    def _dmi(self, *records, cut=None):
+        d = self.t.root + "/sys/firmware/dmi/tables"
+        os.makedirs(d, exist_ok=True)
+        blob = b"".join(records)
+        with open(os.path.join(d, "DMI"), "wb") as f:
+            f.write(blob[:cut] if cut else blob)
+        return blob
+
+    @staticmethod
+    def _type17(size=0x8000 | 0, ext=0, kind=0x1A, detail=0x2080, speed=3200, conf=2416, part="M393A4K40DB3-CWE", handle=0x11, short=False):
+        """an SMBIOS 3.3 type 17 record, its fields at the spec's offsets"""
+        b = bytearray(0x5C)
+        b[0], b[1] = 17, 0x5C
+        struct.pack_into("<H", b, 2, handle)
+        struct.pack_into("<H", b, 0x0C, size)
+        b[0x12] = kind
+        struct.pack_into("<H", b, 0x13, detail)
+        struct.pack_into("<H", b, 0x15, speed)
+        b[0x10], b[0x11], b[0x17], b[0x18], b[0x19], b[0x1A] = 1, 1, 2, 3, 0, 4
+        struct.pack_into("<I", b, 0x1C, ext)
+        struct.pack_into("<H", b, 0x20, conf)
+        if short:      # SMBIOS 2.3: the record ends before the part number's neighbours
+            b[1] = 0x1B
+            b = b[:0x1B]
+        return bytes(b) + b"_\0Bank 1, Hex 0xCE\0..\0" + part.encode() + b"\0\0"
+
+    def test_memory_modules_from_dmi(self):
+        """SMBIOS type 17 from the raw table: no dmidecode on the machine"""
+        bios = bytes([0, 0x18]) + bytes(0x16) + b"Vendor\0Ver\0\0"
+        array = bytes([16, 0x17]) + bytes(0x15) + b"\0\0"
+        end = bytes([127, 4, 0, 0]) + b"\0\0"
+        self._dmi(bios, array,
+                  self._type17(size=0x7FFF, ext=32768),            # 32 GiB through the extended size
+                  self._type17(size=0, part="NO DIMM"),            # an empty slot
+                  self._type17(size=0xFFFF, part="UNKNOWN"),       # size unknown: not a module to count
+                  self._type17(size=16384, kind=0x18, detail=0x80, speed=1600, conf=0, part="PLAIN"),  # 16 GiB DDR3, not registered
+                  self._type17(size=0x8000 | 16384, part="KB"),    # the unit bit: 16 MiB in KiB
+                  end, self._type17(size=8192, part="AFTER END"))
+        c = hd.Collector(self.fs, self.run, hd.parse_config(""))
+        mods = c.memory()["modules"]
+        self.assertEqual(len(mods), 3)
+        self.assertEqual(mods[0], {"size_gb": 32, "type": "DDR4", "registered": True, "rated_mts": 3200, "configured_mts": 2416, "part": "M393A4K40DB3-CWE"})
+        self.assertEqual((mods[1]["size_gb"], mods[1]["type"], mods[1]["registered"], mods[1]["configured_mts"], mods[1]["part"]), (16, "DDR3", False, None, "PLAIN"))
+        self.assertEqual(mods[2]["size_gb"], 0.02)
+
+    def test_memory_modules_short_cut_or_absent(self):
+        c = hd.Collector(self.fs, self.run, hd.parse_config(""))
+        self.assertNotIn("modules", c.memory(), "no table: no field, the rest works")
+        self.assertIn("total_mib", c.memory())
+        full = self._type17(size=32768, part="WHOLE") + self._type17(size=8192, part="CUT")
+        one = len(self._type17(size=32768, part="WHOLE"))
+        for cut in (one + 2, one + 30, one + 0x5C + 3, len(full) - 1):
+            self._dmi(full, cut=cut)
+            mods = c.memory()["modules"]
+            self.assertEqual(mods[0]["part"], "WHOLE", cut)
+            self.assertLessEqual(len(mods), 1, cut)     # a cut record is not a module
+        self._dmi(self._type17(size=8192, short=True, part="OLD"))     # a short record: what it has
+        m = c.memory()["modules"][0]
+        self.assertEqual((m["size_gb"], m["configured_mts"], m["part"]), (8, None, "OLD"))
+        self._dmi(b"\xff" * 300)      # junk, a record length that loops
+        self.assertEqual(c.memory().get("modules", []), [])
+        self._dmi(bytes([17, 2, 0, 0]) * 100)  # a record shorter than its header
+        self.assertEqual(c.memory().get("modules", []), [])
 
     def test_map_topology(self):
         """what the board map shows slots with: PCI parents, a disk's port, USB without serials"""

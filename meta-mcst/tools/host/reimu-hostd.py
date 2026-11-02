@@ -205,6 +205,56 @@ def save_secret(path, kv):
 
 
 # ------------------------------------------------------------------ files
+DMI_MEMORY_TYPES = {0x13: "SDRAM", 0x14: "DDR", 0x15: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1B: "LPDDR", 0x1C: "LPDDR2",
+                    0x1D: "LPDDR3", 0x1E: "LPDDR4", 0x22: "DDR5", 0x23: "LPDDR5"}
+
+
+def _dmi_memory_modules(t):
+    """the installed modules out of a raw SMBIOS table: type 17 records, offsets of
+    the spec (3.3). A record that doesn't end in the table isn't one."""
+    def word(rec, off, size=2):
+        return int.from_bytes(rec[off:off + size], "little") if off + size <= len(rec) else None
+
+    out = []
+    i = 0
+    while i + 4 <= len(t):
+        kind, length = t[i], t[i + 1]
+        end = t.find(b"\0\0", i + length) if length >= 4 else -1
+        if end < 0 or i + length > len(t):
+            break
+        rec = t[i:i + length]
+        strings = t[i + length:end].split(b"\0")
+        i = end + 2
+        if kind == 127:
+            break
+        if kind != 17:
+            continue
+        size = word(rec, 0x0C)
+        if size in (None, 0, 0xFFFF):
+            continue
+        if size == 0x7FFF:
+            mb = word(rec, 0x1C, 4)
+            if mb is None:
+                continue
+        else:
+            mb = (size & 0x7FFF) / 1024 if size & 0x8000 else size
+        gb = mb / 1024
+        rated = word(rec, 0x15)
+        conf = word(rec, 0x20)
+        if rated == 0xFFFF:
+            rated = word(rec, 0x54, 4)
+        if conf == 0xFFFF:
+            conf = word(rec, 0x58, 4)
+        n = rec[0x1A] if len(rec) > 0x1A else 0
+        part = strings[n - 1].decode("ascii", "replace").strip() if 0 < n <= len(strings) else ""
+        detail = word(rec, 0x13) or 0
+        out.append({"size_gb": int(gb) if gb == int(gb) else round(gb, 2),
+                    "type": DMI_MEMORY_TYPES.get(rec[0x12]) if len(rec) > 0x12 else None,
+                    "registered": bool(detail & 0x2000), "rated_mts": rated or None, "configured_mts": conf or None,
+                    "part": part or None})
+    return out
+
+
 class Fs:
     """the machine's files, or a fake tree under root (tests)"""
 
@@ -224,10 +274,10 @@ class Fs:
         except OSError:
             return default
 
-    def readb(self, path):
+    def readb(self, path, limit=4096):
         try:
             with open(self.p(path), "rb") as f:
-                return f.read(4096)
+                return f.read(limit)
         except OSError:
             return None
 
@@ -558,8 +608,12 @@ class Collector:
         # the board's e2k_edac has only mc0 (size_mb 0, no dimm/csrow entries)
         ctls = [{"mc": int(mc.rsplit("mc", 1)[1]), "name": self.fs.read(mc + "/mc_name"),
                  "size_mib": self.fs.int(mc + "/size_mb", 0)} for mc in sorted(mcs, key=_natkey)]
-        return {"total_mib": mi.get("MemTotal", 0) // 1024, "ecc": "edac" if mcs else "unknown", "dimms": dimms,
-                "controllers": ctls}
+        out = {"total_mib": mi.get("MemTotal", 0) // 1024, "ecc": "edac" if mcs else "unknown", "dimms": dimms,
+               "controllers": ctls}
+        table = self.fs.readb("/sys/firmware/dmi/tables/DMI", 1 << 20)     # root only
+        if table:
+            out["modules"] = _dmi_memory_modules(table)
+        return out
 
     def _lspci(self):
         if self.lspci is None:
