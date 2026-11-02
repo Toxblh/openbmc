@@ -2,11 +2,13 @@
 // модель и сводка; что и где стоит в js/boards/*.js, рисование в js/lib/boardscene.js.
 // Чего данные не говорят, то показано нейтрально, как неизвестное.
 import { api, h, fmtBytes } from "../api.js";
-import { createScene } from "../lib/boardscene.js";
+import { createScene, ZOOMS } from "../lib/boardscene.js";
 
 const BOARDS = [{ re: /1E8SV-uATX|1E8CB-uATX|TVGI\.469555\.445/i, load: () => import("../boards/1e8sv-uatx.js") }];
 const P = "/xyz/openbmc_project/reimu";
 const VIEW_KEY = "reimu-map-view";
+const PHONE = 768;
+const MIN_STAGE = 320;
 const json = (p) => api.get(p).then((r) => JSON.parse(r.data.Json)).catch(() => null);
 const AGENT_OLD = "Этот агент не сообщает об этом: его надо обновить.";
 const NO_AGENT = "Агент хоста не подключён, данных нет.";
@@ -20,6 +22,28 @@ function loadView() {
   } catch (e) {
     return "iso";
   }
+}
+
+// the stage takes what the window leaves with the cards under it; a phone goes by its width
+function stageHeight() {
+  if (!root || !stage || innerWidth < PHONE) return null;
+  const sc = root.closest(".page");
+  const box = sc ? sc.getBoundingClientRect() : { top: 0 };
+  const bottom = sc ? box.top + sc.clientHeight - parseFloat(getComputedStyle(sc).paddingBottom) : innerHeight;
+  const top = stage.getBoundingClientRect().top + (sc ? sc.scrollTop : scrollY);
+  return Math.max(MIN_STAGE, bottom - top - summary.getBoundingClientRect().height - 14);
+}
+
+function zoomBy(dir) {
+  if (scene) scene.zoom(dir);
+  showZoom();
+}
+
+function showZoom() {
+  const z = scene ? scene.zoomState().Z : 1;
+  root.querySelector("[data-zoom='reset']").textContent = `${Math.round(z * 100)} %`;
+  root.querySelector("[data-zoom='out']").disabled = z <= ZOOMS[0];
+  root.querySelector("[data-zoom='in']").disabled = z >= ZOOMS[ZOOMS.length - 1];
 }
 
 function setView(v) {
@@ -69,11 +93,12 @@ export async function mount(el) {
   fanText = mod.fanText;
   if (root !== el) return false;
   const seg = (v, t) => h("button", { class: "btn small", dataset: { viewBtn: v }, onclick: () => setView(v) }, t);
+  const zb = (n, dir, t, title) => h("button", { class: "btn small", dataset: { zoom: n }, title, onclick: () => zoomBy(dir) }, t);
   stage = h("div", { class: "bs-stage" });
   stateBox = h("div", { id: "map-state" });
   summary = h("div", { class: "grid bs-sum", id: "map-summary" });
   el.append(
-    h("div", { class: "row section" }, h("h3", { class: "bs-title" }, `Карта платы ${board.name}`), h("span", { class: "spacer" }), seg("iso", "Изометрия"), seg("top", "Сверху")),
+    h("div", { class: "row section" }, h("h3", { class: "bs-title" }, `Карта платы ${board.name}`), h("span", { class: "spacer" }), zb("out", -1, "−", "Уменьшить"), zb("reset", 0, "100 %", "Вся плата"), zb("in", 1, "+", "Увеличить"), seg("iso", "Изометрия"), seg("top", "Сверху")),
     stateBox,
     h("div", { class: "card bs-board" }, stage),
     summary,
@@ -273,8 +298,10 @@ async function refresh() {
   const s = shapeOf(model);
   if (s !== shape) {
     const pinned = scene && scene.pinned();
+    const zoom = scene && scene.zoomState();
     if (scene) scene.destroy();
-    scene = createScene(stage, { size: board.size, view, info });
+    scene = createScene(stage, { size: board.size, view, info, maxHeight: stageHeight });
+    if (zoom) scene.setZoomState(zoom);
     board.draw(scene, model);
     scene.finish();
     if (pinned) scene.pin(pinned);
@@ -287,6 +314,8 @@ async function refresh() {
   }
   renderState(sensors, host);
   renderSummary();
+  scene.refit();
+  showZoom();
 }
 
 const ST = { busy: "занято", empty: "свободно", unknown: "неизвестно" };

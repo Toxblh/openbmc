@@ -336,6 +336,9 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .bs-board { padding: 0; overflow: hidden; margin-bottom: 12px; }
 .bs-stage { position: relative; background: var(--bg); }
 .bs-svg { display: block; width: 100%; height: auto; }
+.bs-svg.boxed { height: 100%; }
+.bs-svg.zoomed { cursor: grab; touch-action: none; }
+.bs-svg.zoomed:active { cursor: grabbing; }
 .bs-svg text { font-family: var(--sans); pointer-events: none; user-select: none; }
 .bs-part { cursor: default; }
 .bs-line { fill: none; stroke: var(--border); stroke-width: .5; }

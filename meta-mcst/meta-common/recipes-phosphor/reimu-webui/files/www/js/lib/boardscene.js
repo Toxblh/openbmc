@@ -8,6 +8,7 @@ const TH = (-20 * Math.PI) / 180;
 const PH = (55 * Math.PI) / 180;
 const VX = -330;
 const VW = 630;
+export const ZOOMS = [1, 1.5, 2, 3, 4];
 
 export const svgEl = (t, a, p) => {
   const e = document.createElementNS(NS, t);
@@ -36,7 +37,7 @@ export function tempColor(t, status) {
 
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-export function createScene(stage, { size = [244, 244], view = "iso", info = () => null } = {}) {
+export function createScene(stage, { size = [244, 244], view = "iso", info = () => null, maxHeight = () => null } = {}) {
   const [W, H] = size;
   const R = []; // what follows the camera
   const parts = [];
@@ -57,6 +58,12 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   };
   const clouds = {}; // id -> set(value)
   let T = view === "iso" ? 1 : 0;
+  let viewTo = T;
+  // the zoom, the middle of the view from the middle of the board, the height given to the stage
+  let Z = 1;
+  let PX = 0;
+  let PY = 0;
+  let boxH = null;
   let FS = 5.2;
   let cam;
   let slotN = 0;
@@ -339,12 +346,27 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   function render() {
     cam = mkCam(T);
     for (const f of R) f(cam);
-    const h = 345 - 85 * T;
-    SV.setAttribute("viewBox", `${VX} ${(-h / 2).toFixed(1)} ${VW} ${h.toFixed(1)}`);
+    const h = heightOf(T);
+    const vw = VW / Z;
+    const vh = h / Z;
+    PX = Math.max(-(VW - vw) / 2, Math.min((VW - vw) / 2, PX));
+    PY = Math.max(-(h - vh) / 2, Math.min((h - vh) / 2, PY));
+    SV.setAttribute("viewBox", [VX + VW / 2 + PX - vw / 2, PY - vh / 2, vw, vh].map((n) => Number(n.toFixed(2))).join(" "));
+    SV.classList.toggle("zoomed", Z > 1);
   }
+  const heightOf = (t) => 345 - 85 * t;
+  // screen pixels in a unit of the board at zoom 1
+  const pxScale = () => {
+    const w = stage.clientWidth || 600;
+    return boxH ? Math.min(w / VW, boxH / heightOf(T)) : w / VW;
+  };
   function fit() {
     const w = stage.clientWidth || 600;
-    FS = Math.max(5.2, 7.5 / (w / VW));
+    const max = maxHeight();
+    boxH = max ? Math.min(max, (w * heightOf(viewTo)) / VW) : null;
+    stage.style.height = boxH ? `${boxH.toFixed(0)}px` : "";
+    SV.classList.toggle("boxed", !!boxH);
+    FS = Math.max(5.2, 7.5 / pxScale());
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
     labels.forEach((l) => setLines(l.tx, comp ? l.short : l.full));
@@ -352,10 +374,11 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   }
   function setView(v) {
     const to = v === "iso" ? 1 : 0;
+    viewTo = to;
     cancelAnimationFrame(raf);
     if (reducedMotion()) {
       T = to;
-      render();
+      fit();
       return;
     }
     const from = T;
@@ -366,6 +389,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       T = from + (to - from) * k;
       render();
       if (k < 1) raf = requestAnimationFrame(step);
+      else fit();
     };
     raf = requestAnimationFrame(step);
   }
@@ -413,13 +437,41 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     cur = null;
     pop.hidden = true;
   };
+  // zoomed in, a drag moves the view; a press without a move stays a click
+  let drag = null;
+  let dragged = false;
+  SV.addEventListener("pointerdown", (e) => {
+    dragged = false;
+    if (Z > 1 && e.button === 0) drag = { id: e.pointerId, x: e.clientX, y: e.clientY, px: PX, py: PY };
+  });
   SV.addEventListener("pointermove", (e) => {
     mx = e.clientX;
     my = e.clientY;
+    if (drag && e.pointerId === drag.id) {
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!dragged && Math.hypot(dx, dy) > 4) {
+        dragged = true;
+        SV.setPointerCapture(e.pointerId);
+        if (!pinned) hide();
+      }
+      if (dragged) {
+        const k = pxScale() * Z;
+        PX = drag.px - dx / k;
+        PY = drag.py - dy / k;
+        render();
+        return;
+      }
+    }
     if (!pinned && cur) place();
   });
+  const dragEnd = () => {
+    drag = null;
+  };
+  SV.addEventListener("pointerup", dragEnd);
+  SV.addEventListener("pointercancel", dragEnd);
   SV.addEventListener("pointerover", (e) => {
-    if (pinned) return;
+    if (pinned || drag) return;
     const p = e.target.closest(".bs-part");
     if (p && p.dataset.id) {
       cur = p.dataset.id;
@@ -434,6 +486,10 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     if (p && !(e.relatedTarget && p.contains(e.relatedTarget))) hide();
   });
   SV.addEventListener("click", (e) => {
+    if (dragged) {
+      dragged = false;
+      return;
+    }
     const p = e.target.closest(".bs-part");
     mx = e.clientX;
     my = e.clientY;
@@ -454,9 +510,23 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     finish() {
       parts.sort((a, b) => a.k - b.k).forEach((p) => sceneG.appendChild(p.g));
       ro.observe(stage);
+      addEventListener("resize", fit);
       fit();
     },
     setView,
+    // what around the map changed its height
+    refit: fit,
+    zoom(dir) {
+      const i = ZOOMS.indexOf(Z) + dir;
+      Z = dir === 0 ? 1 : ZOOMS[Math.max(0, Math.min(ZOOMS.length - 1, i))];
+      if (Z === 1) PX = PY = 0;
+      render();
+      return Z;
+    },
+    zoomState: () => ({ Z, PX, PY }),
+    setZoomState(z) {
+      ({ Z, PX, PY } = z);
+    },
     setValue(key, v) {
       if (clouds[key]) clouds[key](v);
     },
@@ -472,6 +542,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     destroy() {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      removeEventListener("resize", fit);
     },
   };
 }

@@ -391,6 +391,114 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   await s.page.context().close();
 }
 
+// the height of the map by the window: the cards under it are seen at once, not on a phone
+{
+  const fits = (s) => s.page.evaluate(() => {
+    const b = document.getElementById("map-summary").getBoundingClientRect();
+    return { bottom: b.bottom, win: innerHeight, stage: document.querySelector(".bs-stage").style.height, h: document.querySelector(".bs-stage").clientHeight, scroll: document.documentElement.scrollHeight };
+  });
+  for (const [w, wh] of [[1300, 700], [1920, 900]]) {
+    const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    const r = await fits(s);
+    check(r.bottom <= r.win, `${w}x${wh}: the cards in the window (bottom ${Math.round(r.bottom)} of ${r.win})`);
+    check(r.h >= 300, `${w}x${wh}: the map stays usable (${r.h})`);
+    await s.page.context().close();
+  }
+  { // cards in two rows: the map keeps its minimum, the first row is seen
+    const s = await open(clone(FIX), { width: 1000, height: 760, view: "iso" });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    const top = await s.page.evaluate(() => document.querySelector("#map-summary .card").getBoundingClientRect().bottom);
+    check(top <= 760, `1000x760: the first row of the cards in the window (${Math.round(top)})`);
+    await s.page.context().close();
+  }
+  { // a big window: no empty space added around the board
+    const s = await open(clone(FIX), { width: 1300, height: 1500, view: "iso" });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    const r = await fits(s);
+    check(r.bottom < r.win && r.h <= 560, `a tall window: the map no higher than the board needs (${r.h})`);
+    await s.page.setViewportSize({ width: 1300, height: 700 });
+    await s.page.waitForTimeout(300);
+    const r2 = await fits(s);
+    check(r2.bottom <= 700, `the window made lower: the cards still in it (${Math.round(r2.bottom)})`);
+    await s.page.context().close();
+  }
+  { // a low window: the map keeps a minimum, the page scrolls
+    const s = await open(clone(FIX), { width: 1300, height: 420, view: "iso" });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    const r = await fits(s);
+    check(r.h >= 300, `a low window: a minimum of the map (${r.h})`);
+    await s.page.context().close();
+  }
+  { // a phone: by its width, as before
+    const s = await open(clone(FIX), { width: 390, height: 844, view: "iso" });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    const r = await fits(s);
+    check(r.stage === "", `a phone: the height not set (${r.stage})`);
+    await s.page.context().close();
+  }
+}
+
+// zoom by the buttons
+{
+  const s = await open(clone(FIX), { width: 1300, height: 800, view: "iso" });
+  await ready(s);
+  const vb = () => s.page.evaluate(() => document.querySelector(".bs-svg").getAttribute("viewBox").split(" ").map(Number));
+  const btn = (n) => s.page.locator(`[data-zoom='${n}']`);
+  const v0 = await vb();
+  check(await btn("out").isDisabled(), "zoom: nothing to take out at 100 %");
+  check((await btn("reset").textContent()).trim() === "100 %", "zoom: shows 100 %");
+  await btn("in").click();
+  const v1 = await vb();
+  check(Math.abs(v1[2] - v0[2] / 1.5) < 0.1, `zoom in: the view 1.5 times less (${v0[2]} -> ${v1[2]})`);
+  check((await btn("reset").textContent()).trim() === "150 %", "zoom: shows 150 %");
+  await btn("in").click(); await btn("in").click(); await btn("in").click();
+  check(await btn("in").isDisabled(), "zoom: a limit, the button off");
+  await btn("out").click(); await btn("out").click(); await btn("out").click();
+  // a drag moves the view and is not a click on what is under it
+  const box = await s.page.locator(".bs-stage").boundingBox();
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  const before = await vb();
+  await s.page.mouse.move(cx, cy);
+  await s.page.mouse.down();
+  await s.page.mouse.move(cx - 120, cy - 60, { steps: 4 });
+  await s.page.mouse.up();
+  const after = await vb();
+  check(after[0] > before[0] && after[1] > before[1], `zoom: a drag moves the view (${before[0]},${before[1]} -> ${after[0]},${after[1]})`);
+  await s.page.mouse.move(2, 2);
+  check(await s.page.evaluate(() => { const p = document.querySelector(".bs-pop"); return !p || p.hidden; }), "zoom: a drag pins no card of a part");
+  // the edge: no flying off the board
+  for (let i = 0; i < 6; i++) {
+    await s.page.mouse.move(cx, cy);
+    await s.page.mouse.down();
+    await s.page.mouse.move(cx - 500, cy, { steps: 2 });
+    await s.page.mouse.up();
+  }
+  const far = await vb();
+  check(far[0] + far[2] <= v0[0] + v0[2] + 0.1, "zoom: the view stops at the edge");
+  // the view switched and the scene built again keep it
+  await s.page.locator("[data-view-btn='top']").click();
+  await s.page.waitForTimeout(900);
+  check((await btn("reset").textContent()).trim() === "150 %", "zoom: stays through the switch of the view");
+  s.fix = clone(s.fix);
+  s.fix.host = null;
+  await s.page.evaluate(() => { document.querySelector(".bs-svg").dataset.old = "1"; });
+  await s.page.waitForTimeout(5600);
+  check(await s.page.evaluate(() => !document.querySelector(".bs-svg").dataset.old), "zoom: the scene was built again");
+  const again = await vb();
+  check(Math.abs(again[2] - v0[2] / 1.5) < 0.1, `zoom: stays through a rebuilt scene (${again[2]})`);
+  await btn("reset").click();
+  const back = await vb();
+  check(back[2] === v0[2] && back[0] === v0[0], "zoom: the button with the percent goes back to the whole board");
+  check(s.errors.length === 0, `zoom: no errors (${s.errors.join(";")})`);
+  await s.page.context().close();
+}
+
 // a slow BMC, a cycle longer than the period: one request at a time, the next cycle after it
 {
   const s = await open(clone(FIX), { slow: 1200 });
