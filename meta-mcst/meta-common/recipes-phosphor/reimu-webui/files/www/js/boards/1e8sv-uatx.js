@@ -139,8 +139,8 @@ function draw(sc, m) {
     box(g, 210, 80, 22, 9, 0, 3, "#131416");
     slot(top(g, 3), 210, 80, 22, 9, 0.3, busy, false);
     if (busy) {
-      box(only($("g", {}, g), true), 210, 4, 22, 77.5, 1.5, 2, "#1b1c1f");
-      box(only($("g", {}, g), false), 210, 4, 22, 80.5, 1.5, 2, "#1b1c1f");
+      // from the level of the connector's top: a side going lower would be drawn over its opening
+      box(g, 210, 4, 22, 80.5, 3, 0.5, "#1b1c1f");
       const t = top(g, 3.5);
       $("rect", { x: 213.5, y: 16, width: 15, height: 40, rx: 0.8, fill: "#303135" }, t);
       $("rect", { x: 213.5, y: 62, width: 15, height: 9, rx: 0.5, fill: "#3a3b40" }, t);

@@ -492,6 +492,42 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
+// the M.2 module: one box, it ends in the middle of its connector; what lies past that stays seen
+for (const [key, cam] of [["persp", { th: -30, ph: 55, inv: 1 / 1000, s: 1.2 }], ["iso", { th: -45, ph: (Math.atan(Math.SQRT2) * 180) / Math.PI, inv: 0, s: 1.25 }]]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: key });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const [th, ph] = [(cam.th * Math.PI) / 180, (cam.ph * Math.PI) / 180];
+  const raw = (x, y, z) => {
+    const [dx, dy] = [x - 122, y - 122];
+    const Y = dx * Math.sin(th) + dy * Math.cos(th);
+    const k = 1 / (1 - cam.inv * (Y * Math.sin(ph) + z * Math.cos(ph)));
+    return [cam.s * (dx * Math.cos(th) - dy * Math.sin(th)) * k, cam.s * (Y * Math.cos(ph) - z * Math.sin(ph)) * k];
+  };
+  const ys = [[0, 0], [244, 0], [0, 244], [244, 244]].map((q) => raw(q[0], q[1], 0)[1]);
+  const oy = -(Math.min(...ys) + Math.max(...ys)) / 2;
+  const at = (x, y, z) => { const q = raw(x, y, z); return [q[0], q[1] + oy]; };
+  const polys = await s.page.evaluate(() => [...document.querySelectorAll(".bs-svg .bs-part[data-id='X48'] polygon")].map((e) => [...e.points].map((p) => [p.x, p.y])));
+  check(polys.length === 6, `${key}: the M.2 module is one box (${polys.length / 3 - 1})`);
+  // the near edge of the top of the module: its corners x + w, y + h and x, y + h
+  const edge = polys[5];
+  let end = 0, best = Infinity;
+  for (let y = 70; y < 95; y += 0.01) {
+    const e = dist(edge[2], at(232, y, 3.5)) + dist(edge[3], at(210, y, 3.5));
+    if (e < best) { best = e; end = y; }
+  }
+  check(Math.abs(end - 84.5) < 0.05, `${key}: the M.2 module ends in the middle of its connector, y 84.5 (${end.toFixed(2)})`);
+  const seen = await s.page.evaluate(([over, past]) => {
+    const m = document.querySelector(".bs-svg").getScreenCTM();
+    const mod = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X48'] polygon")].slice(3);
+    const hit = (q) => document.elementFromPoint(m.a * q[0] + m.c * q[1] + m.e, m.b * q[0] + m.d * q[1] + m.f);
+    return { over: mod.includes(hit(over)), past: mod.includes(hit(past)), part: hit(past).closest(".bs-part")?.dataset.id };
+  }, [at(221, 82, 3.5), at(221, 86, 3)]);
+  check(seen.over, `${key}: the module is drawn over the connector up to its middle`);
+  check(!seen.past && seen.part === "X48", `${key}: past the middle the opening of the connector is seen, the module's side does not cover it (${seen.past ? "covered" : "seen"}, ${seen.part})`);
+  await s.page.context().close();
+}
+
 // the pins of the heatsink: of two that meet on the screen the nearer is drawn over the farther
 {
   const s = await open(clone(FIX), { width: 1400, height: 800, view: "persp" });
