@@ -190,7 +190,8 @@ function draw(sc, m) {
     box(g, 102, 58, 59, 44, 1, 1.5, "#b4b6b3");
     const inner = $("g", { transform: "translate(102 58) scale(0.1475 0.14667)" }, top(g, 2.5));
     const doc = new DOMParser().parseFromString(LID, "image/svg+xml");
-    inner.appendChild(document.importNode(doc.documentElement, true));
+    // its drawing as a group: an svg in an svg is a viewport of its own, the camera cannot take it apart
+    $("g", { class: "bs-lid", fill: "none" }, inner).append(...document.importNode(doc.documentElement, true).children);
   }
   // КПИ-2 with its pin heatsink
   {

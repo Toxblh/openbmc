@@ -67,10 +67,8 @@ const svgText = (s) => s.page.evaluate(() => [...document.querySelectorAll(".bs-
 const label = (s, id) => s.page.evaluate((i) => [...document.querySelectorAll(`.bs-svg .bs-part[data-id='${i}'] text.bs-lbl`)].map((t) => t.textContent).join("|"), id);
 // how much of a slot is lit: the width of its clip, null: none lit
 const lit = (s, id) => s.page.evaluate((i) => {
-  const g = document.querySelector(`.bs-svg .bs-part[data-id='${i}'] [clip-path]`);
-  if (!g) return null;
-  const r = document.querySelector(`${g.getAttribute("clip-path").slice(4, -1)} rect`);
-  return Number(r.getAttribute("width"));
+  const g = document.querySelector(`.bs-svg .bs-part[data-id='${i}'] [data-lit]`);
+  return g ? Number(g.dataset.lit) : null;
 }, id);
 // the popover of a part: as a click on it pins it
 async function pop(s, id) {
@@ -348,8 +346,8 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
   await ready(s);
   const r = await s.page.evaluate(() => {
     const g = document.querySelector(".bs-svg .bs-part[data-id='CPU']");
-    const a = [...g.querySelectorAll("polygon, rect, path")].filter((e) => !e.closest("svg svg")).map((e) => e.getBoundingClientRect());
-    const l = g.querySelector("svg svg, svg").getBoundingClientRect();
+    const a = [...g.querySelectorAll("polygon, rect, path")].filter((e) => !e.closest(".bs-lid")).map((e) => e.getBoundingClientRect());
+    const l = g.querySelector(".bs-lid").getBoundingClientRect();
     return { w: Math.max(...a.map((b) => b.width)) / l.width, h: Math.max(...a.map((b) => b.height)) / l.height };
   });
   check(r.w < 1.02 && r.h < 1.02, `nothing of the CPU wider than its lid (${r.w.toFixed(2)} x ${r.h.toFixed(2)})`);
@@ -464,37 +462,97 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   await s.page.context().close();
 }
 
-// the view of the board: an orthographic camera, its edges at 11.8 and 57.6 degrees, each axis as that camera shortens it
+// the view of the board: a pinhole camera, turned by 20 degrees and tilted by 55: the far edge is shorter
 {
+  const { CAM_DIST: D } = await import(path.join(WWW, "js/lib/boardscene.js"));
+  check(D > 0, `the camera has a distance (${D} mm)`);
+  // the same camera, written here again: millimetres on the board to the screen, around the middle of the board
+  const th = (-20 * Math.PI) / 180, ph = (55 * Math.PI) / 180, S = 1.2;
+  const pin = (x, y, z = 0) => {
+    const X = (x - 122) * Math.cos(th) - (y - 122) * Math.sin(th);
+    const Y = (x - 122) * Math.sin(th) + (y - 122) * Math.cos(th);
+    const k = 1 / (1 - (Y * Math.sin(ph) + z * Math.cos(ph)) / D);
+    return [S * X * k, S * (Y * Math.cos(ph) - z * Math.sin(ph)) * k];
+  };
+  const len = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+  // where two lines through a-b and c-d meet
+  const meet = (a, b, c, d) => {
+    const r = [b[0] - a[0], b[1] - a[1]], q = [d[0] - c[0], d[1] - c[1]], n = r[0] * q[1] - r[1] * q[0];
+    const u = ((c[0] - a[0]) * q[1] - (c[1] - a[1]) * q[0]) / n;
+    return [a[0] + u * r[0], a[1] + u * r[1]];
+  };
+  const angle = (a, b, c, d) => {
+    const v = Math.abs(Math.atan2(b[1] - a[1], b[0] - a[0]) - Math.atan2(d[1] - c[1], d[0] - c[0])) * 180 / Math.PI;
+    return Math.min(v, 180 - v);
+  };
+  // the top of a box of a part, as drawn: the corners x,y x+w,y x+w,y+h x,y+h in the units of the view
+  const topOf = (s, id, n = 0) => s.page.evaluate(([i, k]) => {
+    const e = [...document.querySelectorAll(`.bs-svg .bs-part[data-id='${i}'] polygon`)].filter((p) => !p.getAttribute("filter"))[3 * k + 2];
+    return [...e.points].map((p) => [p.x, p.y]);
+  }, [id, n]);
+
   const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
   await ready(s);
   await s.page.waitForTimeout(300);
-  const r = await s.page.evaluate(() => {
-    const scr = (e, p) => { const m = e.getScreenCTM(); return [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f]; };
-    // the plate: the largest polygon of the board
-    const area = (q) => q.reduce((a, p, i) => { const n = q[(i + 1) % q.length]; return a + p[0] * n[1] - n[0] * p[1]; }, 0) / 2;
-    let best = null;
-    for (const e of document.querySelectorAll(".bs-svg .bs-part[data-id='BOARD'] polygon")) {
-      if (e.getAttribute("filter")) continue;
-      const q = [...e.points].map((p) => scr(e, p));
-      if (q.length === 4 && (!best || Math.abs(area(q)) > Math.abs(area(best)))) best = q;
-    }
-    const len = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
-    const edges = best.map((p, i) => len(p, best[(i + 1) % 4]));
-    const slope = best.map((p, i) => { const n = best[(i + 1) % 4]; return Math.abs((Math.atan2(n[1] - p[1], n[0] - p[0]) * 180) / Math.PI); }).map((a) => (a > 90 ? 180 - a : a));
-    // a plane of the rear panel: its first axis along the edge of the board, its second up
-    const pl = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X28'] g[transform^='matrix']")].find((g) => g.transform.baseVal[0].matrix.c === 0);
-    const m = pl.getScreenCTM();
-    return { edges, slope, along: Math.hypot(m.a, m.b), up: Math.hypot(m.c, m.d) };
+  const [A, B, C, E] = await topOf(s, "BOARD");
+  const far = len(A, B), near = len(C, E), right = len(B, C), lft = len(E, A);
+  check(D === 2000, `the camera 2000 mm from the middle of the board (${D})`);
+  check(Math.abs(far / near - 0.918) < 0.005, `far edge to near edge of the board about 0.918 (${far.toFixed(2)} / ${near.toFixed(2)} = ${(far / near).toFixed(4)})`);
+  // in millimetres of the board, the scale of the screen comes after the perspective
+  check(Math.abs(far / S - 224.6) < 0.2 && Math.abs(near / S - 244.8) < 0.2, `the long edges in projected mm, 224.6 and 244.8 (${(far / S).toFixed(1)}, ${(near / S).toFixed(1)})`);
+  check(Math.abs(lft / S - 155.2) < 0.2 && Math.abs(right / S - 157.5) < 0.2, `the sides in projected mm, 155.2 and 157.5 (${(lft / S).toFixed(1)}, ${(right / S).toFixed(1)})`);
+  check(angle(A, B, E, C) > 0.5, `the long edges are not parallel (${angle(A, B, E, C).toFixed(2)} degrees)`);
+  check(angle(A, E, B, C) > 0.5, `the short edges are not parallel (${angle(A, E, B, C).toFixed(2)} degrees)`);
+  const vl = meet(A, B, E, C), vs = meet(A, E, B, C);
+  check(vl[1] < Math.min(A[1], B[1]) && vl[0] > B[0], `the long edges meet far away, up and to the right (${vl.map((v) => v.toFixed(0))})`);
+  check(vs[1] < Math.min(A[1], B[1]), `the short edges meet far away, up (${vs.map((v) => v.toFixed(0))})`);
+  // the two sides of a turned board are not one length: not a mirror, the turn brings one nearer
+  const pa = pin(0, 0), pb = pin(244, 0), pc = pin(244, 244), pe = pin(0, 244);
+  check(Math.abs(right / lft - len(pb, pc) / len(pe, pa)) < 0.002, `the side edges as the camera gives them (${right.toFixed(2)}, ${lft.toFixed(2)}; ${(len(pb, pc) / len(pe, pa)).toFixed(4)})`);
+  // one size, farther: smaller by what the camera gives
+  const m46 = await topOf(s, "X46"), m45 = await topOf(s, "X45");
+  const want = len(pin(48, 15, 7.5), pin(195, 15, 7.5)) / len(pin(48, 140, 7.5), pin(195, 140, 7.5));
+  const got = len(m46[0], m46[1]) / len(m45[0], m45[1]);
+  check(got < 0.97 && Math.abs(got - want) < 0.002, `a memory slot far to one near, X46 / X45 (${got.toFixed(4)}, the camera gives ${want.toFixed(4)})`);
+  // a large thing in a plane lies on what it stands on: the frame of a slot on the top of its box, the lid on the CPU
+  const corners = await s.page.evaluate(() => {
+    const root = document.querySelector(".bs-svg").getScreenCTM().inverse();
+    const toRoot = (e, x, y) => { const m = root.multiply(e.getScreenCTM()); return [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f]; };
+    const first = (e) => e.getAttribute("d").match(/^M\s*(-?[\d.]+)[ ,]+(-?[\d.]+)/).slice(1).map(Number);
+    // the largest outline of a part, drawn through the camera as a path
+    const outline = (id) => [...document.querySelectorAll(`.bs-svg .bs-part[data-id='${id}'] path`)].filter((e) => /^M/.test(e.getAttribute("d"))).sort((p, q) => q.getTotalLength() - p.getTotalLength())[0];
+    const fr = outline("X46");
+    const lid = outline("CPU");
+    return { frame: fr && toRoot(fr, ...first(fr)), lid: lid && toRoot(lid, ...first(lid)) };
   });
-  const [a, b] = r.edges;
-  const mm = (a + b) / 2 / 244;
-  // an orthographic camera turned by 20 degrees and tilted by 55: what it gives, not what looks even
-  const th = (20 * Math.PI) / 180, ph = (55 * Math.PI) / 180;
-  const kx = Math.hypot(Math.cos(th), Math.sin(th) * Math.cos(ph)), ky = Math.hypot(Math.sin(th), Math.cos(th) * Math.cos(ph));
-  check(Math.abs(Math.max(a, b) / Math.min(a, b) - kx / ky) < 0.01, `the edges of the board as the camera gives them (${a.toFixed(2)}, ${b.toFixed(2)}, ratio ${kx / ky})`);
-  check(Math.abs(r.up / r.along - Math.sin(ph) / ky) < 0.01, `a millimetre up as the camera gives it (${(r.up / r.along).toFixed(3)} of one along the rear panel)`);
-  check(Math.abs(r.slope[0] - 11.8) < 0.3 && Math.abs(r.slope[1] - 57.6) < 0.3, `the edges in the directions of the chosen camera (${r.slope.map((d) => d.toFixed(1)).join(", ")})`);
+  const offLine = (p, a, b) => Math.abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / len(a, b);
+  check(corners.frame && offLine(corners.frame, m46[0], m46[1]) < 0.1, `the frame of a long slot on the edge of its box (${corners.frame && offLine(corners.frame, m46[0], m46[1]).toFixed(3)})`);
+  const cpu = await topOf(s, "CPU", 1);
+  check(corners.lid && offLine(corners.lid, cpu[0], cpu[1]) < 0.3, `the lid on the CPU (${corners.lid && offLine(corners.lid, cpu[0], cpu[1]).toFixed(3)})`);
+  // what the pointer finds is the part drawn there
+  const hit = await s.page.evaluate(() => Object.fromEntries(["X46", "X45", "CPU", "KPI", "X31", "X28"].map((id) => {
+    const r = document.querySelectorAll(`.bs-svg .bs-part[data-id='${id}'] polygon`);
+    const e = r[2];
+    const m = e.getScreenCTM();
+    const q = [...e.points].map((p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f]);
+    const x = q.reduce((t, p) => t + p[0], 0) / q.length, y = q.reduce((t, p) => t + p[1], 0) / q.length;
+    const f = document.elementFromPoint(x, y);
+    return [id, f && f.closest(".bs-part") && f.closest(".bs-part").dataset.id];
+  })));
+  check(Object.entries(hit).every(([k, v]) => k === v || /^S:/.test(v)), `the pointer on a part finds that part (${JSON.stringify(hit)})`);
+  // from above: parallel, as it was
+  await s.page.locator("[data-view-btn='top']").click();
+  await s.page.waitForTimeout(1000);
+  const [a0, b0, c0, e0] = await topOf(s, "BOARD");
+  check(len(a0, b0) === len(e0, c0) && len(a0, e0) === len(b0, c0) && a0[1] === b0[1] && a0[0] === e0[0], `from above: a square, no perspective (${len(a0, b0).toFixed(2)}, ${len(a0, e0).toFixed(2)})`);
+  const silk = await s.page.evaluate(() => {
+    const t = [...document.querySelectorAll(".bs-svg text")].find((e) => e.textContent === "PCIE x8");
+    const m = t.getScreenCTM();
+    return [m.a, m.b, m.c, m.d].map((v) => +v.toFixed(5));
+  });
+  check(silk[1] === 0 && silk[2] === 0 && silk[0] === silk[3], `from above: what is drawn in a plane has no slant (${silk})`);
+  await s.page.locator("[data-view-btn='iso']").click();
+  await s.page.waitForTimeout(1000);
   // at 45 degrees a long slot has parts behind it that are nearer by its middle
   const order = await s.page.evaluate(() => {
     const all = [...document.querySelectorAll(".bs-svg .bs-part")].map((e) => e.dataset.id);

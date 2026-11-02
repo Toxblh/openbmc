@@ -1,11 +1,14 @@
 // A board as a scene: one projection of millimetres on the board, from a view
-// from above (t=0) to an isometric one (t=1), so the same drawing serves both and
+// from above (t=0) to a view in perspective (t=1), so the same drawing serves both and
 // the change between them is a camera move. Boxes, slots, cards, labels and
 // clouds of values; what stands where is in js/boards/*.js. Text from outside
 // only ever goes in through textContent.
 const NS = "http://www.w3.org/2000/svg";
-// An orthographic camera, turned and tilted: each axis as it shortens it, 0.96 along the rear edge,
-// 0.64 along the side, 0.82 up; the board is square, its edges on the screen are not.
+// A pinhole camera, turned and tilted: each axis as it shortens it, 0.96 along the rear edge, 0.64
+// along the side, 0.82 up; the board is square, its edges on the screen are not. It looks at the
+// middle of the board from CAM_DIST mm: far enough to see the rear panel from the side, the far long
+// edge comes out 0.918 of the near one. In millimetres of the board: before the scale of the screen.
+export const CAM_DIST = 2000;
 const TH = (-20 * Math.PI) / 180;
 const PH = (55 * Math.PI) / 180;
 const FLAT = (-20 * Math.PI) / 180; // the order of the parts from above: nothing there hides anything
@@ -99,30 +102,160 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   pop.hidden = true;
   stage.replaceChildren(SV, pop);
 
-  // the projection
-  const P = (c, x, y, z = 0) => [c.s * (x * c.ct - y * c.st) + c.ox, c.s * ((x * c.st + y * c.ct) * c.cp - z * c.sp) + c.oy];
+  // the projection: turned and tilted around the middle of the board, then what is farther is smaller.
+  // Y grows towards the viewer, z too; from above, t = 0, nothing depends on the depth
+  const P = (c, x, y, z = 0) => {
+    const dx = x - W / 2;
+    const dy = y - H / 2;
+    const Y = dx * c.st + dy * c.ct;
+    const k = 1 / (1 - (c.t * (Y * c.sp + z * c.cp)) / CAM_DIST);
+    return [c.s * (dx * c.ct - dy * c.st) * k + c.ox, c.s * (Y * c.cp - z * c.sp) * k + c.oy];
+  };
   function mkCam(t) {
     const th = TH * t;
     const ph = PH * t;
-    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: 0 };
-    const q = [[0, 0], [W, 0], [0, H], [W, H]].map((p) => P(c, p[0], p[1]));
-    const xs = q.map((p) => p[0]);
-    const ys = q.map((p) => p[1]);
-    c.ox = -(Math.min(...xs) + Math.max(...xs)) / 2;
-    c.oy = -(Math.min(...ys) + Math.max(...ys)) / 2 - 3 * t;
-    return c;
+    // the middle of the board stands where the camera looks, the perspective goes around it
+    return { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: -3 * t };
   }
-  const Mtop = (c, z) => [c.s * c.ct, c.s * c.st * c.cp, -c.s * c.st, c.s * c.ct * c.cp, c.ox, -c.s * z * c.sp + c.oy];
-  const Mleft = (c, x) => [-c.s * c.st, c.s * c.ct * c.cp, 0, -c.s * c.sp, c.s * x * c.ct + c.ox, c.s * x * c.st * c.cp + c.oy];
-  const Mfront = (c, y) => [c.s * c.ct, c.s * c.st * c.cp, 0, -c.s * c.sp, -c.s * y * c.st + c.ox, c.s * y * c.ct * c.cp + c.oy];
-  const plane = (p, fn, a) => {
-    const g = $("g", a || {}, p);
-    R.push((c) => g.setAttribute("transform", `matrix(${fn(c).map((v) => v.toFixed(4)).join(" ")})`));
+  // A plane: a drawing in millimetres of its own, lying in the scene; at: its point in the scene.
+  const planes = [];
+  const plane = (p, at) => {
+    const g = $("g", {}, p);
+    planes.push({ g, at });
     return g;
   };
-  const top = (p, z) => plane(p, (c) => Mtop(c, z));
-  const left = (p, x) => plane(p, (c) => Mleft(c, x));
-  const front = (p, y) => plane(p, (c) => Mfront(c, y));
+  const top = (p, z) => plane(p, (u, v) => [u, v, z]);
+  const left = (p, x) => plane(p, (u, v) => [x, u, v]);
+  const front = (p, y) => plane(p, (u, v) => [u, y, v]);
+  // SVG has only affine transforms, a perspective is none. So once, when all is drawn, a plane is taken
+  // apart: a small thing gets its own transform, the camera around its middle; a large rectangle or
+  // polygon is drawn through P at every point; a large group is taken apart further.
+  const SMALL = 6; // mm, half a diagonal: at this size the error is under 0.02 mm
+  const mul = (a, b) => [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1], a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
+  const app = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  const ownM = (e) => [...(e.transform ? e.transform.baseVal : [])].reduce((m, t) => {
+    const q = t.matrix;
+    return mul(m, [q.a, q.b, q.c, q.d, q.e, q.f]);
+  }, [1, 0, 0, 1, 0, 0]);
+  // where it lies in its plane, m: from its coordinates to the plane
+  const extent = (e, m) => {
+    const b = e.getBBox();
+    const q = [[b.x, b.y], [b.x + b.width, b.y], [b.x, b.y + b.height], [b.x + b.width, b.y + b.height]].map((p) => app(m, p[0], p[1]));
+    const us = q.map((p) => p[0]);
+    const vs = q.map((p) => p[1]);
+    const [u0, u1, v0, v1] = [Math.min(...us), Math.max(...us), Math.min(...vs), Math.max(...vs)];
+    return { u: (u0 + u1) / 2, v: (v0 + v1) / 2, hu: Math.max(0.5, (u1 - u0) / 2), hv: Math.max(0.5, (v1 - v0) / 2), big: Math.hypot(u1 - u0, v1 - v0) / 2 > SMALL };
+  };
+  // the camera around a point of a plane, as an affine transform of that plane
+  const around = (c, at, x) => {
+    const o = P(c, ...at(x.u, x.v));
+    const r = P(c, ...at(x.u + x.hu, x.v));
+    const l = P(c, ...at(x.u - x.hu, x.v));
+    const d = P(c, ...at(x.u, x.v + x.hv));
+    const n = P(c, ...at(x.u, x.v - x.hv));
+    const m = [(r[0] - l[0]) / (2 * x.hu), (r[1] - l[1]) / (2 * x.hu), (d[0] - n[0]) / (2 * x.hv), (d[1] - n[1]) / (2 * x.hv)];
+    return [...m, o[0] - m[0] * x.u - m[2] * x.v, o[1] - m[1] * x.u - m[3] * x.v];
+  };
+  const matrix = (m) => `matrix(${m.map((v) => v.toFixed(6)).join(" ")})`;
+  // an outline of a shape: M, L, C, Z in its coordinates
+  const K = 0.4477; // from a corner to the control points of its arc, of a radius
+  const outline = (e) => {
+    if (e.tagName === "polygon") return [...e.points].map((p, i) => [i ? "L" : "M", p.x, p.y]).concat([["Z"]]);
+    const n = (k) => Number(e.getAttribute(k)) || 0;
+    const [x, y, w, h] = [n("x"), n("y"), n("width"), n("height")];
+    const rx = Math.min(n("rx") || n("ry"), w / 2);
+    const ry = Math.min(n("ry") || n("rx"), h / 2);
+    if (!rx || !ry) return [["M", x, y], ["L", x + w, y], ["L", x + w, y + h], ["L", x, y + h], ["Z"]];
+    const [kx, ky] = [rx * K, ry * K];
+    const [X, Y] = [x + w, y + h];
+    return [["M", x + rx, y], ["L", X - rx, y], ["C", X - kx, y, X, y + ky, X, y + ry], ["L", X, Y - ry], ["C", X, Y - ky, X - kx, Y, X - rx, Y],
+      ["L", x + rx, Y], ["C", x + kx, Y, x, Y - ky, x, Y - ry], ["L", x, y + ry], ["C", x, y + ky, x + kx, y, x + rx, y], ["Z"]];
+  };
+  // that outline as a path through a function of a point
+  const pathOf = (o, fn) => o.map(([cmd, ...v]) => {
+    let out = cmd;
+    for (let i = 0; i < v.length; i += 2) {
+      const q = fn(v[i], v[i + 1]);
+      out += `${i ? " " : ""}${q[0].toFixed(4)},${q[1].toFixed(4)}`;
+    }
+    return out;
+  }).join("");
+  // A shape gets a path beside it, its attributes stay. From above the shape itself is shown, a browser
+  // draws the edges of a rectangle and of a path differently: that view stays as it was to the pixel.
+  const pathBeside = (e) => {
+    const p = $("path", {});
+    for (const a of e.attributes) if (!/^(x|y|width|height|rx|ry|points)$/.test(a.name)) p.setAttribute(a.name, a.value);
+    e.after(p);
+    return p;
+  };
+  const showFor = (e, p, c) => {
+    const flat = c.t === 0;
+    if (flat !== e.__flat) {
+      e.__flat = flat;
+      e.setAttribute("display", flat ? "inline" : "none");
+      p.setAttribute("display", flat ? "none" : "inline");
+    }
+    return flat;
+  };
+  const wrapped = (e) => {
+    const w = $("g", {});
+    e.replaceWith(w);
+    w.appendChild(e);
+    return w;
+  };
+  function takeApart(node, T, at) {
+    for (const e of [...node.children]) {
+      const tag = e.tagName;
+      if (tag === "defs" || tag === "animateTransform" || tag === "clipPath") continue;
+      const m = mul(T, ownM(e));
+      const x = extent(e, m);
+      if (x.big && tag === "g") {
+        // a clip stands in the coordinates of its group, that is now of the view: through P too
+        const cut = /url\(#(.+)\)/.exec(e.getAttribute("clip-path") || "");
+        if (cut) {
+          for (const r of [...defs.querySelector(`#${cut[1]}`).children]) {
+            const o = outline(r);
+            const p = pathBeside(r);
+            p.removeAttribute("transform");
+            R.push((c) => {
+              if (showFor(r, p, c)) r.setAttribute("transform", matrix(mul(around(c, at, x), m)));
+              else p.setAttribute("d", pathOf(o, (u, v) => P(c, ...at(...app(m, u, v)))));
+            });
+          }
+        }
+        e.removeAttribute("transform");
+        takeApart(e, m, at);
+      } else if (x.big && (tag === "rect" || tag === "polygon")) {
+        // in the coordinates of the shape under its own transform: the widths of strokes and gradients stay
+        const o = outline(e);
+        const p = pathBeside(e);
+        const w = wrapped(e);
+        w.appendChild(p);
+        R.push((c) => {
+          const A = around(c, at, x);
+          w.setAttribute("transform", matrix(mul(A, T)));
+          if (showFor(e, p, c)) return;
+          const M = mul(A, m);
+          const det = M[0] * M[3] - M[1] * M[2];
+          // seen edge on, from above: nothing to show, no way back from the screen
+          p.setAttribute("d", pathOf(o, Math.abs(det) < 1e-6 ? (u, v) => [u, v] : (u, v) => {
+            const q = P(c, ...at(...app(m, u, v)));
+            const [a, b] = [q[0] - M[4], q[1] - M[5]];
+            return [(M[3] * a - M[2] * b) / det, (M[0] * b - M[1] * a) / det];
+          }));
+        });
+      } else {
+        const w = wrapped(e);
+        R.push((c) => w.setAttribute("transform", matrix(mul(around(c, at, x), T))));
+      }
+    }
+  }
+  // once, and only when it has a layout: sizes are not known before that
+  function takeApartPlanes() {
+    if (!planes.length || !SV.getClientRects().length) return;
+    parts.forEach((p) => sceneG.appendChild(p.g)); // not in the page yet: no sizes
+    for (const { g, at } of planes.splice(0)) takeApart(g, [1, 0, 0, 1, 0, 0], at);
+  }
   // shown in one view only: iso, or from above
   const only = (g, iso) => {
     R.push((c) => g.setAttribute("opacity", iso ? c.t : 1 - c.t));
@@ -168,13 +301,21 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const side = $("polygon", { fill: shade(col, 0.7) }, g);
     const tp = $("polygon", { fill: col, stroke: "rgba(255,255,255,.08)", "stroke-width": 0.4 }, g);
     R.push((c) => {
-      const a0 = Math.atan2(c.ct, c.st);
+      // the side seen ends where a line from the eye touches the circle; from above, half of it
+      let a0 = Math.atan2(c.ct, c.st);
+      let half = Math.PI / 2;
+      if (c.t > 0) {
+        const far = (CAM_DIST * c.sp) / c.t;
+        const [ex, ey] = [W / 2 + c.st * far - cx, H / 2 + c.ct * far - cy];
+        a0 = Math.atan2(ey, ex);
+        half = Math.acos(Math.min(1, r / Math.hypot(ex, ey)));
+      }
       const N = 14;
       const lo = [];
       const hi = [];
       const full = [];
       for (let i = 0; i <= N; i++) {
-        const a = a0 - Math.PI / 2 + (Math.PI * i) / N;
+        const a = a0 - half + (2 * half * i) / N;
         const x = cx + r * Math.cos(a);
         const y = cy + r * Math.sin(a);
         lo.push(P(c, x, y, z0));
@@ -217,10 +358,13 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       $("rect", { x: 0, y: 0, width: L, height: S, rx: S * 0.22, fill: f }, p);
       $("rect", { x: pad, y: pad, width: L - 2 * pad, height: S - 2 * pad, fill: "#0b0b0d" }, p);
       const n = Math.round((L - 2 * pad) / 1.15);
+      // the teeth by eights: a transform for each eight of them, not for each
+      let some;
       for (let i = 0; i < n; i++) {
+        if (i % 8 === 0) some = $("g", {}, p);
         const X = pad + (i * (L - 2 * pad)) / n + 0.2;
-        $("rect", { x: X, y: pad, width: 0.5, height: S * 0.12, fill: t }, p);
-        $("rect", { x: X, y: S - pad - S * 0.12, width: 0.5, height: S * 0.12, fill: t }, p);
+        $("rect", { x: X, y: pad, width: 0.5, height: S * 0.12, fill: t }, some);
+        $("rect", { x: X, y: S - pad - S * 0.12, width: 0.5, height: S * 0.12, fill: t }, some);
       }
       if (on) $("rect", { x: pad, y: S / 2 - S * 0.09, width: L - 2 * pad, height: S * 0.18, fill: "#7a7c80" }, p);
       $("rect", { x: keyAt * L - 0.5, y: pad, width: 1, height: S - 2 * pad, fill: f }, p);
@@ -230,7 +374,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       const id = `bs-sc${slotN++}`;
       const cp = $("clipPath", { id }, defs);
       $("rect", { x: -2, y: -1, width: 2 + L * frac, height: S + 2 }, cp);
-      draw($("g", { "clip-path": `url(#${id})` }, hg), true);
+      draw($("g", { "clip-path": `url(#${id})`, "data-lit": 2 + L * frac }, hg), true);
     }
   }
   // a device in a connector: a thin board standing up, one height for all
@@ -399,6 +543,16 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
 
   // half the height the isometric view shows: the stage may be higher than it needs
   const isoHalf = () => boxH / Math.min((stage.clientWidth || 600) / VW, boxH / heightOf(1)) / 2 - FS * 0.3;
+  // how far along y a point of the board goes to stand at that height on the screen; not a line under a
+  // perspective, a few steps of Newton
+  const millimetresTo = (c, e, Y) => {
+    let d = 0;
+    for (let i = 0; i < 5; i++) {
+      const at = P(c, e[0], e[1] + d)[1];
+      d += (Y - at) / (P(c, e[0], e[1] + d + 1)[1] - at);
+    }
+    return d;
+  };
   // In the isometric view the callouts of a side stand in a column down the edge of the board, each a
   // step from the next by its lines, moved as little as can be: the end of a leader moves along the
   // edge, so it stays off the board. From above they stay on their routes.
@@ -442,7 +596,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
         a[i].y = Math.min(a[i].y, i < a.length - 1 ? a[i + 1].y - (a[i + 1].h + a[i].h) / 2 : lim - a[i].h / 2);
       }
       a.forEach((q) => {
-        q.l.dm = (q.y - q.y0) / (c.s * c.ct * c.cp);
+        q.l.dm = millimetresTo(c, q.l.route[q.l.route.length - 1], q.y);
       });
     }
   }
@@ -529,6 +683,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     // one size for both views, the higher of them: a switch moves nothing on the page
     boxH = Math.min(maxHeight() || Infinity, (w * heightOf(0)) / VW);
     stage.style.height = `${boxH.toFixed(0)}px`;
+    takeApartPlanes();
     FS = Math.max(5.2, 7.5 / (boxH / heightOf(0)));
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
