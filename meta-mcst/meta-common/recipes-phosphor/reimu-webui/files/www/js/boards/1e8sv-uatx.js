@@ -48,7 +48,7 @@ const led = (g, u, v, on, col) => {
   if (on) $("circle", { cx: u, cy: v, r: 2.6, fill: col, opacity: 0.35 }, g);
   $("circle", { cx: u, cy: v, r: 1.2, fill: on ? col : "#3a3b3e" }, g);
 };
-const clip = (s, n) => (s.length > n ? `${s.slice(0, Math.max(1, n - 1))}…` : s);
+const clip = (s, n) => s.slice(0, n);
 
 function draw(sc, m) {
   const { plate: PL, part, box, slot, card, top, left, only, txt, label } = sc;
@@ -101,8 +101,8 @@ function draw(sc, m) {
     let short;
     if (busy) {
       const len = ((w - 3) * d.width) / d.slot;
-      card(g, x + 1.5, y + h / 2 - 0.5, len, 11, 10, d.kind === "gpu" ? "#34363b" : "#2b3330", clip(`${d.short} · x${d.width}`, Math.floor(len / 1.6)));
-      full = `${id} · x${d.width}${d.width !== d.slot ? ` из x${d.slot}` : ""} · ${clip(d.dev, 44)}`;
+      card(g, x + 1.5, y + h / 2 - 0.5, len, 11, 10, d.kind === "gpu" ? "#34363b" : "#2b3330", `${d.short} · x${d.width}`);
+      full = `${id} · x${d.width}${d.width !== d.slot ? ` из x${d.slot}` : ""} · ${d.dev}`;
       short = `${id} · x${d.width}/x${d.slot}`;
     } else {
       full = `${id} · x${d.slot} · ${d.state === "empty" ? "пусто" : "неизвестно"}`;
@@ -126,7 +126,7 @@ function draw(sc, m) {
       $("circle", { cx: 221, cy: 6.5, r: 1.2, fill: "#000", stroke: "#6e706d", "stroke-width": 0.3 }, t);
       $("text", { "font-size": 2.8, fill: "#a0a2a7", "text-anchor": "middle", "font-weight": 500, transform: "translate(222 36) rotate(-90)" }, t).textContent = clip(d.short, 22);
     }
-    label("X48", [232, 84.5, 3], [[254, 84.5]], busy ? `X48 · ${clip(d.dev, 26)} · ${d.size}` : `X48 · ${d.state === "empty" ? "пусто" : "неизвестно"}`, busy ? `X48 · ${d.size}` : "X48 · —", { dim: !busy });
+    label("X48", [232, 84.5, 3], [[254, 84.5]], busy ? `X48 · ${d.dev} · ${d.size}` : `X48 · ${d.state === "empty" ? "пусто" : "неизвестно"}`, busy ? `X48 · ${d.size}` : "X48 · —", { dim: !busy });
   }
   // SATA, as on the photo; a short cable straight up in a port with a disk
   SATA.forEach(([id, x, y]) => {

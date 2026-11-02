@@ -361,7 +361,7 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .bs-row { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 3px 0; border-top: 1px solid var(--border); }
 .bs-row b { font-weight: 600; min-width: 30px; }
 .bs-row em { font-style: normal; background: var(--panel-2); border-radius: 5px; padding: 0 5px; font-size: 11px; }
-.bs-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.bs-row > span { min-width: 0; }
 .bs-led { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .bs-led.on { background: var(--ok); }
 .bs-pool { height: 8px; border-radius: 4px; background: var(--bg-2); overflow: hidden; margin: 2px 0 6px; }

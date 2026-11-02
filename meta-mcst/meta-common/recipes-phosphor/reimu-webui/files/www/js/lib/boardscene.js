@@ -41,6 +41,20 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   const R = []; // what follows the camera
   const parts = [];
   const labels = [];
+  // a long callout goes on several lines, by words
+  const setLines = (tx, str) => {
+    const lines = [];
+    for (const w of str.split(" ")) {
+      const last = lines[lines.length - 1];
+      if (last !== undefined && `${last} ${w}`.length <= 38) lines[lines.length - 1] = `${last} ${w}`;
+      else lines.push(w);
+    }
+    tx.replaceChildren(...lines.map((l) => {
+      const t = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
+      t.textContent = l;
+      return t;
+    }));
+  };
   const clouds = {}; // id -> set(value)
   let T = view === "iso" ? 1 : 0;
   let FS = 5.2;
@@ -184,11 +198,16 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     }
   }
   // a device in a connector: a thin board standing up, one height for all
+  let clipN = 0;
   function card(g, x, y, len, z0, hh, col, name) {
     box(g, x, y, len, 1, z0, hh, col);
     const m = front(g, y + 1);
     if (name) {
-      const t = $("text", { x: x + len / 2, y: 0, "font-size": 2.8, fill: "#d8d9dc", "text-anchor": "middle", "font-weight": 500, transform: `translate(0 ${z0 + hh * 0.42}) scale(1 -1)` }, m);
+      // longer than the card: from its left end, cut by its edge
+      const long = name.length * 1.5 > len - 3;
+      const id = `bs-c${clipN++}`;
+      $("rect", { x: x + 1, y: z0, width: len - 2, height: hh }, $("clipPath", { id }, SV.querySelector("defs")));
+      const t = $("text", { x: long ? x + 1.5 : x + len / 2, y: 0, "font-size": 2.8, fill: "#d8d9dc", "text-anchor": long ? "start" : "middle", "font-weight": 500, transform: `translate(0 ${z0 + hh * 0.42}) scale(1 -1)` }, $("g", { "clip-path": `url(#${id})` }, m));
       t.textContent = name;
     }
   }
@@ -221,6 +240,15 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const dot = o.dot ? $("circle", { r: 1.3, class: `bs-dot ${o.dot}` }, g) : null;
     const tx = $("text", { class: `bs-lbl${o.dim ? " dim" : ""}`, "text-anchor": o.end ? "end" : "start", "dominant-baseline": "middle" }, g);
     labels.push({ tx, full, short });
+    const place = (X, Y) => {
+      tx.setAttribute("x", X);
+      tx.setAttribute("y", Y);
+      const lines = [...tx.children];
+      lines.forEach((t, i) => {
+        t.setAttribute("x", X);
+        t.setAttribute("y", Y + (i - (lines.length - 1) / 2) * FS * 1.25);
+      });
+    };
     R.push((c) => {
       const a = P(c, anc[0], anc[1], anc[2] || 0);
       const ps = route.map((p) => P(c, p[0], p[1]));
@@ -230,9 +258,8 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       if (dot) {
         dot.setAttribute("cx", L[0] + 3 * d);
         dot.setAttribute("cy", L[1]);
-        tx.setAttribute("x", L[0] + 6.5 * d);
-      } else tx.setAttribute("x", L[0] + 3 * d);
-      tx.setAttribute("y", L[1]);
+        place(L[0] + 6.5 * d, L[1]);
+      } else place(L[0] + 3 * d, L[1]);
     });
   }
   // a temperature on the board: a marker (dashed: the place is approximate), a cloud, a halo
@@ -320,7 +347,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     FS = Math.max(5.2, 7.5 / (w / VW));
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
-    labels.forEach((l) => { l.tx.textContent = comp ? l.short : l.full; });
+    labels.forEach((l) => setLines(l.tx, comp ? l.short : l.full));
     render();
   }
   function setView(v) {

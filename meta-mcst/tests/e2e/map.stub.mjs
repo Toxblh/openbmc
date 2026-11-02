@@ -130,6 +130,7 @@ async function shot(s, name) { if (SHOTS) { await s.page.waitForTimeout(1000); a
   check(/нет адреса/.test(sum), "no address on the port without a link");
   // USB
   const usbp = await pop(s, "X4");
+  check(!(await s.page.locator("#sv, svg").first().innerHTML()).includes("…"), "no name cut with an ellipsis");
   check(/USB нижний[\s\S]*Ultra Fit/.test(usbp), `USB by port number (${usbp.replace(/\n/g, " ").slice(0, 140)})`);
   // fans, UID
   check(/1\d{3} об\/мин|\d+ об\/мин/.test(text) && /\d+ %/.test(text), "fans: speed and percent in clouds");
