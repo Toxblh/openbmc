@@ -316,7 +316,7 @@ function info(pid) {
     const d = m.net[pid];
     const rows = [["Линк", !d.known ? "неизвестно" : d.link ? "есть" : "нет"], d.speed ? ["Скорость", `${d.speed} Мбит/с`] : null, d.iface ? ["Интерфейс", d.iface] : null, d.ip ? ["IP", d.ip] : null, d.mac ? ["MAC", d.mac] : null];
     if (pid === "X4") m.usb.X4.forEach((u, i) => rows.push([`USB ${i ? "верхний" : "нижний"}`, !m.usb.known ? "неизвестно" : u ? u.product || u.id : "пусто"]));
-    return { title: pid, sub: d.sub, rows, note: pid === "X4" ? (m.usb.known ? "Какой порт нижний, а какой верхний, не проверено." : m.on ? AGENT_OLD : NO_AGENT) : d.known ? "Какой интерфейс в каком разъёме, выведено по нумерации, кабелем не проверено." : NO_AGENT };
+    return { title: pid, sub: d.sub, rows, note: pid === "X4" ? (m.usb.known ? "" : m.on ? AGENT_OLD : NO_AGENT) : d.known ? "Какой интерфейс в каком разъёме, выведено по нумерации, кабелем не проверено." : NO_AGENT };
   }
   if (m.fans[pid]) {
     const d = m.fans[pid];

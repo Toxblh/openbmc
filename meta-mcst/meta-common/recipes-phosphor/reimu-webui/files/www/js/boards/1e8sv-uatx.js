@@ -279,7 +279,7 @@ export default {
   ata: (n) => n - 1,
   // Рисунок 9: X19 USB01, USB03; X4 USB10, USB12; USB13 is the BMC's. EHCI 01:0a: USB0x, 01:0b: USB1x
   // (checked: the BMC's virtual hub is 4-4). Root hub -> controller, port N -> USBx(N-1).
-  // Which of USB10, USB12 is the lower one in X4 isn't in the manual: lower first here, not checked.
+  // In X4 USB10 is the lower port, USB12 the upper: not in the manual, checked on the board (2026-11-02).
   usb: { roots: { 1: 0, 2: 0, 3: 1, 4: 1 }, ports: { "01": "X19", "03": "X19", 10: "X4", 12: "X4", 13: "BMC" }, order: { X4: ["10", "12"] } },
   // Слоты по рисунку 9 и шелкографии: x8, x8, x2. Какой порт в каком разъёме: X30 и X31 сказал
   // владелец платы, по видеокарте и NVMe; X32: порты x4, на которых нет ничего встроенного (01:05.0 это BMC)
