@@ -3,6 +3,7 @@
 // чертеже такого нет, место выбрано рядом.
 import { svgEl as $ } from "../lib/boardscene.js";
 import { LID } from "./lid-elbrus-8sv.js";
+import { ASPEED_LOGO } from "../lib/chip-aspeed.js";
 
 const MEM = [["X46", 48, 15, 147, 5, 3], ["X44", 48, 24, 147, 5, 2], ["X16", 48, 131, 147, 5, 0], ["X45", 48, 140, 147, 5, 1]];
 const PCI = [["X31", 43, 159, 88, 7], ["X30", 43, 180, 88, 7], ["X32", 43, 220, 88, 7]];
@@ -60,7 +61,6 @@ function draw(sc, m) {
   txt(PL, 210, 92.6, "M2 SATA3", 2.4, silk);
   txt(PL, 176, 176.8, "КПИ-2", 3, silk, "middle", 500);
   txt(PL, 142, 226.5, "1Э8СВ-uATX", 7.2, "#a6a8ad", "start", 600);
-  txt(PL, 33.5, 80, "AST2500", 2.4, silk, "middle");
   $("rect", { x: 63, y: 149.3, width: 17, height: 6, rx: 0.5, fill: "#2a2b2f" }, PL);
   txt(PL, 71.5, 153.7, "МЦСТ:", 3, "#d4d5d8", "middle", 600);
   const sn = $("g", { class: "bs-part" }, PL);
@@ -150,7 +150,13 @@ function draw(sc, m) {
     txt(t, 99.5, 204.5, "+", 4, "#4a4c4b", "middle", 700);
     txt(t, 99.5, 210.5, "CR2032", 2.6, "#6b6d6c", "middle", 500);
   }
-  box(part("BMC", 33.5, 77), 24, 68, 19, 18, 0, 2, "#202124");
+  {
+    const g = part("BMC", 33.5, 77);
+    box(g, 24, 68, 19, 18, 0, 2, "#141517");
+    const t = top(g, 2);
+    $("path", { d: ASPEED_LOGO, fill: "#e8e9ea", "fill-rule": "evenodd", transform: "translate(25.9 72.2) scale(.152)" }, t);
+    txt(t, 33.5, 80.6, "AST2500", 2.3, "#e8e9ea", "middle", 500);
+  }
   box(part("X19", 38, 237), 30, 234, 16, 6, 0, 5, "#2c2d31");
   // the CPU
   {
