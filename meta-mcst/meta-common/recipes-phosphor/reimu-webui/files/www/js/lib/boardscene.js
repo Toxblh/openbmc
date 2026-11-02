@@ -1,16 +1,23 @@
-// A board as a scene: one projection of millimetres on the board, from a view
-// from above (t=0) to a view in perspective (t=1), so the same drawing serves both and
-// the change between them is a camera move. Boxes, slots, cards, labels and
+// A board as a scene: one projection of millimetres on the board, three views of it (from above,
+// isometric, in perspective), so the same drawing serves all and the change between them is a
+// camera move. Boxes, slots, cards, labels and
 // clouds of values; what stands where is in js/boards/*.js. Text from outside
 // only ever goes in through textContent.
 const NS = "http://www.w3.org/2000/svg";
-// A pinhole camera, turned and tilted: each axis as it shortens it, 0.91 along the rear edge, 0.71
-// along the side, 0.82 up; the board is square, its edges on the screen are not. It looks at the
-// middle of the board from CAM_DIST mm: far enough to see the rear panel from the side, the far long
+// The perspective: a pinhole camera, turned and tilted: each axis as it shortens it, 0.91 along the rear
+// edge, 0.71 along the side, 0.82 up; the board is square, its edges on the screen are not. It looks at
+// the middle of the board from CAM_DIST mm: far enough to see the rear panel from the side, the far long
 // edge comes out 0.870 of the near one. In millimetres of the board: before the scale of the screen.
 export const CAM_DIST = 1000;
-const TH = (-30 * Math.PI) / 180;
-const PH = (55 * Math.PI) / 180;
+// A camera: t, 0 from above, 1 from the side; turn and tilt; inv, 1 / the distance, 0 for parallel rays;
+// the scale; wp, wi: how much of the places of the callouts of the perspective and the isometric view.
+// A move between two views goes through all of these at once.
+const VIEWS = {
+  top: { t: 0, th: 0, ph: 0, inv: 0, s: 1.3, wp: 0, wi: 0 },
+  persp: { t: 1, th: (-30 * Math.PI) / 180, ph: (55 * Math.PI) / 180, inv: 1 / CAM_DIST, s: 1.2, wp: 1, wi: 0 },
+  // a true isometric view: the three axes foreshortened alike by sqrt(2/3), the edges at 30 degrees
+  iso: { t: 1, th: -Math.PI / 4, ph: Math.atan(Math.SQRT2), inv: 0, s: 1.25, wp: 0, wi: 1 },
+};
 const FLAT = (-20 * Math.PI) / 180; // the order of the parts from above: nothing there hides anything
 const VX = -330;
 const VW = 630;
@@ -58,7 +65,7 @@ function depthOrder(parts) {
   return out;
 }
 
-export function createScene(stage, { size = [244, 244], view = "iso", info = () => null, maxHeight = () => null } = {}) {
+export function createScene(stage, { size = [244, 244], view = "persp", info = () => null, maxHeight = () => null } = {}) {
   const [W, H] = size;
   const R = []; // what follows the camera
   const parts = [];
@@ -79,7 +86,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     }));
   };
   const clouds = {}; // id -> set(value)
-  let T = view === "iso" ? 1 : 0;
+  let S = { ...VIEWS[view] };
   // the zoom, the middle of the view from the middle of the board, the height given to the stage
   let Z = 1;
   let PX = 0;
@@ -103,18 +110,16 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   stage.replaceChildren(SV, pop);
 
   // the projection: turned and tilted around the middle of the board, then what is farther is smaller.
-  // Y grows towards the viewer, z too; from above, t = 0, nothing depends on the depth
+  // Y grows towards the viewer, z too; with parallel rays, inv = 0, nothing depends on the depth
   const P = (c, x, y, z = 0) => {
     const dx = x - W / 2;
     const dy = y - H / 2;
     const Y = dx * c.st + dy * c.ct;
-    const k = 1 / (1 - (c.t * (Y * c.sp + z * c.cp)) / CAM_DIST);
+    const k = 1 / (1 - c.inv * (Y * c.sp + z * c.cp));
     return [c.s * (dx * c.ct - dy * c.st) * k + c.ox, c.s * (Y * c.cp - z * c.sp) * k + c.oy];
   };
-  function mkCam(t) {
-    const th = TH * t;
-    const ph = PH * t;
-    const c = { t, ct: Math.cos(th), st: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), s: 1.3 - 0.1 * t, ox: 0, oy: 0 };
+  function mkCam(v) {
+    const c = { ...v, ct: Math.cos(v.th), st: Math.sin(v.th), cp: Math.cos(v.ph), sp: Math.sin(v.ph), ox: 0, oy: 0 };
     // the board in the middle of the stage, up and down: the perspective moves its corners off the middle
     const ys = [[0, 0], [W, 0], [0, H], [W, H]].map((p) => P(c, p[0], p[1])[1]);
     c.oy = -(Math.min(...ys) + Math.max(...ys)) / 2;
@@ -259,7 +264,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     parts.forEach((p) => sceneG.appendChild(p.g)); // not in the page yet: no sizes
     for (const { g, at } of planes.splice(0)) takeApart(g, [1, 0, 0, 1, 0, 0], at);
   }
-  // shown in one view only: iso, or from above
+  // shown from the side (both views), or from above
   const only = (g, iso) => {
     R.push((c) => g.setAttribute("opacity", iso ? c.t : 1 - c.t));
     return g;
@@ -304,11 +309,11 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const side = $("polygon", { fill: shade(col, 0.7) }, g);
     const tp = $("polygon", { fill: col, stroke: "rgba(255,255,255,.08)", "stroke-width": 0.4 }, g);
     R.push((c) => {
-      // the side seen ends where a line from the eye touches the circle; from above, half of it
+      // the side seen ends where a line from the eye touches the circle; with parallel rays, half of it
       let a0 = Math.atan2(c.ct, c.st);
       let half = Math.PI / 2;
-      if (c.t > 0) {
-        const far = (CAM_DIST * c.sp) / c.t;
+      if (c.inv > 0) {
+        const far = c.sp / c.inv;
         const [ex, ey] = [W / 2 + c.st * far - cx, H / 2 + c.ct * far - cy];
         a0 = Math.atan2(ey, ex);
         half = Math.acos(Math.min(1, r / Math.hypot(ex, ey)));
@@ -424,7 +429,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const ln = $("polyline", { class: "bs-line" }, g);
     const dot = o.dot ? $("circle", { r: 1.3, class: `bs-dot ${o.dot}` }, g) : null;
     const tx = $("text", { class: `bs-lbl${o.dim ? " dim" : ""}`, "text-anchor": o.end ? "end" : "start", "dominant-baseline": "middle" }, g);
-    const l = { tx, full, short, route, end: !!o.end, dot: !!o.dot, dm: 0 };
+    const l = { tx, full, short, route, end: !!o.end, dot: !!o.dot, dm: { persp: 0, iso: 0 } };
     labels.push(l);
     const place = (X, Y) => {
       tx.setAttribute("x", X);
@@ -437,7 +442,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     };
     R.push((c) => {
       const a = P(c, anc[0], anc[1], anc[2] || 0);
-      const ps = route.map((p, i) => P(c, p[0], p[1] + (i === route.length - 1 ? l.dm * c.t : 0)));
+      const ps = route.map((p, i) => P(c, p[0], p[1] + (i === route.length - 1 ? l.dm.persp * c.wp + l.dm.iso * c.wi : 0)));
       ln.setAttribute("points", pts(a, ...ps));
       const L = ps[ps.length - 1];
       const d = o.end ? -1 : 1;
@@ -448,8 +453,10 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
       } else place(L[0] + 3 * d, L[1]);
     });
   }
+  // how far a cloud stands off its place under this camera
+  const offNow = (pill, c) => [0, 1].map((i) => pill.off.persp[i] * c.wp + pill.off.iso[i] * c.wi);
   // the line of a cloud moved off its place, none when it stands there
-  const moved = (ln, p, x, y, off, c) => ln.setAttribute("points", Math.hypot(off[0], off[1]) * c.t > 0.5 ? pts(p, [x, y]) : "");
+  const moved = (ln, p, x, y, off) => ln.setAttribute("points", Math.hypot(off[0], off[1]) > 0.5 ? pts(p, [x, y]) : "");
   // a temperature on the board: a marker (dashed: the place is approximate), a cloud, a halo
   function tempCloud(s) {
     const g = $("g", { class: "bs-part" }, LB);
@@ -459,7 +466,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const rc = $("rect", { rx: 3.5, class: "bs-pill" }, g);
     const tx = $("text", { "font-weight": 600, "text-anchor": "middle", "dominant-baseline": "middle" }, g);
     const pill = {
-      off: [0, 0],
+      off: { persp: [0, 0], iso: [0, 0] },
       rect(c) {
         const p = P(c, s.at[0], s.at[1], s.z || 0);
         const w = FS * 2.9;
@@ -470,9 +477,10 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     R.push((c) => {
       const p = P(c, s.at[0], s.at[1], s.z || 0);
       const { x: x0, y: y0, w, h } = pill.rect(c);
-      const x = x0 + pill.off[0] * c.t;
-      const y = y0 + pill.off[1] * c.t;
-      moved(ln, p, x, y, pill.off, c);
+      const off = offNow(pill, c);
+      const x = x0 + off[0];
+      const y = y0 + off[1];
+      moved(ln, p, x, y, off);
       if (mk) {
         mk.setAttribute("cx", p[0]);
         mk.setAttribute("cy", p[1]);
@@ -515,7 +523,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     const tx = $("text", { class: "bs-pilltx", "text-anchor": "middle", "dominant-baseline": "middle", "font-weight": 600 }, g);
     tx.textContent = text;
     const pill = {
-      off: [0, 0],
+      off: { persp: [0, 0], iso: [0, 0] },
       rect(c) {
         const p = P(c, at[0], at[1], at[2]);
         const fs = FS * 0.86;
@@ -527,9 +535,10 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     R.push((c) => {
       const fs = FS * 0.86;
       const { x: x0, y: y0, w, h } = pill.rect(c);
-      const X = x0 + pill.off[0] * c.t;
-      const Y = y0 + pill.off[1] * c.t;
-      moved(ln, P(c, at[0], at[1], at[2]), X, Y, pill.off, c);
+      const off = offNow(pill, c);
+      const X = x0 + off[0];
+      const Y = y0 + off[1];
+      moved(ln, P(c, at[0], at[1], at[2]), X, Y, off);
       rc.setAttribute("x", (X - w / 2).toFixed(2));
       rc.setAttribute("y", (Y - h / 2).toFixed(2));
       rc.setAttribute("width", w.toFixed(2));
@@ -544,8 +553,8 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     };
   }
 
-  // half the height the isometric view shows: the stage may be higher than it needs
-  const isoHalf = () => boxH / Math.min((stage.clientWidth || 600) / VW, boxH / heightOf(1)) / 2 - FS * 0.3;
+  // half the height a view from the side shows: the stage may be higher than it needs
+  const sideHalf = () => boxH / Math.min((stage.clientWidth || 600) / VW, boxH / heightOf(1)) / 2 - FS * 0.3;
   // how far along y a point of the board goes to stand at that height on the screen; not a line under a
   // perspective, a few steps of Newton
   const millimetresTo = (c, e, Y) => {
@@ -556,12 +565,12 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     }
     return d;
   };
-  // In the isometric view the callouts of a side stand in a column down the edge of the board, each a
+  // In a view from the side the callouts of a side stand in a column down the edge of the board, each a
   // step from the next by its lines, moved as little as can be: the end of a leader moves along the
   // edge, so it stays off the board. From above they stay on their routes.
-  function spreadLabels() {
-    const c = mkCam(1);
-    const lim = isoHalf();
+  function spreadLabels(view) {
+    const c = mkCam(VIEWS[view]);
+    const lim = sideHalf();
     for (const end of [true, false]) {
       const a = labels.filter((l) => l.end === end).map((l) => {
         const e = l.route[l.route.length - 1];
@@ -599,26 +608,23 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
         a[i].y = Math.min(a[i].y, i < a.length - 1 ? a[i + 1].y - (a[i + 1].h + a[i].h) / 2 : lim - a[i].h / 2);
       }
       a.forEach((q) => {
-        q.l.dm = millimetresTo(c, q.l.route[q.l.route.length - 1], q.y);
+        q.l.dm[view] = millimetresTo(c, q.l.route[q.l.route.length - 1], q.y);
       });
     }
   }
-  // In the isometric view a cloud of a value that falls on another or on a callout moves off it, as
+  // In a view from the side a cloud of a value that falls on another or on a callout moves off it, as
   // little as can be, with a line to its place. From above they stay where they are.
-  function spreadClouds() {
-    const c = mkCam(1);
-    const lim = isoHalf();
+  function spreadClouds(view) {
+    const c = mkCam(VIEWS[view]);
+    const lim = sideHalf();
     const fixed = labels.map((l) => {
       const e = l.route[l.route.length - 1];
-      const p = P(c, e[0], e[1] + l.dm);
+      const p = P(c, e[0], e[1] + l.dm[view]);
       const w = Math.max(0, ...[...l.tx.children].map((t) => t.textContent.length)) * FS * 0.56;
       const from = p[0] + (l.end ? -1 : 1) * (l.dot ? 6.5 : 3);
       return { x: from + ((l.end ? -1 : 1) * w) / 2, y: p[1], w, h: l.tx.children.length * FS * 1.25 };
     });
-    const free = pills.map((q) => {
-      q.off = [0, 0];
-      return { q, ...q.rect(c) };
-    });
+    const free = pills.map((q) => ({ q, ...q.rect(c) }));
     const pad = FS * 0.12;
     const apart = (a, b, ka, kb) => {
       const ox = (a.w + b.w) / 2 + pad - Math.abs(a.x - b.x);
@@ -651,23 +657,24 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     }
     free.forEach((a) => {
       const r = a.q.rect(c);
-      a.q.off = [a.x - r.x, a.y - r.y];
+      a.q.off[view] = [a.x - r.x, a.y - r.y];
     });
   }
 
-  // the parts in the order of the view: a camera on its way goes by the isometric one
+  // the parts in the order of the view: both views from the side look from one corner of the board,
+  // one order; a camera on its way goes by it
   let flatOrder = [];
-  let isoOrder = [];
+  let sideOrder = [];
   let inOrder = null;
   function render() {
-    const order = T > 0 ? isoOrder : flatOrder;
+    const order = S.t > 0 ? sideOrder : flatOrder;
     if (order !== inOrder) {
       order.forEach((p) => sceneG.appendChild(p.g));
       inOrder = order;
     }
-    cam = mkCam(T);
+    cam = mkCam(S);
     for (const f of R) f(cam);
-    const h = heightOf(T);
+    const h = heightOf(S.t);
     const vw = VW / Z;
     const vh = h / Z;
     PX = Math.max(-(VW - vw) / 2, Math.min((VW - vw) / 2, PX));
@@ -679,11 +686,11 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
   // screen pixels in a unit of the board at zoom 1
   const pxScale = () => {
     const w = stage.clientWidth || 600;
-    return Math.min(w / VW, boxH / heightOf(T));
+    return Math.min(w / VW, boxH / heightOf(S.t));
   };
   function fit() {
     const w = stage.clientWidth || 600;
-    // one size for both views, the higher of them: a switch moves nothing on the page
+    // one size for all views, the highest of them: a switch moves nothing on the page
     boxH = Math.min(maxHeight() || Infinity, (w * heightOf(0)) / VW);
     stage.style.height = `${boxH.toFixed(0)}px`;
     takeApartPlanes();
@@ -691,24 +698,26 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     LB.setAttribute("font-size", FS);
     const comp = w < 640;
     labels.forEach((l) => setLines(l.tx, comp ? l.short : l.full));
-    spreadLabels();
-    spreadClouds();
+    for (const v of ["persp", "iso"]) {
+      spreadLabels(v);
+      spreadClouds(v);
+    }
     render();
   }
   function setView(v) {
-    const to = v === "iso" ? 1 : 0;
+    const to = VIEWS[v];
     cancelAnimationFrame(raf);
     if (reducedMotion()) {
-      T = to;
+      S = { ...to };
       render();
       return;
     }
-    const from = T;
+    const from = S;
     const t0 = performance.now();
     const step = (n) => {
       let k = Math.min(1, (n - t0) / 750);
       k = k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2;
-      T = from + (to - from) * k;
+      S = Object.fromEntries(Object.keys(to).map((n) => [n, from[n] + (to[n] - from[n]) * k]));
       render();
       if (k < 1) raf = requestAnimationFrame(step);
     };
@@ -830,7 +839,7 @@ export function createScene(stage, { size = [244, 244], view = "iso", info = () 
     // everything drawn: in order of depth, then to the screen
     finish() {
       flatOrder = [...parts].sort((a, b) => a.k - b.k);
-      isoOrder = depthOrder(parts);
+      sideOrder = depthOrder(parts);
       ro.observe(stage);
       addEventListener("resize", fit);
       fit();

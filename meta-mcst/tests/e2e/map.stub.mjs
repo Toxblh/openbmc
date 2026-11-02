@@ -26,7 +26,7 @@ const HARNESS = `<!doctype html><html><head><meta charset="utf-8"><link rel="sty
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open(fix, { width = 1300, height = 900, view, led = { Asserted: false }, html = HARNESS, block, slow = 0 } = {}) {
+async function open(fix, { width = 1300, height = 900, view, led = { Asserted: false }, html = HARNESS, block, slow = 0, noStorage = false } = {}) {
   const ctx = await browser.newContext({ locale: "ru-RU", viewport: { width, height } });
   const page = await ctx.newPage();
   const s = { page, errors: [], fix };
@@ -57,6 +57,7 @@ async function open(fix, { width = 1300, height = 900, view, led = { Asserted: f
     const types = { ".js": "text/javascript", ".css": "text/css" };
     return route.fulfill({ contentType: types[path.extname(f)] || "application/octet-stream", body: fs.readFileSync(f) });
   });
+  if (noStorage) await page.addInitScript(() => Object.defineProperty(window, "localStorage", { get() { throw new Error("denied"); } }));
   if (view) await page.addInitScript((v) => localStorage.setItem("reimu-map-view", v), view);
   await page.goto(`${ORIGIN}/harness.html`);
   return s;
@@ -81,6 +82,24 @@ async function pop(s, id) {
 }
 const partCount = (s, id, sel) => s.page.evaluate(([i, q]) => document.querySelector(`.bs-svg .bs-part[data-id='${i}']`).querySelectorAll(q).length, [id, sel]);
 const clear = (s, what) => check(!s.errors.length, `${what}: no page errors ${s.errors.join("; ").slice(0, 200)}`);
+// the corners of the plate as drawn: x,y x+w,y x+w,y+h x,y+h in the units of the view
+const cornersOf = (s) => s.page.evaluate(() => {
+  const e = [...document.querySelectorAll(".bs-svg .bs-part[data-id='BOARD'] polygon")].filter((p) => !p.getAttribute("filter"))[2];
+  return [...e.points].map((p) => [p.x, p.y]);
+});
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const between = (a, b, c, d) => {
+  const v = Math.abs(Math.atan2(b[1] - a[1], b[0] - a[0]) - Math.atan2(d[1] - c[1], d[0] - c[0])) * 180 / Math.PI;
+  return Math.min(v, Math.abs(180 - v));
+};
+const viewOn = (s) => s.page.evaluate(() => [...document.querySelectorAll("[data-view-btn].primary")].map((b) => b.dataset.viewBtn).join());
+const stored = (s) => s.page.evaluate(() => localStorage.getItem("reimu-map-view"));
+// a button of a view; one that is not there is a failed check, the rest of the run still says its numbers
+async function pick(s, v) {
+  const b = s.page.locator(`[data-view-btn='${v}']`);
+  if (!(await b.count())) { check(false, `there is a button of the view ${v}`); return; }
+  await b.click();
+}
 async function shot(s, name) { if (SHOTS) { await s.page.waitForTimeout(1000); await s.page.screenshot({ path: path.join(SHOTS, name), fullPage: true }); } }
 
 // a real board, the host on, an agent that says all
@@ -356,7 +375,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
 
 // the rear panel against the drawing of the manual (ТВГИ.469555.445РЭ, sizes in mm)
 {
-  const s = await open(clone(FIX), { view: "iso" });
+  const s = await open(clone(FIX), { view: "persp" });
   await ready(s);
   const r = await s.page.evaluate(() => {
     const g = document.querySelector(".bs-svg .bs-part[data-id='X28']");
@@ -374,7 +393,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
 
 // VGA against the rear view in the manual's drawing (sizes in mm)
 {
-  const s = await open(clone(FIX), { view: "iso" });
+  const s = await open(clone(FIX), { view: "persp" });
   await ready(s);
   const r = await s.page.evaluate(() => {
     const g = document.querySelector(".bs-svg .bs-part[data-id='X28']");
@@ -396,7 +415,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     return { bottom: b.bottom, win: innerHeight, stage: document.querySelector(".bs-stage").style.height, h: document.querySelector(".bs-stage").clientHeight, scroll: document.documentElement.scrollHeight };
   });
   for (const [w, wh] of [[1300, 700], [1920, 900]]) {
-    const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+    const s = await open(clone(FIX), { width: w, height: wh, view: "persp" });
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
@@ -405,7 +424,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await s.page.context().close();
   }
   { // cards in two rows: the map keeps its minimum, the first row is seen
-    const s = await open(clone(FIX), { width: 1000, height: 760, view: "iso" });
+    const s = await open(clone(FIX), { width: 1000, height: 760, view: "persp" });
     await ready(s);
     await s.page.waitForTimeout(300);
     const top = await s.page.evaluate(() => document.querySelector("#map-summary .card").getBoundingClientRect().bottom);
@@ -413,7 +432,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await s.page.context().close();
   }
   { // a big window: no empty space added around the board
-    const s = await open(clone(FIX), { width: 1300, height: 1500, view: "iso" });
+    const s = await open(clone(FIX), { width: 1300, height: 1500, view: "persp" });
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
@@ -425,7 +444,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await s.page.context().close();
   }
   { // a low window: the map keeps a minimum, the page scrolls
-    const s = await open(clone(FIX), { width: 1300, height: 420, view: "iso" });
+    const s = await open(clone(FIX), { width: 1300, height: 420, view: "persp" });
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
@@ -433,7 +452,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
     await s.page.context().close();
   }
   { // a phone: by its width, as before
-    const s = await open(clone(FIX), { width: 390, height: 844, view: "iso" });
+    const s = await open(clone(FIX), { width: 390, height: 844, view: "persp" });
     await ready(s);
     await s.page.waitForTimeout(300);
     const r = await fits(s);
@@ -444,7 +463,7 @@ for (const [what, block, f] of [["the map's code missing", /boards\/1e8sv/, (x) 
 
 // the switch of the view changes no size: neither the map nor what is under it moves
 for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
-  const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+  const s = await open(clone(FIX), { width: w, height: wh, view: "persp" });
   await ready(s);
   await s.page.waitForTimeout(300);
   const size = () => s.page.evaluate(() => ({
@@ -454,17 +473,18 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
   }));
   const a = await size();
   const seen = new Set();
-  await s.page.locator("[data-view-btn='top']").click();
-  for (let i = 0; i < 8; i++) { const r = await size(); seen.add(JSON.stringify(r)); await s.page.waitForTimeout(120); }
-  await s.page.locator("[data-view-btn='iso']").click();
-  for (let i = 0; i < 8; i++) { const r = await size(); seen.add(JSON.stringify(r)); await s.page.waitForTimeout(120); }
+  // from each to each of the three
+  for (const v of ["iso", "top", "persp", "top", "iso", "persp"]) {
+    await pick(s, v);
+    for (let i = 0; i < 8; i++) { const r = await size(); seen.add(JSON.stringify(r)); await s.page.waitForTimeout(120); }
+  }
   check(seen.size === 1 && seen.has(JSON.stringify(a)), `${w}x${wh}: the views of one size, labels too (${[...seen].join(" ")})`);
   await s.page.context().close();
 }
 
 // the pins of the heatsink: of two that meet on the screen the nearer is drawn over the farther
 {
-  const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "persp" });
   await ready(s);
   await s.page.waitForTimeout(1000);
   const bad = await s.page.evaluate(() => {
@@ -483,8 +503,8 @@ for (const [w, wh] of [[1300, 700], [1920, 1080], [1300, 1500], [390, 844]]) {
 }
 
 // the board in the middle of the stage, up and down, in both views
-for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
-  const s = await open(clone(FIX), { width: 1400, height: 800, view: stored });
+for (const [v, key] of [["persp", "persp"], ["iso", "iso"], ["top", "2d"]]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: key });
   await ready(s);
   await s.page.waitForTimeout(300);
   const r = await s.page.evaluate(() => {
@@ -498,6 +518,9 @@ for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
     return { above: best.top - st.top, below: st.bottom - best.bottom, h: best.height };
   });
   check(Math.abs(r.above - r.below) < 8, `${v}: the board in the middle, up and down (${r.above.toFixed(1)} above, ${r.below.toFixed(1)} below)`);
+  // the corners themselves, in the units of the view
+  const ys = (await cornersOf(s)).map((p) => p[1]);
+  check(Math.abs(Math.min(...ys) + Math.max(...ys)) < 0.1, `${v}: its corners centred (${Math.min(...ys).toFixed(2)}, ${Math.max(...ys).toFixed(2)})`);
   await s.page.context().close();
 }
 
@@ -530,7 +553,7 @@ for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
     return [...e.points].map((p) => [p.x, p.y]);
   }, [id, n]);
 
-  const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "persp" });
   await ready(s);
   await s.page.waitForTimeout(300);
   const [A, B, C, E] = await topOf(s, "BOARD");
@@ -580,7 +603,7 @@ for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
   })));
   check(Object.entries(hit).every(([k, v]) => k === v || /^S:/.test(v)), `the pointer on a part finds that part (${JSON.stringify(hit)})`);
   // from above: parallel, as it was
-  await s.page.locator("[data-view-btn='top']").click();
+  await pick(s, "top");
   await s.page.waitForTimeout(1000);
   const [a0, b0, c0, e0] = await topOf(s, "BOARD");
   check(len(a0, b0) === len(e0, c0) && len(a0, e0) === len(b0, c0) && a0[1] === b0[1] && a0[0] === e0[0], `from above: a square, no perspective (${len(a0, b0).toFixed(2)}, ${len(a0, e0).toFixed(2)})`);
@@ -590,27 +613,214 @@ for (const [v, stored] of [["iso", "iso"], ["top", "2d"]]) {
     return [m.a, m.b, m.c, m.d].map((v) => +v.toFixed(5));
   });
   check(silk[1] === 0 && silk[2] === 0 && silk[0] === silk[3], `from above: what is drawn in a plane has no slant (${silk})`);
-  await s.page.locator("[data-view-btn='iso']").click();
+  await pick(s, "persp");
   await s.page.waitForTimeout(1000);
-  // at 45 degrees a long slot has parts behind it that are nearer by its middle
+  // a long slot has parts behind it that are nearer by its middle
   const order = await s.page.evaluate(() => {
     const all = [...document.querySelectorAll(".bs-svg .bs-part")].map((e) => e.dataset.id);
     return { x5: all.indexOf("X5"), x46: all.indexOf("X46"), x54: all.indexOf("X54"), x48: all.indexOf("X48") };
   });
-  check(order.x5 < order.x46, `isometric: a fan connector behind a memory slot drawn before it (${order.x5}, ${order.x46})`);
-  // the name on the M.2 module reads from the top corner down, not upside down
+  check(order.x5 < order.x46, `perspective: a fan connector behind a memory slot drawn before it (${order.x5}, ${order.x46})`);
+  // the name on the M.2 module not upside down
   const m2 = await s.page.evaluate(() => {
     const t = [...document.querySelectorAll(".bs-part[data-id='X48'] text")].find((e) => e.textContent === "NT-512" && Number(e.closest("g[opacity]").getAttribute("opacity")) === 1);
     const m = t.getScreenCTM();
     return m.a;
   });
-  check(m2 > 0, `isometric: the name on the M.2 module not upside down (${m2.toFixed(2)})`);
+  check(m2 > 0, `perspective: the name on the M.2 module not upside down (${m2.toFixed(2)})`);
   await s.page.context().close();
 }
 
-// the callouts in the isometric view, in the sizes of a window: none cut, none on another, none on the board
-for (const [w, wh] of [[1000, 692], [1400, 800], [1920, 1080], [390, 844]]) {
-  const s = await open(clone(FIX), { width: w, height: wh, view: "iso" });
+// three views, three buttons; what was chosen comes back; nothing or something else stored: the perspective
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800 });
+  await ready(s);
+  const names = await s.page.locator("[data-view-btn]").allTextContents();
+  check(names.join() === "Изометрия,Перспектива,Сверху", `three buttons in their order (${names})`);
+  check((await viewOn(s)) === "persp", `nothing stored: the perspective (${await viewOn(s)})`);
+  const [a, b, c] = await cornersOf(s);
+  check(Math.abs(dist(a, b) / dist(c, (await cornersOf(s))[3]) - 0.87) < 0.005, "nothing stored: its numbers");
+  for (const [v, key] of [["iso", "iso"], ["top", "2d"], ["persp", "persp"]]) {
+    await pick(s, v);
+    await s.page.waitForTimeout(1000);
+    check((await stored(s)) === key, `${v}: remembered as ${key} (${await stored(s)})`);
+    await s.page.reload();
+    await ready(s);
+    check((await viewOn(s)) === v, `${key}: comes back as ${v} (${await viewOn(s)})`);
+    const q = await cornersOf(s);
+    const ratio = dist(q[0], q[1]) / dist(q[3], q[2]);
+    const want = { iso: 1, top: 1, persp: 0.87 }[v];
+    check(Math.abs(ratio - want) < 0.005, `${v}: after a reload far to near ${ratio.toFixed(4)}`);
+    const flat = Math.abs(q[0][1] - q[1][1]) < 0.01;
+    check(v === "top" ? flat : !flat, `${v}: after a reload ${v === "top" ? "the board square on" : "the board turned"} (${q[0][1].toFixed(2)}, ${q[1][1].toFixed(2)})`);
+    if (v === "iso") {
+      const d = (Math.abs(Math.atan2(q[1][1] - q[0][1], q[1][0] - q[0][0])) * 180) / Math.PI;
+      check(Math.abs(d - 30) < 0.2, `iso: after a reload the edges at 30 degrees (${d.toFixed(2)})`);
+    }
+    check((await stored(s)) === key, `${v}: still stored as ${key} after a reload (${await stored(s)})`);
+  }
+  await s.page.context().close();
+}
+for (const key of ["3d", "top"]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: key });
+  await ready(s);
+  check((await viewOn(s)) === "persp", `${key} stored, unknown: the perspective (${await viewOn(s)})`);
+  await s.page.context().close();
+}
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "2d" });
+  await ready(s);
+  const vb = await s.page.locator(".bs-svg").getAttribute("viewBox");
+  check(vb === "-330 -172.5 630 345", `2d stored: from above (${vb})`);
+  check((await viewOn(s)) === "top", `2d stored: its button on (${await viewOn(s)})`);
+  await s.page.context().close();
+}
+
+// no moving pictures asked for: the view changes at once
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800 });
+  await ready(s);
+  await s.page.emulateMedia({ reducedMotion: "reduce" });
+  await pick(s, "iso");
+  const q = await cornersOf(s);
+  check(Math.abs(dist(q[0], q[1]) / dist(q[3], q[2]) - 1) < 0.001, `reduced motion: the isometric view at once (${(dist(q[0], q[1]) / dist(q[3], q[2])).toFixed(4)})`);
+  await s.page.context().close();
+}
+// a browser that keeps nothing: the map works, the buttons too
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800, noStorage: true });
+  await ready(s);
+  check((await viewOn(s)) === "persp", `no storage: the perspective (${await viewOn(s)})`);
+  await pick(s, "iso");
+  check((await viewOn(s)) === "iso" && !s.errors.length, `no storage: a button still works (${await viewOn(s)}; ${s.errors.join(";").slice(0, 120)})`);
+  await s.page.context().close();
+}
+
+// the isometric view: a parallel projection, the three axes foreshortened alike
+{
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: "iso" });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const q = await cornersOf(s);
+  const [A, B, C, E] = q;
+  const edges = q.map((p, i) => dist(p, q[(i + 1) % 4]));
+  const mean = edges.reduce((t, v) => t + v, 0) / 4;
+  check(edges.every((v) => Math.abs(v - mean) / mean < 0.005), `isometric: the edges of the board of one length (${edges.map((v) => v.toFixed(2))})`);
+  const slope = q.map((p, i) => { const n = q[(i + 1) % 4]; const a = Math.abs((Math.atan2(n[1] - p[1], n[0] - p[0]) * 180) / Math.PI); return a > 90 ? 180 - a : a; });
+  check(slope.every((d) => Math.abs(d - 30) < 0.2), `isometric: the edges at 30 degrees (${slope.map((d) => d.toFixed(2))})`);
+  check(between(A, B, E, C) < 0.05 && between(B, C, A, E) < 0.05, `isometric: opposite edges parallel (${between(A, B, E, C).toFixed(3)}, ${between(B, C, A, E).toFixed(3)} degrees)`);
+  check(Math.abs(mean / 244 - 0.8165 * 1.25) < 0.005, `isometric: 0.8165 of a millimetre at the scale of 1.25 (${(mean / 244).toFixed(4)})`);
+  check(E[1] > A[1] && E[0] > A[0] && B[1] < A[1], `isometric: turned so the rear panel is seen (${[A, B, C, E].map((p) => p.map((v) => v.toFixed(0)))})`);
+  const r = await s.page.evaluate(() => {
+    const root = document.querySelector(".bs-svg").getScreenCTM().inverse();
+    // a plane of the rear panel: its first axis along the edge of the board, its second straight up
+    const pl = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X28'] g[transform^='matrix']")].find((g) => Math.abs(g.transform.baseVal[0].matrix.c) < 1e-5);
+    if (!pl) return null;
+    const m = root.multiply(pl.getScreenCTM());
+    return { along: Math.hypot(m.a, m.b), up: Math.hypot(m.c, m.d) };
+  });
+  const mm = mean / 244;
+  check(r && Math.abs(r.up - mm) / mm < 0.005, `isometric: a millimetre up as long as one along the board (${r && r.up.toFixed(4)}, ${mm.toFixed(4)})`);
+  check(r && Math.abs(r.along - mm) / mm < 0.005, `isometric: a millimetre along the rear panel the same (${r && r.along.toFixed(4)})`);
+  const order = await s.page.evaluate(() => {
+    const all = [...document.querySelectorAll(".bs-svg .bs-part")].map((e) => e.dataset.id);
+    return { x5: all.indexOf("X5"), x46: all.indexOf("X46") };
+  });
+  check(order.x5 < order.x46, `isometric: a fan connector behind a memory slot drawn before it (${order.x5}, ${order.x46})`);
+  const m2 = await s.page.evaluate(() => {
+    const t = [...document.querySelectorAll(".bs-part[data-id='X48'] text")].find((e) => e.textContent === "NT-512" && Number(e.closest("g[opacity]").getAttribute("opacity")) === 1);
+    return t.getScreenCTM().a;
+  });
+  check(m2 > 0, `isometric: the name on the M.2 module not upside down (${m2.toFixed(2)})`);
+  const bad = await s.page.evaluate(() => {
+    const f = [...document.querySelectorAll(".bs-svg .bs-part[data-id='KPI'] polygon")].slice(3).map((e) => e.getBoundingClientRect());
+    const a = [];
+    for (let i = 0; i + 2 < f.length; i += 3) a.push({ left: Math.min(f[i].left, f[i + 1].left, f[i + 2].left), right: Math.max(f[i].right, f[i + 1].right, f[i + 2].right), bottom: Math.max(f[i].bottom, f[i + 1].bottom, f[i + 2].bottom) });
+    let n = 0;
+    for (let i = 0; i < a.length; i++) for (let j = i + 1; j < a.length; j++) {
+      if (Math.min(a[i].right, a[j].right) - Math.max(a[i].left, a[j].left) > 2 && a[i].bottom > a[j].bottom + 2) n++;
+    }
+    return { n, of: a.length };
+  });
+  check(bad.of === 36 && bad.n === 0, `isometric: the heatsink, no far pin over a near one (${bad.n}, ${bad.of} pins)`);
+  await s.page.context().close();
+}
+
+// what the pointer finds is the part drawn there, in each view
+for (const key of ["persp", "iso", "2d"]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: key });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const hit = await s.page.evaluate(() => Object.fromEntries(["X46", "X45", "CPU", "KPI", "X31", "X28", "X15"].map((id) => {
+    const e = document.querySelectorAll(`.bs-svg .bs-part[data-id='${id}'] polygon`)[2];
+    const m = e.getScreenCTM();
+    const q = [...e.points].map((p) => [m.a * p.x + m.c * p.y + m.e, m.b * p.x + m.d * p.y + m.f]);
+    const f = document.elementFromPoint(q.reduce((t, p) => t + p[0], 0) / q.length, q.reduce((t, p) => t + p[1], 0) / q.length);
+    return [id, f && f.closest(".bs-part") && f.closest(".bs-part").dataset.id];
+  })));
+  check(Object.entries(hit).every(([k, v]) => k === v || /^S:/.test(v)), `${key}: the pointer on a part finds that part (${JSON.stringify(hit)})`);
+  await s.page.context().close();
+}
+
+// on the way from a view to a view: a camera between the two, what lies in a plane stays on what it lies on
+for (const [from, to, a0, a1] of [["persp", "iso", 0.87, 1], ["iso", "persp", 0.87, 1], ["iso", "top", 0.9999, 1.0001], ["top", "persp", 0.87, 1]]) {
+  const s = await open(clone(FIX), { width: 1400, height: 800, view: from === "top" ? "2d" : from });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  await s.page.evaluate(() => {
+    window.__f = [];
+    const root = document.querySelector(".bs-svg").getScreenCTM().inverse();
+    const seen = () => {
+      const pl = [...document.querySelectorAll(".bs-svg .bs-part[data-id='BOARD'] polygon")].filter((p) => !p.getAttribute("filter"))[2];
+      const q = [...pl.points].map((p) => [p.x, p.y]);
+      const box = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X46'] polygon")][2];
+      const b = [...box.points].map((p) => [p.x, p.y]);
+      const fr = [...document.querySelectorAll(".bs-svg .bs-part[data-id='X46'] path")].filter((e) => /^M/.test(e.getAttribute("d")) && getComputedStyle(e).display !== "none").sort((x, y) => y.getTotalLength() - x.getTotalLength())[0];
+      let off = 0;
+      if (fr) {
+        const m = document.querySelector(".bs-svg").getScreenCTM().inverse().multiply(fr.getScreenCTM());
+        const [x, y] = fr.getAttribute("d").match(/^M\s*(-?[\d.]+)[ ,]+(-?[\d.]+)/).slice(1).map(Number);
+        const p = [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f];
+        off = Math.abs((b[1][0] - b[0][0]) * (p[1] - b[0][1]) - (b[1][1] - b[0][1]) * (p[0] - b[0][0])) / Math.hypot(b[1][0] - b[0][0], b[1][1] - b[0][1]);
+      }
+      window.__f.push({ far: Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]), near: Math.hypot(q[2][0] - q[3][0], q[2][1] - q[3][1]), off, y0: q[0][1] });
+      if (window.__f.length < 400 && !window.__stop) requestAnimationFrame(seen);
+    };
+    void root;
+    requestAnimationFrame(seen);
+  });
+  await pick(s, to);
+  await s.page.waitForTimeout(1200);
+  const f = await s.page.evaluate(() => { window.__stop = 1; return window.__f; });
+  const ratios = f.map((x) => x.far / x.near);
+  const start = ratios[0], end = ratios[ratios.length - 1];
+  const inner = ratios.filter((r) => r > Math.min(start, end) + 1e-3 && r < Math.max(start, end) - 1e-3);
+  const y0s = new Set(f.map((x) => x.y0.toFixed(1)));
+  check(from === "iso" && to === "top" ? y0s.size > 3 : inner.length > 0, `${from} to ${to}: frames between the two (${f.length} frames, ${inner.length} of them between, far to near ${start.toFixed(3)} to ${end.toFixed(3)})`);
+  check(ratios.every((r) => r >= a0 - 0.002 && r <= a1 + 0.002), `${from} to ${to}: far to near stays in its range (${Math.min(...ratios).toFixed(4)}, ${Math.max(...ratios).toFixed(4)})`);
+  const off = Math.max(...f.map((x) => x.off));
+  check(off < 0.3, `${from} to ${to}: the frame of a long slot on its box in each of the frames (${off.toFixed(3)})`);
+  check(!s.errors.length, `${from} to ${to}: no errors (${s.errors.join(";").slice(0, 120)})`);
+  await s.page.context().close();
+}
+
+// the buttons on a phone: all of them there, nothing sideways
+{
+  const s = await open(clone(FIX), { width: 390, height: 844 });
+  await ready(s);
+  await s.page.waitForTimeout(300);
+  const r = await s.page.evaluate(() => ({
+    sw: document.documentElement.scrollWidth,
+    b: [...document.querySelectorAll("[data-view-btn], [data-zoom]")].map((e) => { const q = e.getBoundingClientRect(); return [q.left, q.right]; }),
+  }));
+  check(r.b.length === 6 && r.b.every(([a, z]) => a >= 0 && z <= 390), `a phone: zoom and the three views in the width (${r.b.length}, right ${Math.round(Math.max(...r.b.map((x) => x[1])))})`);
+  check(r.sw <= 390, `a phone: no sideways scroll with them (${r.sw})`);
+  await s.page.context().close();
+}
+
+// the callouts in each view from the side, in the sizes of a window: none cut, none on another, none on the board
+for (const view of ["persp", "iso"]) for (const [w, wh] of [[1000, 692], [1400, 800], [1920, 1080], [390, 844]]) {
+  const s = await open(clone(FIX), { width: w, height: wh, view });
   await ready(s);
   await s.page.waitForTimeout(300);
   const r = await s.page.evaluate(() => {
@@ -634,16 +844,37 @@ for (const [w, wh] of [[1000, 692], [1400, 800], [1920, 1080], [390, 844]]) {
     const xs = pl.map((p) => p[0]), ys = pl.map((p) => p[1]);
     return { cut, over, onBoard, fill: [Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys)), Math.round(st.width), Math.round(st.height)] };
   });
-  check(!r.cut.length, `${w}x${wh}: no callout cut by the stage (${r.cut})`);
-  check(!r.over.length, `${w}x${wh}: no callout on another (${r.over})`);
-  check(!r.onBoard.length, `${w}x${wh}: no callout on the board (${r.onBoard})`);
-  check(r.fill[0] > r.fill[2] * 0.45 || r.fill[1] > r.fill[3] * 0.8, `${w}x${wh}: the board fills the stage (${r.fill})`);
+  check(!r.cut.length, `${view} ${w}x${wh}: no callout cut by the stage (${r.cut})`);
+  check(!r.over.length, `${view} ${w}x${wh}: no callout on another (${r.over})`);
+  check(!r.onBoard.length, `${view} ${w}x${wh}: no callout on the board (${r.onBoard})`);
+  check(r.fill[0] > r.fill[2] * 0.45 || r.fill[1] > r.fill[3] * 0.8, `${view} ${w}x${wh}: the board fills the stage (${r.fill})`);
   await s.page.context().close();
+}
+
+// a switch: the callouts stand where this view wants them, as if it had been open from the start
+for (const [w, wh] of [[1000, 692], [1400, 800]]) {
+  const where = (s) => s.page.evaluate(() => [...document.querySelectorAll(".bs-svg text.bs-lbl, .bs-svg rect.bs-pill")].map((e) => [e.closest(".bs-part").dataset.id, Number(e.getAttribute("x")) || 0, Number(e.getAttribute("y")) || 0]));
+  for (const [from, to] of [["persp", "iso"], ["iso", "persp"]]) {
+    const a = await open(clone(FIX), { width: w, height: wh, view: to });
+    await ready(a);
+    await a.page.waitForTimeout(300);
+    const want = await where(a);
+    await a.page.context().close();
+    const s = await open(clone(FIX), { width: w, height: wh, view: from });
+    await ready(s);
+    await s.page.waitForTimeout(300);
+    await pick(s, to);
+    await s.page.waitForTimeout(1200);
+    const got = await where(s);
+    const worst = Math.max(...got.map((p, i) => Math.hypot(p[1] - want[i][1], p[2] - want[i][2])));
+    check(got.length === want.length && worst < 0.1, `${w}x${wh}, ${from} to ${to}: the callouts as this view lays them out (worst ${worst.toFixed(2)})`);
+    await s.page.context().close();
+  }
 }
 
 // zoom by the buttons
 {
-  const s = await open(clone(FIX), { width: 1300, height: 800, view: "iso" });
+  const s = await open(clone(FIX), { width: 1300, height: 800, view: "persp" });
   await ready(s);
   const vb = () => s.page.evaluate(() => document.querySelector(".bs-svg").getAttribute("viewBox").split(" ").map(Number));
   const btn = (n) => s.page.locator(`[data-zoom='${n}']`);
@@ -679,7 +910,20 @@ for (const [w, wh] of [[1000, 692], [1400, 800], [1920, 1080], [390, 844]]) {
   const far = await vb();
   check(far[0] + far[2] <= v0[0] + v0[2] + 0.1, "zoom: the view stops at the edge");
   // the view switched and the scene built again keep it
-  await s.page.locator("[data-view-btn='top']").click();
+  // between the two views from the side the same place is kept, the height of what is shown is one
+  const v3d = await vb();
+  await pick(s, "iso");
+  await s.page.waitForTimeout(900);
+  const vi = await vb();
+  check(v3d.join() === vi.join(), `zoom: perspective to isometric keeps the place (${v3d}; ${vi})`);
+  const before2 = await vb();
+  await s.page.mouse.move(cx, cy);
+  await s.page.mouse.down();
+  await s.page.mouse.move(cx + 80, cy + 40, { steps: 4 });
+  await s.page.mouse.up();
+  check((await vb())[0] < before2[0], `zoom: a drag works in the isometric view too (${before2[0]} -> ${(await vb())[0]})`);
+  await s.page.mouse.move(2, 2);
+  await pick(s, "top");
   await s.page.waitForTimeout(900);
   check((await btn("reset").textContent()).trim() === "150 %", "zoom: stays through the switch of the view");
   s.fix = clone(s.fix);

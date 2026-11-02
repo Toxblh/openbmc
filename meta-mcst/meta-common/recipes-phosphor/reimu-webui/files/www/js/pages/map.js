@@ -14,13 +14,15 @@ const AGENT_OLD = "Этот агент не сообщает об этом: ег
 const NO_AGENT = "Агент хоста не подключён, данных нет.";
 
 let root, timer, board, fanText, stage, summary, stateBox, scene, model, shape, id;
-let view = "iso";
+let view = "persp";
 
+// nothing stored or anything else: the perspective
 function loadView() {
   try {
-    return localStorage.getItem(VIEW_KEY) === "2d" ? "top" : "iso";
+    const v = localStorage.getItem(VIEW_KEY);
+    return v === "2d" ? "top" : v === "iso" ? "iso" : "persp";
   } catch (e) {
-    return "iso";
+    return "persp";
   }
 }
 
@@ -50,7 +52,7 @@ function setView(v) {
   view = v;
   root.querySelectorAll("[data-view-btn]").forEach((b) => b.classList.toggle("primary", b.dataset.viewBtn === v));
   try {
-    localStorage.setItem(VIEW_KEY, v === "top" ? "2d" : "iso");
+    localStorage.setItem(VIEW_KEY, v === "top" ? "2d" : v);
   } catch (e) {
     /* a remembered view is only a convenience */
   }
@@ -98,7 +100,7 @@ export async function mount(el) {
   stateBox = h("div", { id: "map-state" });
   summary = h("div", { class: "grid bs-sum", id: "map-summary" });
   el.append(
-    h("div", { class: "row section" }, h("h3", { class: "bs-title" }, `Карта платы ${board.name}`), h("span", { class: "spacer" }), zb("out", -1, "−", "Уменьшить"), zb("reset", 0, "100 %", "Вся плата"), zb("in", 1, "+", "Увеличить"), seg("iso", "Изометрия"), seg("top", "Сверху")),
+    h("div", { class: "row section" }, h("h3", { class: "bs-title" }, `Карта платы ${board.name}`), h("span", { class: "spacer" }), zb("out", -1, "−", "Уменьшить"), zb("reset", 0, "100 %", "Вся плата"), zb("in", 1, "+", "Увеличить"), seg("iso", "Изометрия"), seg("persp", "Перспектива"), seg("top", "Сверху")),
     stateBox,
     h("div", { class: "card bs-board" }, stage),
     summary,
