@@ -121,6 +121,6 @@ vm("mv /tmp/bmcweb.good /tmp/reimu-webdev/bin/bmcweb");
 
 // ---- leave the VM as it was ----
 vm("umount /usr/bin/bmcweb; umount /usr/share/www; umount /tmp/reimu-webdev; systemctl stop bmcweb.service; systemctl restart bmcweb.socket");
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

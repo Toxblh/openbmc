@@ -103,7 +103,7 @@ for (const [w, h] of SIZES) {
     await ctx.close();
   }
 }
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 fs.rmSync(W, { recursive: true, force: true });
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

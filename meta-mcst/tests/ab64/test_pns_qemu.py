@@ -161,7 +161,7 @@ class PnsBmc(T.Bmc):
             ["qemu-system-arm", "-M", "ast2500-evb,fmc-model=mx66l51235f,spi-model=n25q512ax3", "-m", "512",
              "-nographic", "-drive", "file=%s,if=mtd,format=raw,index=0" % self.img,
              "-drive", "file=%s,if=mtd,format=raw,index=1" % self.pns,
-             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (T.SSH, T.HTTPS),
+             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (T.SSH, T.webfwd.inner(T.HTTPS)),
              "-net", "nic,netdev=n0,macaddr=98:a7:b0:00:00:01",
              "-qmp", "unix:%s/%s.qmp,server,nowait" % (T.RQ, self.name),
              "-qmp", "unix:%s/%s.qmp2,server,nowait" % (T.RQ, self.name),
@@ -673,7 +673,13 @@ def e2e(b, new):
     shutil.copyfile(NEW, put_local)
     env = dict(os.environ, BASE="https://127.0.0.1:%d" % T.HTTPS, PNS_IMAGE=put_local, OUT=os.path.join(W, "shots"))
     # the page while the platform is on, then off: the write
-    r = subprocess.run(["node", d, "on"], env=env, capture_output=True, text=True, timeout=600)
+    try:
+        r = subprocess.run(["node", d, "on"], env=env, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired as e:
+        # what it had said before it hung: without this the log has only the timeout
+        out = e.stdout or b""
+        print("    HUNG, said so far: " + (out.decode(errors="replace") if isinstance(out, bytes) else out).strip().replace("\n", "\n    "))
+        raise
     print("    " + (r.stdout + r.stderr).strip().replace("\n", "\n    "))
     check(r.returncode == 0, "browser: the PNS card while the platform is on")
     b.power(False)
@@ -762,6 +768,12 @@ def chip_to(b, kind, orig, bad):
         ok = rc == 0 and (c == orig if kind == "orig" else c[:len(bad["other-board"])] == bad["other-board"])
     if not ok:
         print("    chip -> %s: rc %d %s" % (kind, rc, o[-300:]))
+        if "не найден" in o:
+            # a file the test put there is gone (seen once in a while): what
+            # /tmp/sc holds, since when the BMC is up, what touched files
+            _, d = b.sh("cat /proc/uptime; { ls -la --full-time %s /tmp/reimu-pns 2>/dev/null || ls -lae %s /tmp/reimu-pns; }; df -k /tmp; "
+                        "journalctl -b --no-pager -o short-monotonic | grep -iE 'tmpfiles|oom|/tmp/sc|reimu-pns-flash' | tail -40" % (SC, SC))
+            print("    " + d.replace("\n", "\n    "))
     return ok
 
 

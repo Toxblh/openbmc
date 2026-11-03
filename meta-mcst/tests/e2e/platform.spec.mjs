@@ -102,6 +102,6 @@ await page.waitForSelector("#ov-grid .kv");
 await page.screenshot({ path: `${OUT}/01-overview.png` });
 
 check(errors.length === 0, `no JS errors (${errors.join(" | ")})`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

@@ -59,4 +59,5 @@ const res = await page.evaluate(async (pngB64) => {
   return { jpegBytes: jpeg.length, stock: await stock(), accel: await accel() };
 }, png);
 console.log(JSON.stringify(res, null, 1));
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
+process.exit(0);

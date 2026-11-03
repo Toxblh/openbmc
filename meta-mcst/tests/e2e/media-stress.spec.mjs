@@ -151,6 +151,6 @@ await page.locator(".slot").nth(0).locator('button:has-text("Отключить"
 await waitVm(findDisk, (o) => !/^sd/m.test(o), 30000);
 
 await b2.close();
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

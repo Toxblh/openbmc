@@ -120,6 +120,6 @@ await settings();
 t = await card();
 check(t.includes("основной чип") && t.includes("REIMU 5564 2.1.0") && !t.includes("ожидает"), "back on the primary chip with 2.1.0");
 check(errors.length === 0, `no page errors (${errors.join("; ")})`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

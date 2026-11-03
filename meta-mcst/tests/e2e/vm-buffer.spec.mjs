@@ -33,4 +33,5 @@ console.log("dd:", out.split("\n").slice(0, 8).join(" | "));
 console.log("bmcweb pid before/after:", pid0, pid1);
 console.log("journal:", log || "(nothing)");
 console.log(pid0 === pid1 && !/terminate|length_error/.test(log) && !/error/i.test(out) ? "RESULT: survived" : "RESULT: FAILED (crash or I/O errors)");
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
+process.exit(0);

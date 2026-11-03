@@ -114,6 +114,6 @@ await page.waitForFunction(() => document.querySelector("#kvm-state")?.textConte
 check(true, "reconnect reuses the session's VNC password (no prompt)");
 
 check(errors.length === 0, `no JS errors (${errors.join(" | ")})`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

@@ -72,5 +72,5 @@ try {
   await page.screenshot({ path: `${OUT}/host-fail.png` }).catch(() => {});
 }
 check(errors.length === 0, `no page errors ${JSON.stringify(errors)}`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 process.exit(failed ? 1 : 0);

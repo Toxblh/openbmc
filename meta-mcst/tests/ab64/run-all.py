@@ -140,8 +140,11 @@ def main():
     ap.add_argument("--no-fetch", action="store_true", help="reuse the image in runs/image")
     a = ap.parse_args()
 
-    try:      # the installers call it; a hung mount here would look like a hang of theirs
-        subprocess.run(["sync"], timeout=20)
+    # the installers call it; a hung mount here would look like a hang of
+    # theirs. A sync stuck in the kernel can't be killed (nor waited for): left
+    sync = subprocess.Popen(["sync"])
+    try:
+        sync.wait(timeout=20)
     except subprocess.TimeoutExpired:
         print("WARNING: sync doesn't end on this machine (a hung network mount?)", flush=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -174,6 +177,10 @@ def main():
                                  "node", os.path.join(e2e, "ota.stub.mjs")]))
     jobs.append(Job("map", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                             "node", os.path.join(e2e, "map.stub.mjs")]))
+    jobs.append(Job("login_page", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                   "node", os.path.join(e2e, "login.stub.mjs")]))
+    jobs.append(Job("kvm_h264", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                 "node", os.path.join(e2e, "kvm-h264.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

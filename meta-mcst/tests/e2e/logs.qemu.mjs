@@ -78,6 +78,6 @@ async function open(user, pass, viewport) {
   check(true, "an Operator is refused the archive");
   await ctx.close();
 }
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(`${failed} failed`);
 process.exit(failed ? 1 : 0);

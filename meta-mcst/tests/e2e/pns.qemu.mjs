@@ -76,6 +76,6 @@ if (mode === "on") {
   check(/Запись флеша: готово/.test(t) && /Версия ПНС release-2\.30\.13\.1-E8C2/.test(t), `backup written back: ${t.slice(0, 200)}`);
 }
 check(errors.length === 0, `no JS errors ${errors.slice(0, 3).join(" | ")}`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `${failed} FAILED` : "ALL PASSED");
 process.exit(failed ? 1 : 0);

@@ -121,6 +121,6 @@ for (const [what, o] of [
   await s.page.context().close();
 }
 
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log("RESULT:", failed ? `FAILED ${failed}` : "ALL PASSED");
 process.exit(failed ? 1 : 0);

@@ -43,5 +43,5 @@ await slot0.locator(`button:has-text("Отключить")`).click({ timeout: 10
 let gone = "";
 for (let i = 0; i < 30 && gone !== "gone|0"; i++) { await page.waitForTimeout(1000); gone = vm("(cat /sys/kernel/config/usb_gadget/mass-storage0/UDC 2>/dev/null || echo gone); echo \"|$(pgrep nbd-proxy | wc -l)\"").replace(/\n/g, ""); }
 check(gone === "gone|0", `gadget removed and nbd-proxy exited after disconnect (${gone})`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `${failed} FAILED` : "ALL PASSED"); process.exit(failed ? 1 : 0);

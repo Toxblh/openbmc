@@ -114,6 +114,6 @@ async function open(running, { answer = true, otaStart = null, checkReply = null
   await s.page.getByText("Проверка не удалась: нет соединения").waitFor();
   check(true, "a failed check says why");
 }
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(`${failed} failed`);
 process.exit(failed ? 1 : 0);

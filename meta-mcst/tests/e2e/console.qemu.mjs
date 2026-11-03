@@ -147,7 +147,7 @@ if (PORTS > 1) {
 }
 
 check(errors.length === 0, `no JS errors (${errors.join(" | ")})`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 com1.end();
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

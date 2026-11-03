@@ -29,5 +29,5 @@ for (const p of process.argv.slice(2).length ? process.argv.slice(2) : ["overvie
   const text = (await page.locator("main, #app, body").first().innerText()).replace(/\s+/g, " ").slice(0, 160);
   check(errors.length === 0, `${p}: no JS errors${errors.length ? " — " + errors.slice(0, 3).join(" | ") : ""}${failedReq.length ? "; HTTP: " + failedReq.slice(0, 4).join(", ") : ""} :: ${text}`);
 }
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(failed ? `${failed} FAILED` : "ALL PASSED"); process.exit(failed ? 1 : 0);

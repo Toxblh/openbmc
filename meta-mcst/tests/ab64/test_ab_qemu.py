@@ -73,6 +73,8 @@ SSH, HTTPS = int(os.environ.get("AB_SSH", 2422)), int(os.environ.get("AB_HTTPS",
 IPMI = int(os.environ.get("AB_IPMI", 0))
 NETDEV_EXTRA = os.environ.get("AB_NETDEV_EXTRA", "")
 failed = []
+sys.path.insert(0, HERE)
+import webfwd  # noqa: E402  (the web port with a real backlog: QEMU's resets a few connections at once)
 
 
 def check(cond, what):
@@ -141,7 +143,7 @@ class Bmc:
         self.p = subprocess.Popen(
             ["qemu-system-arm", "-M", "ast2500-evb,fmc-model=mx66l51235f", "-m", "512",
              "-nographic", "-drive", "file=%s,if=mtd,format=raw" % self.img,
-             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, HTTPS)
+             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, webfwd.inner(HTTPS))
              + (",hostfwd=udp:127.0.0.1:%d-:623" % IPMI if IPMI else "") + NETDEV_EXTRA,
              "-net", "nic,netdev=n0,macaddr=98:a7:b0:00:00:01",
              "-qmp", "unix:%s/%s.qmp,server,nowait" % (RQ, self.name),
@@ -205,7 +207,7 @@ class Bmc:
             f.flush()
             return f.readline()
         f.write('{"execute": "qmp_capabilities"}\n'); f.flush(); f.readline()
-        for host, guest in ((SSH, 22), (HTTPS, 443)):
+        for host, guest in ((SSH, 22), (webfwd.inner(HTTPS), 443)):
             hmp("hostfwd_remove n0 tcp:127.0.0.1:%d" % host)
             hmp("hostfwd_add n0 tcp:127.0.0.1:%d-%s:%d" % (host, ip, guest))
         if IPMI:
@@ -364,6 +366,37 @@ def t_memory():
         b.stop()
 
 
+def web_burst(n, path="/img/favicon.svg"):
+    """N new TLS connections at once, each a GET: the status of each, or the error"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    res, go = [None] * n, threading.Event()
+
+    def one(i):
+        go.wait()
+        try:
+            with socket.create_connection(("127.0.0.1", HTTPS), timeout=60) as raw:
+                with ctx.wrap_socket(raw) as c:
+                    c.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % path).encode())
+                    head = b""
+                    while b"\r\n" not in head:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        head += d
+                    m = re.match(rb"HTTP/1\.1 (\d+)", head)
+                    res[i] = int(m.group(1)) if m else "no answer"
+        except Exception as e:
+            res[i] = type(e).__name__
+    ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    go.set()
+    for t in ts:
+        t.join(120)
+    return res
+
+
 def t_regress():
     b = Bmc("regress", fresh("regress")).start()
     try:
@@ -385,6 +418,12 @@ def t_regress():
                 break
             time.sleep(2)
         check(ok, "reimu-kvm starts once bmcweb made its certificate")
+        # the web port as the browser on the board sees it: QEMU's hostfwd reset
+        # a few connections at once (a page whose app.js came as
+        # ERR_CONNECTION_RESET stayed empty, no login form); webfwd.py
+        res = web_burst(40)
+        bad = [r for r in res if r != 200]
+        check(not bad, "40 connections at once: every one answered (%d failed: %s)" % (len(bad), sorted(set(map(str, bad)))[:4]))
         f = b.out("systemctl --failed --no-legend --plain | cut -d' ' -f1").split()
         expected = {"mcst-fruid.service"}  # QEMU has no FRU EEPROM
         check(set(f) <= expected, "failed units %s (QEMU: only %s)" % (f, sorted(expected)))

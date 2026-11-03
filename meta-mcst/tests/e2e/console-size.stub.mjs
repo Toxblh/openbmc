@@ -335,7 +335,7 @@ if (pyte && has("vim")) {
   }
 } else console.log("SKIP real vim: PY with pyte or vim missing");
 
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 fs.rmSync(W, { recursive: true, force: true });
 console.log(failed ? `RESULT: ${failed} FAILED` : "RESULT: ALL PASSED");
 process.exit(failed ? 1 : 0);

@@ -32,12 +32,13 @@ export async function loginReady(page, timeout = 30000) {
       for (const r of t.list) console.log(`    ${String(r.start).padStart(7)} .. ${String(r.head ?? "-").padStart(7)} .. ${String(r.end ?? "NO END").padStart(7)} ${r.status ?? "-"} ${r.error ?? ""} ${r.url}`);
       console.log(`    no answer yet: ${t.list.filter((r) => r.end === undefined).map((r) => r.url).join(" ") || "none"}`);
     }
-    const state = await page.evaluate(() => ({
+    // no timeout of its own: a page that does not run its scripts would hang here for ever
+    const state = await Promise.race([new Promise((_, no) => setTimeout(() => no(new Error("the page does not run scripts: 20 s")), 20000)), page.evaluate(() => ({
       ready: document.readyState, url: location.href,
       login: document.getElementById("login") && document.getElementById("login").className,
       app: document.getElementById("app") && document.getElementById("app").className,
       cookie: document.cookie.replace(/=[^;]*/g, "=*"), xterm: typeof window.Terminal,
-    })).catch((x) => `evaluate failed: ${x.message}`);
+    }))]).catch((x) => `evaluate failed: ${x.message}`);
     console.log(`    page: ${JSON.stringify(state)}`);
     const s0 = Date.now();
     const again = await page.request.get(new URL("/js/app.js", page.url()).href, { timeout: 30000 }).then((r) => `${r.status()}`).catch((x) => `failed: ${x.message.split("\n")[0]}`);
