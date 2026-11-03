@@ -310,7 +310,7 @@ export default {
   ],
   // the cloud of a graphics card's temperature, by its slot's place
   gpuCloud: (slotId) => ({ X31: [40, 166.5], X30: [40, 187.5], X32: [40, 227.5] })[slotId],
-  // Рисунок 9: GE0 -> X14, GE1 -> X15. PCI-функция -> GE: по порядку, кабелем не проверено
+  // Рисунок 9: GE0 -> X14, GE1 -> X15. PCI-функция -> GE по порядку; проверено кабелем на плате (2026-11-03: enp1s1f1 в X15)
   nics: { "0000:01:01.0": "X14", "0000:01:01.1": "X15", enp1s1f0: "X14", enp1s1f1: "X15" },
   // AHCI numbers its ports over both controllers: ataN = SATA N-1 (рисунок 9); checked on one: M.2 at ata4
   ata: (n) => n - 1,

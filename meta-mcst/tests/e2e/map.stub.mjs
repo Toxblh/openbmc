@@ -35,7 +35,8 @@ async function open(fix, { width = 1300, height = 900, view, led = { Asserted: f
   const j = (v) => ({ contentType: "application/json", body: JSON.stringify({ data: { Json: JSON.stringify(v) } }) });
   await page.route(`${ORIGIN}/**`, async (route) => {
     const p = new URL(route.request().url()).pathname;
-    s.requests = (s.requests || 0) + (p === `${P}/sensors` ? 1 : 0);
+    s.requests = (s.requests || 0) + (p === `${P}/sensors` || p === `${P}/view/live` ? 1 : 0);
+    if (p === `${P}/view/live`) (s.cycles = s.cycles || []).push(Date.now());
     if (block && block.test(p)) return route.fulfill({ status: 404, body: "" });
     // the live answers of a slow BMC, how many at a time, how many cycles
     if (slow && (p === LED || p.startsWith(`${P}/`) || p.endsWith("/EthernetInterfaces/eth0"))) {
@@ -50,6 +51,17 @@ async function open(fix, { width = 1300, height = 900, view, led = { Asserted: f
     if (p === LED) return led ? route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: led }) }) : route.fulfill({ status: 404, body: "" });
     const f2 = s.fix;
     const dbus = { [`${P}/pns`]: f2.pns, [`${P}/sensors`]: f2.sensors, [`${P}/fans`]: f2.fans, [`${P}/hostlink`]: f2.host };
+    // the view: what the BMC would answer, from the same fixture (a part
+    // missing or blocked is not in it)
+    const there = (q) => !(block && block.test(q));
+    const obj = (q) => (dbus[q] && there(q) ? { [q]: { Json: JSON.stringify(dbus[q]) } } : {});
+    if (p === `${P}/view/live`)
+      return route.fulfill(j({ version: 1, now: 0, power: "On", static: "h1", sensors: {},
+        objects: { ...obj(`${P}/sensors`), ...obj(`${P}/fans`), ...obj(`${P}/hostlink`), ...(led && there(LED) ? { [LED]: led } : {}) },
+        ...(f2.eth && there("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0") ? { eth0: f2.eth } : {}) }));
+    if (p === `${P}/view/static`) return route.fulfill(j({ version: 1, hash: "h1", objects: obj(`${P}/pns`), bmc: null,
+      // (the memory of the Systems/system above: 125 GiB)
+      inventory: { "/xyz/openbmc_project/inventory/system/chassis/motherboard/dimm0": { "xyz.openbmc_project.Inventory.Item.Dimm": { MemorySizeInKB: 125 * 1024 * 1024 } } } }));
     if (p in dbus) return dbus[p] ? route.fulfill(j(dbus[p])) : route.fulfill({ status: 404, body: "" });
     if (p.endsWith("/EthernetInterfaces/eth0")) return f2.eth ? route.fulfill({ contentType: "application/json", body: JSON.stringify(f2.eth) }) : route.fulfill({ status: 404, body: "" });
     const f = path.join(WWW, p);
@@ -156,9 +168,13 @@ async function shot(s, name) { if (SHOTS) { await s.page.waitForTimeout(1000); a
   const usbp = await pop(s, "X4");
   check(!(await s.page.locator("#sv, svg").first().innerHTML()).includes("…"), "no name cut with an ellipsis");
   check(/USB нижний[\s\S]*Ultra Fit/.test(usbp), `USB by port number (${usbp.replace(/\n/g, " ").slice(0, 140)})`);
+  // the rows as the ports stand: the upper one first
+  check(usbp.indexOf("USB верхний") >= 0 && usbp.indexOf("USB верхний") < usbp.indexOf("USB нижний"), "X4: the upper USB row above the lower one");
   // the BMC's load
   check(/LA 0\.42/.test(await s.page.locator(".bs-part[data-id=BMC]").last().textContent()), "the BMC's load average in a cloud at its chip");
   check(/0\.42 \/ 0\.30 \/ 0\.25/.test(await pop(s, "BMC")), "all three in its popover");
+  // X14, X15 checked with a cable on the board: no word of a guess
+  check(!/кабелем не проверено/.test(await pop(s, "X15")), "X15: no 'not checked with a cable' note");
   // fans, UID
   check(/1\d{3} об\/мин|\d+ об\/мин/.test(text) && /\d+ %/.test(text), "fans: speed and percent in clouds");
   check((await s.page.locator(".bs-part[data-id='X5']").getAttribute("opacity")) === "0.35", "a fan not connected is dim");
@@ -992,7 +1008,10 @@ for (const [w, wh] of [[1000, 692], [1400, 800]]) {
   await ready(s);
   await s.page.waitForTimeout(13000);
   check(s.peak === 1, `one live request at a time on a slow BMC (peak ${s.peak})`);
-  check(s.requests === 2, `the next cycle waits for the one before and the period (${s.requests} cycles in 19 s)`);
+  // (one request a cycle with the view: a cycle starts its period after the
+  // answer of the one before, so starts are apart by the answer and the period)
+  const gaps = (s.cycles || []).slice(1).map((t, i) => t - s.cycles[i]);
+  check(gaps.length >= 1 && gaps.every((g) => g >= 5000 + 1200 - 300), `the next cycle waits for the one before and the period (starts apart ${gaps.join(", ")} ms)`);
   await s.page.context().close();
 }
 
@@ -1008,6 +1027,6 @@ for (const [w, wh] of [[1000, 692], [1400, 800]]) {
   await s.page.context().close();
 }
 
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log(`${failed} failed`);
 process.exit(failed ? 1 : 0);

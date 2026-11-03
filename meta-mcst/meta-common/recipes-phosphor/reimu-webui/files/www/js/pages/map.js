@@ -82,6 +82,7 @@ export async function mount(el) {
   root = el;
   scene = null;
   shape = null;
+  api.prefetch(...SOURCES);
   id = await identify();
   const known = BOARDS.find((b) => [id.name, id.fru, id.part].some((s) => s && b.re.test(s)));
   if (root !== el) return false;
@@ -288,12 +289,14 @@ function shapeOf(m) {
 }
 
 // ------------------------------------------------------------------ the page
+const SOURCES = [`${P}/sensors`, `${P}/fans`, `${P}/hostlink`, "/redfish/v1/Managers/bmc/EthernetInterfaces/eth0", "/xyz/openbmc_project/led/groups/enclosure_identify"];
+
 async function refresh() {
-  const sensors = await json(`${P}/sensors`);
-  const fans = await json(`${P}/fans`);
-  const host = await json(`${P}/hostlink`);
-  const eth = await api.get("/redfish/v1/Managers/bmc/EthernetInterfaces/eth0").catch(() => null);
-  const led = await api.get("/xyz/openbmc_project/led/groups/enclosure_identify").then((r) => r.data).catch(() => null);
+  const [sensors, fans, host, eth, led] = await Promise.all([
+    json(SOURCES[0]), json(SOURCES[1]), json(SOURCES[2]),
+    api.get(SOURCES[3]).catch(() => null),
+    api.get(SOURCES[4]).then((r) => r.data).catch(() => null),
+  ]);
   if (!root) return;
   const uid = led && led.Asserted !== undefined ? { known: true, on: !!led.Asserted } : { known: false, on: false };
   model = buildModel(sensors, fans, host, eth, uid);
@@ -357,8 +360,9 @@ function info(pid) {
   if (m.net[pid]) {
     const d = m.net[pid];
     const rows = [["Линк", !d.known ? "неизвестно" : d.link ? "есть" : "нет"], d.speed ? ["Скорость", `${d.speed} Мбит/с`] : null, d.iface ? ["Интерфейс", d.iface] : null, d.ip ? ["IP", d.ip] : null, d.mac ? ["MAC", d.mac] : null];
-    if (pid === "X4") m.usb.X4.forEach((u, i) => rows.push([`USB ${i ? "верхний" : "нижний"}`, !m.usb.known ? "неизвестно" : u ? u.product || u.id : "пусто"]));
-    return { title: pid, sub: d.sub, rows, note: pid === "X4" ? (m.usb.known ? "" : m.on ? AGENT_OLD : NO_AGENT) : d.known ? "Какой интерфейс в каком разъёме, выведено по нумерации, кабелем не проверено." : NO_AGENT };
+    // (the rows as the ports stand: the upper one first; usb.X4 is lower, upper)
+    if (pid === "X4") [1, 0].forEach((i) => rows.push([`USB ${i ? "верхний" : "нижний"}`, !m.usb.known ? "неизвестно" : m.usb.X4[i] ? m.usb.X4[i].product || m.usb.X4[i].id : "пусто"]));
+    return { title: pid, sub: d.sub, rows, note: pid === "X4" ? (m.usb.known ? "" : m.on ? AGENT_OLD : NO_AGENT) : d.known ? "" : NO_AGENT };
   }
   if (m.fans[pid]) {
     const d = m.fans[pid];

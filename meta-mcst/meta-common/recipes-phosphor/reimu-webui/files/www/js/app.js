@@ -30,7 +30,9 @@ function showLogin(msg = "") {
   $("login").classList.remove("hidden");
   $("login-error").textContent = msg;
   $("login-host").textContent = location.host;
-  $("login-pass").focus();
+  // not on a touch screen: a focus nobody tapped for brings a password
+  // manager's autofill over the field, and it closes the keyboard as you type
+  if (!matchMedia("(pointer: coarse)").matches) $("login-pass").focus();
 }
 
 async function showApp(user) {
