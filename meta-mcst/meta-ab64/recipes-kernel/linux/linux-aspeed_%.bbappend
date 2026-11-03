@@ -3,8 +3,8 @@
 # (the 5.10 fragments and patches of the other layers don't apply)
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 KBRANCH = "dev-6.18"
-LINUX_VERSION = "6.18.57"
-SRCREV = "0168b08a4c77fb172f2edc68551d8c16e511ecd4"
+LINUX_VERSION = "6.18.60"
+SRCREV = "4a2f1ea25e7a0704492712c41e3048b0bbfe1332"
 SRC_URI = "git://github.com/openbmc/linux;protocol=https;branch=${KBRANCH} \
            file://defconfig \
            file://aspeed-bmc-mcst-reimu-5564.dts \
