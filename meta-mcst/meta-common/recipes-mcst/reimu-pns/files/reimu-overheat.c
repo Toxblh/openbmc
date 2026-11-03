@@ -23,6 +23,7 @@
 #include <systemd/sd-bus.h>
 #include "reimu-sensors.h"
 #include "reimu-overheat.h"
+#include "reimu-view.h"
 
 #define CONF "/etc/overheatd.conf"
 #define STATE "/var/volatile/systemstate.xml"
@@ -66,10 +67,9 @@ static void state_attr(struct buf *b, const char *state, const char *name, const
     else buf_json(b, p + strlen(key), e - p - strlen(key));
 }
 
-static int prop_json(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
-                     void *ud, sd_bus_error *err)
+/* the document of the object (and of the web UI's view) */
+char *overheat_doc(void)
 {
-    (void)bus; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
     static char conf[4096], state[8192], marker[1024];
     struct buf b = { 0 };
     if (read_all(CONF, conf, sizeof(conf)) < 0) conf[0] = 0;
@@ -96,8 +96,16 @@ static int prop_json(sd_bus *bus, const char *path, const char *iface, const cha
     if (n >= 0) buf_json(&b, marker, n);
     else buf_str(&b, "null");
     buf_str(&b, "}");
-    int r = sd_bus_message_append(reply, "s", b.s ? b.s : "{}");
-    free(b.s);
+    return b.s;
+}
+
+static int prop_json(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
+                     void *ud, sd_bus_error *err)
+{
+    (void)bus; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    char *j = overheat_doc();
+    int r = sd_bus_message_append(reply, "s", j ? j : "{}");
+    free(j);
     return r;
 }
 

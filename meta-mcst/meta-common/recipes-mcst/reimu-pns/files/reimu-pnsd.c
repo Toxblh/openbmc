@@ -52,6 +52,7 @@
 #ifndef PARSER_ONLY
 #include "reimu-pnsflash.h"
 #include "reimu-overheat.h"
+#include "reimu-view.h"
 #endif
 
 #define FRU_XML   "/var/volatile/motherboard_info.xml"
@@ -653,7 +654,7 @@ static char *build_json(void)
  * at most every SENS_CACHE_S seconds whatever the number of viewers */
 #define SENS_SETTLE_S 30
 #define SENS_CACHE_S  3
-static char *sensors_doc(int force)
+char *sensors_doc(int force)
 {
     static char *cached;
     static time_t cached_at;
@@ -698,6 +699,12 @@ static const sd_bus_vtable sensors_vtable[] = {
 };
 
 static char *last_json;
+
+/* the ПНС document for the web UI's view */
+char *pns_doc(void)
+{
+    return build_json();
+}
 
 static int prop_json(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
                      void *ud, sd_bus_error *err)
@@ -802,6 +809,8 @@ static int run_daemon(void)
     if (r >= 0) r = pnsflash_register(bus);
     /* the switch of overheatd's power actions, the reason of an emergency (reimu-overheat.c) */
     if (r >= 0) r = overheat_register(bus);
+    /* what the web UI's pages show, one answer each (reimu-view.c) */
+    if (r >= 0) r = view_register(bus);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
     if (r < 0)
@@ -866,6 +875,15 @@ int main(int argc, char **argv)
         free(b.s);
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--view"))
+    {
+        sd_bus *bus = NULL;
+        if (sd_bus_default_system(&bus) < 0) return 1;
+        g_bus = bus;
+        int rv = view_print(bus, argv[2]);
+        sd_bus_unref(bus);
+        return rv;
+    }
     if (argc == 1) return run_daemon();
 #endif
     fprintf(stderr, "Usage: %s                    run D-Bus service\n"
@@ -873,7 +891,8 @@ int main(int argc, char **argv)
                     "       %s --fru <eeprom>     print FRU ID EEPROM image as XML\n"
                     "       %s --json             print the D-Bus JSON document\n"
                     "       %s --sensors          read the platform sensors now (no power check)\n"
-                    "       %s --journal [n [cursor]]  print BMC journal entries (n < 0: before cursor)\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                    "       %s --journal [n [cursor]]  print BMC journal entries (n < 0: before cursor)\n"
+                    "       %s --view live|static  print a document of the web UI's view\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }

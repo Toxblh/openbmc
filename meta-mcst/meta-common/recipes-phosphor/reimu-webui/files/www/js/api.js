@@ -1,6 +1,8 @@
 // Thin client for bmcweb: session login, XSRF-protected requests, Redfish
 // helpers and authenticated websockets.
 
+import { fromView } from "./lib/view.js";
+
 const listeners = { unauthorized: [] };
 
 function cookie(name) {
@@ -28,7 +30,11 @@ function redfishMessage(body) {
 // handshake takes more than a few seconds, so a burst of parallel requests
 // (which makes the browser open many new connections) must be avoided:
 // requests are limited to a few in flight, reusing keep-alive connections.
-const MAX_INFLIGHT = 4;
+const MAX_INFLIGHT = 6;
+const pendingGets = new Map();
+// GETs started ahead (api.prefetch): taken by the first get of the same URL in
+// the next few seconds
+const prefetched = new Map();
 let inflight = 0;
 const waiters = [];
 async function slot() {
@@ -41,7 +47,48 @@ function release() {
   if (next) next();
 }
 
+// What the BMC's view answers (lib/view.js): these URLs come from it, one
+// request (reimu-pnsd's view/live) for all of them, again after VIEW_TTL; its
+// static part only when its version changes. A BMC without the view: bmcweb.
+const VIEW = "/xyz/openbmc_project/reimu/view";
+const VIEWED = new RegExp(
+  "^(/redfish/v1/(Systems/system|Chassis(/[^/]+(/Thermal|/Power)?)?|Managers/bmc(/EthernetInterfaces/eth0)?)" +
+    "|/xyz/openbmc_project/(reimu/(sensors|fans|hostlink|overheat|pns)|led/groups/enclosure_identify))$",
+);
+const VIEW_TTL = 1500;
+// asked on every page (the power chip): from the view only when a page has it
+// fresh or on its way; else on its own, a page without sensors reads none
+const LAZY = new Set(["/redfish/v1/Systems/system"]);
+const view = { ok: true, live: null, stat: null, at: 0, pending: null };
+async function viewNow() {
+  if (view.live && Date.now() - view.at < VIEW_TTL) return;
+  if (!view.pending)
+    view.pending = (async () => {
+      const live = JSON.parse((await request("GET", `${VIEW}/live`)).data.Json);
+      if (!view.stat || view.stat.hash !== live.static) view.stat = JSON.parse((await request("GET", `${VIEW}/static`)).data.Json);
+      view.live = live;
+      view.at = Date.now();
+    })().finally(() => (view.pending = null));
+  await view.pending;
+}
+async function viewOrGet(url, opts) {
+  const fresh = view.pending || (view.live && Date.now() - view.at < VIEW_TTL);
+  if (view.ok && VIEWED.test(url) && (fresh || !LAZY.has(url))) {
+    try {
+      await viewNow();
+      const r = fromView(url, view.live, view.stat);
+      if (r !== undefined) return r;
+    } catch (e) {
+      if (e.status === 401) throw e;
+      if (e.status === 404) view.ok = false; // a BMC without it
+    }
+  }
+  return request("GET", url, undefined, opts);
+}
+
 async function request(method, url, data, opts = {}) {
+  // a change: what the view said before it is old
+  if (method !== "GET") view.live = null;
   await slot();
   try {
     return await doRequest(method, url, data, opts);
@@ -86,7 +133,34 @@ export const api = {
   on(ev, fn) {
     listeners[ev].push(fn);
   },
-  get: (url, opts) => request("GET", url, undefined, opts),
+  get(url, opts) {
+    // the same GET asked again while it is on its way (the map and the cards of
+    // a page, the power chip and a page): one request, its answer to both (an
+    // answer is read, not changed)
+    const key = url + (opts && opts.noAuthEvent ? " noauth" : "");
+    const pre = prefetched.get(key);
+    if (pre) {
+      prefetched.delete(key);
+      return pre;
+    }
+    let p = pendingGets.get(key);
+    if (!p) {
+      p = viewOrGet(url, opts).finally(() => pendingGets.delete(key));
+      pendingGets.set(key, p);
+    }
+    return p;
+  },
+  // what a page will ask for after the answers it waits for (the members of a
+  // collection, a board's chassis): asked now, at the same time
+  prefetch(...urls) {
+    for (const url of urls) {
+      if (prefetched.has(url) || pendingGets.has(url)) continue;
+      const p = this.get(url);
+      p.catch(() => {});
+      prefetched.set(url, p);
+      setTimeout(() => prefetched.get(url) === p && prefetched.delete(url), 5000);
+    }
+  },
   post: (url, data) => request("POST", url, data === undefined ? {} : data),
   patch: (url, data) => request("PATCH", url, data),
   put: (url, data) => request("PUT", url, data),

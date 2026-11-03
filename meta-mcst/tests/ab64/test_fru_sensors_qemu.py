@@ -207,7 +207,7 @@ class Platform(ab.Bmc):
             ["qemu-system-arm", "-M", "ast2500-evb,fmc-model=mx66l51235f,spi-model=n25q512ax3", "-m", "512",
              "-nographic", "-drive", "file=%s,if=mtd,format=raw" % self.img,
              "-drive", "file=%s,if=mtd,format=raw" % self.pns] + dev +
-            ["-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, HTTPS),
+            ["-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:443" % (SSH, ab.webfwd.inner(HTTPS)),
              "-net", "nic,netdev=n0,macaddr=98:a7:b0:00:00:01",
              "-qmp", "unix:%s/%s.qmp,server,nowait" % (RQ, self.name),
              "-qmp", "unix:%s/%s.qmp2,server,nowait" % (RQ, self.name),
@@ -603,6 +603,16 @@ def t_off():
         b.stop()
 
 
+def view_vs_bmcweb():
+    """the web UI's view (reimu-pnsd view/live, view/static through js/lib/view.js)
+    says what bmcweb says, for every URL it answers (tests/e2e/view.qemu.mjs)"""
+    www = os.path.join(ab.HERE, "..", "..", "meta-common", "recipes-phosphor", "reimu-webui", "files", "www")
+    env = dict(os.environ, BASE="https://127.0.0.1:%d" % HTTPS, WWW=www)
+    r = subprocess.run(["node", os.path.join(ab.HERE, "..", "e2e", "view.qemu.mjs")], env=env, capture_output=True, text=True, timeout=300)
+    print("    " + (r.stdout + r.stderr).strip().replace("\n", "\n    "))
+    check(r.returncode == 0, "the web UI's view = bmcweb's answers")
+
+
 def t_hoston():
     b = Platform("hoston", fresh_env("hoston", ethaddr=FRU_MAC.lower(), eth1addr="98:a7:b0:06:0f:7f"), power=True).start()
     try:
@@ -633,6 +643,7 @@ def t_hoston():
         check(b.wait(lambda: b.host_state() == "Running", 30), "host state Running")
         s = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), 120, 3)
         check(bool(s), "sensors on D-Bus %s" % sorted(b.sensors()))
+        view_vs_bmcweb()
         time.sleep(10)
         jp = journal(b, "reimu-fru-power")
         check("FRU ID read:" not in jp, "reimu-fru-power: FRU ID not read again (%s)" % jp.strip()[-100:])

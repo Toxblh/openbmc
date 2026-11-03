@@ -28,6 +28,7 @@ async function loadMap(box) {
 }
 
 async function loadInventory() {
+  api.prefetch("/redfish/v1/Systems/system/Processors", "/redfish/v1/Systems/system/Memory", "/redfish/v1/Chassis/motherboard");
   const [sys, chassis, mgr] = await Promise.all([api.get("/redfish/v1/Systems/system").catch(() => null), api.collection("/redfish/v1/Chassis").catch(() => []), api.get("/redfish/v1/Managers/bmc").catch(() => null)]);
   const [cpus, mems] = await Promise.all([
     sys && sys.Processors ? api.collection(sys.Processors["@odata.id"]).catch(() => []) : [],

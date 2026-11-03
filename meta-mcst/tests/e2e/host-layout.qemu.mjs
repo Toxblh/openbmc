@@ -92,6 +92,18 @@ for (const [w, hgt] of SIZES) {
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/xyz/openbmc_project/reimu/hostlink", (r) =>
     r.request().method() === "GET" ? r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { Json: JSON.stringify(state) } }) }) : r.continue());
+  // the pages read it from the BMC's view (reimu-pnsd view/live) too: the same
+  // document there
+  await page.route("**/xyz/openbmc_project/reimu/view/live", async (r) => {
+    const res = await r.fetch();
+    if (!res.ok()) return r.fulfill({ response: res });
+    const body = await res.json();
+    const live = JSON.parse(body.data.Json);
+    const HL = "/xyz/openbmc_project/reimu/hostlink";
+    live.objects = { ...live.objects, [HL]: { ...((live.objects || {})[HL] || {}), Json: JSON.stringify(state) } };
+    body.data.Json = JSON.stringify(live);
+    r.fulfill({ response: res, body: JSON.stringify(body) });
+  });
   if (process.env.WWW) {
     await page.route(/\/(js|css)\/.*\.(js|css)(\?.*)?$/, (r) => {
       const p = path.join(process.env.WWW, new URL(r.request().url()).pathname);
@@ -196,5 +208,5 @@ for (const [w, hgt] of SIZES) {
   check(errors.length === 0, `${at} no page errors ${JSON.stringify(errors)}`);
   await ctx.close();
 }
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 process.exit(failed ? 1 : 0);

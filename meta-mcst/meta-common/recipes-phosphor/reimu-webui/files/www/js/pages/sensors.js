@@ -57,6 +57,7 @@ export async function mount(el) {
 let last = null;
 
 async function refresh() {
+  api.prefetch("/redfish/v1/Chassis/motherboard", "/redfish/v1/Chassis/motherboard/Thermal", "/redfish/v1/Chassis/motherboard/Power");
   const [chassis, plat, fans, host, overheat] = await Promise.all([api.collection("/redfish/v1/Chassis").catch(() => []), platformSensors(), fanState(), hostSensorRows(), overheatState()]);
   const data = { temp: [], fan: [], in: [], curr: [], power: [], platform: plat, fans, overheat };
   await Promise.all(

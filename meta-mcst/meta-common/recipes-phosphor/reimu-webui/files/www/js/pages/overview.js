@@ -16,6 +16,7 @@ export async function mount(el) {
 }
 
 async function refresh() {
+  api.prefetch("/redfish/v1/Chassis/motherboard", "/redfish/v1/Chassis/motherboard/Thermal");
   const [sys, mgr, chassis, plat] = await Promise.all([
     api.get("/redfish/v1/Systems/system").catch(() => null),
     api.get("/redfish/v1/Managers/bmc").catch(() => null),

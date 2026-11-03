@@ -18,18 +18,12 @@ const when = (s) => (s ? new Date(s * 1000).toLocaleString() : "—");
 const JOBS = { verify: "сверка чипов", "sync-backup": "копирование на резервный чип", "restore-primary": "восстановление основного чипа", "prepare-update": "подготовка к обновлению" };
 
 export async function getStatus() {
-  try {
-    const r = await api.get(FW);
-    return JSON.parse(r.data.Json);
-  } catch (e) {
-    if (e.status !== 404) return undefined; // request failed
-  }
-  try {
-    const r = await api.get(AB);
-    return { ab: JSON.parse(r.data.Json) };
-  } catch (e) {
-    return e.status === 404 ? null : undefined; // null: no reliable upgrade on this board
-  }
+  // (both at once: one of them is a 404 on every board)
+  const [fw, ab] = await Promise.allSettled([api.get(FW), api.get(AB)]);
+  if (fw.status === "fulfilled") return JSON.parse(fw.value.data.Json);
+  if (fw.reason.status !== 404) return undefined; // request failed
+  if (ab.status === "fulfilled") return { ab: JSON.parse(ab.value.data.Json), releases: ab.value.data.OtaReleases };
+  return ab.reason.status === 404 ? null : undefined; // null: no reliable upgrade on this board
 }
 
 async function run(action) {
@@ -38,7 +32,8 @@ async function run(action) {
 }
 
 // Creates the card; `onReboot` reboots the BMC (shared with the BMC card).
-export function firmwareCard(mgr, onReboot) {
+// `first`: the state already being fetched (with the rest of the page)
+export function firmwareCard(mgr, onReboot, first = null) {
   const card = h("div", { class: "card span2", id: "fw-card" }, h("h3", {}, "Прошивка BMC"), h("div", { class: "muted" }, "Загрузка…"));
   let timer = null;
   let alive = true;
@@ -46,11 +41,10 @@ export function firmwareCard(mgr, onReboot) {
   // updates from the releases: the list as last fetched, what the page chose
   const ota = { releases: null, loaded: 0, showPre: null };
 
-  async function loadReleases(o) {
+  async function loadReleases(o, have) {
     if (!o || o.state !== "checked" || o.checked === ota.loaded) return;
     try {
-      const r = await api.get(AB);
-      ota.releases = JSON.parse(r.data.OtaReleases);
+      ota.releases = JSON.parse(have !== undefined ? have : (await api.get(AB)).data.OtaReleases);
       ota.loaded = o.checked;
     } catch (e) {
       toast(`Список версий не прочитан: ${e.message}`, "err");
@@ -60,7 +54,8 @@ export function firmwareCard(mgr, onReboot) {
   async function refresh() {
     clearTimeout(timer);
     if (!alive) return;
-    let st = await getStatus();
+    let st = await (first || getStatus());
+    first = null;
     if (!alive) return;
     // a failed request (BMC busy) keeps the last state and retries
     if (st === undefined && last) {
@@ -68,7 +63,7 @@ export function firmwareCard(mgr, onReboot) {
       return;
     }
     if (st === undefined) st = null;
-    if (st && st.ab) await loadReleases(st.ab.ota);
+    if (st && st.ab) await loadReleases(st.ab.ota, st.releases);
     if (!alive) return;
     const lastJob = last && (last.ab ? last.ab.job : last.job);
     const wasRunning = lastJob && lastJob.state === "running";

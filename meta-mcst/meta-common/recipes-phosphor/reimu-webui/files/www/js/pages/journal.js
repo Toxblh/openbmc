@@ -29,14 +29,8 @@ export async function mount(el) {
     h("div", { class: "card", id: "log-body" }, "Загрузка…"),
   );
   const $ = (id) => el.querySelector("#" + id);
-  const services = [];
-  for (const base of ["/redfish/v1/Managers/bmc/LogServices", "/redfish/v1/Systems/system/LogServices"]) {
-    try {
-      for (const s of await api.collection(base)) services.push(s);
-    } catch (e) {
-      /* collection may be absent */
-    }
-  }
+  // (a collection may be absent)
+  const services = (await Promise.all(["/redfish/v1/Managers/bmc/LogServices", "/redfish/v1/Systems/system/LogServices"].map((b) => api.collection(b).catch(() => [])))).flat();
   if (!root) return;
   $("log-svc").append(...services.map((s) => h("option", { value: s["@odata.id"] }, `Redfish: ${s.Name || s.Id}`)));
   const q = () => $("log-q").value.toLowerCase();
