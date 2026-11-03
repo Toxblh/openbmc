@@ -18,7 +18,8 @@ test adds hostfwd for 2022 and 5900 on DOCS_SSH2022, DOCS_VNC). Groups:
            (reimu-fru power), then the client goes again; a right clock: no read
   fan      phosphor-fan-presence-tach is not in the image (reimu-fand owns the
            fans), the power-on target doesn't need it
-  smoke    VNC on 5900 and its password; server_uid, enclosure_identify,
+  smoke    VNC only on localhost (the network: no; ssh -L: its password;
+           /kvm/0: RFB); server_uid, enclosure_identify,
            IndicatorLED; setled; checkalerts; last_power_state; ip-fallback;
            hwclock; auto_power_on; revert-to-mfg (released: nothing; a pressed
            reading in a sandbox: wipes the cow and reboots, in the sandbox);
@@ -241,9 +242,9 @@ def des_ecb(key, block):
     return _perm(out, 64, fp).to_bytes(8, "big")
 
 
-def vnc_auth(password):
+def vnc_auth(password, port=VNC):
     """the result of the RFB VNC authentication with this password: True/False"""
-    s = socket.create_connection(("127.0.0.1", VNC), timeout=15)
+    s = socket.create_connection(("127.0.0.1", port), timeout=15)
     f = s.makefile("rb")
     ver = f.read(12)
     if not ver.startswith(b"RFB "):
@@ -260,6 +261,67 @@ def vnc_auth(password):
     r = struct.unpack(">I", f.read(4))[0]
     s.close()
     return r == 0
+
+
+def vnc_banner(port):
+    """what a VNC client on this port gets first"""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        s.settimeout(10)
+        d = s.recv(12)
+        s.close()
+        return d.decode(errors="replace") or "closed"
+    except OSError as e:
+        return "%s" % e
+
+
+def vnc_tunnel():
+    """ssh -N -L PORT:localhost:5900 to the BMC, as the README says for a VNC
+    client: (PORT, the ssh process)"""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    c, env = T.ssh_cmd()
+    p = subprocess.Popen(c[:-1] + ["-N", "-L", "%d:localhost:5900" % port, c[-1]], env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for i in range(60):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+            break
+        except OSError:
+            time.sleep(0.5)
+    return port, p
+
+
+def kvm0_banner():
+    """the first bytes the BMC's VNC sends through bmcweb's /kvm/0 websocket
+    (what the web UI's VNC source uses)"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    rq = urllib.request.Request("https://127.0.0.1:%d/redfish/v1/SessionService/Sessions" % T.HTTPS, method="POST",
+                                data=json.dumps({"UserName": "root", "Password": "0penBmc"}).encode(),
+                                headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(rq, context=ctx, timeout=60) as r:
+        token = r.headers.get("X-Auth-Token")
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", T.HTTPS), timeout=20))
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET /kvm/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n"
+               "X-Auth-Token: %s\r\n\r\n" % (key, token)).encode())
+    f = s.makefile("rb")
+    status = f.readline().decode(errors="replace").strip()
+    while f.readline() not in (b"\r\n", b""):
+        pass
+    if " 101 " not in status + " ":
+        return "upgrade refused: %s" % status
+    hdr = f.read(2)
+    n = hdr[1] & 0x7f
+    if n == 126:
+        n = struct.unpack(">H", f.read(2))[0]
+    data = f.read(min(n, 12))
+    s.close()
+    return data.decode(errors="replace")
 
 
 def web(method, path, data=None, headers=None):
@@ -279,13 +341,21 @@ LEDS = "xyz.openbmc_project.LED.GroupManager /xyz/openbmc_project/led/groups/enc
 
 
 def t_smoke(b):
-    print("  -- VNC (reimu.md:254-256)", flush=True)
+    print("  -- VNC (reimu.md:254-256): only on the BMC's localhost; the web UI's VNC (/kvm/0 on 443), a VNC client through an SSH tunnel", flush=True)
     time.sleep(2)
     if check(b.ssh("netstat -ltn | grep -q ':5900 '").returncode == 0, "obmc-ikvm listens on 5900"):
-        r = vnc_auth("0penBmc")
-        check(r is True, "the default password 0penBmc is accepted (%s)" % r)
-        r = vnc_auth("wrong")
-        check(r is False, "a wrong one isn't (%s)" % r)
+        r = vnc_banner(VNC)
+        check(not r.startswith("RFB"), "VNC not reachable from the network (it offered security type None): %s" % r)
+        port, tun = vnc_tunnel()
+        try:
+            r = vnc_auth("0penBmc", port)
+            check(r is True, "through ssh -L: the default password 0penBmc is accepted (%s)" % r)
+            r = vnc_auth("wrong", port)
+            check(r is False, "a wrong one isn't (%s)" % r)
+        finally:
+            tun.kill()
+        r = kvm0_banner()
+        check(r.startswith("RFB 003.008"), "the web UI's VNC (bmcweb /kvm/0) reaches it: %s" % r)
 
     print("  -- UID (reimu.md:312-319, 329-331, 375-377)", flush=True)
     rc = lambda c: b.ssh(c).returncode  # noqa: E731

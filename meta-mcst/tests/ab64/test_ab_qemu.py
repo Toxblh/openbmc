@@ -53,7 +53,7 @@ starts from a fresh copy of ab.mtd. Tests (all by default):
               (kexec into the new image from RAM, write both slots, the A/B
               environment, the settings), the new firmware boots
 """
-import base64, hashlib, json, os, re, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import base64, hashlib, json, os, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -433,8 +433,60 @@ def t_regress():
         u = b.out("grep -l i2c-adapter /usr/sbin/* /usr/bin/* /libexec/* /usr/libexec/* 2>/dev/null").split()
         check(not u, "nothing uses /sys/class/i2c-adapter %s" % u)
         check(b.ssh("ls -d /sys/bus/i2c/devices/i2c-3/new_device").returncode == 0, "/sys/bus/i2c/devices/i2c-N/new_device")
+        net_services(b)
     finally:
         b.stop()
+
+
+def ssh_kexinit():
+    """the server's KEXINIT name-lists (kex, hostkey, ciphers c2s), unencrypted
+    on the wire right after the banners"""
+    s = socket.create_connection(("127.0.0.1", SSH), timeout=20)
+    f = s.makefile("rb")
+    banner = b""
+    while not banner.startswith(b"SSH-"):
+        banner = f.readline()
+    s.sendall(b"SSH-2.0-reimu-test\r\n")
+    n, pad = struct.unpack(">IB", f.read(5))
+    p = f.read(n - 1)[:n - 1 - pad]
+    s.close()
+    if p[0] != 20:
+        return banner.decode().strip(), {}
+    i, lists = 17, []
+    for _ in range(4):
+        m = struct.unpack(">I", p[i:i + 4])[0]
+        lists.append(p[i + 4:i + 4 + m].decode().split(","))
+        i += 4 + m
+    return banner.decode().strip(), dict(zip(("kex", "hostkey", "c2s", "s2c"), lists))
+
+
+def net_services(b):
+    """what listens on the network and how: VNC only on localhost (obmc-ikvm
+    offered security type None to the LAN; the web UI's VNC goes through
+    bmcweb's /kvm/0 on 443), no LLMNR, OpenSSL 3, OpenSSH 9 with strict kex
+    (Terrapin), sftp for scp"""
+    ns = b.out("netstat -ltnu 2>/dev/null")
+    v = [l.split()[3] for l in ns.splitlines() if re.search(r":5900\s", l)]
+    check(v and all(a.startswith("127.0.0.1:") or a.startswith("::1:") for a in v),
+          "obmc-ikvm (VNC) listens only on localhost: %s" % v)
+    llmnr = [l.split()[3] for l in ns.splitlines() if re.search(r":5355\s", l)]
+    check(not llmnr, "nothing listens on 5355 (LLMNR off): %s" % llmnr)
+    ov = b.out("openssl version").strip()
+    check(re.match(r"OpenSSL 3\.", ov) is not None, "OpenSSL 3: %s" % ov)
+    banner, kx = ssh_kexinit()
+    check(re.match(r"SSH-2\.0-OpenSSH_(9|1\d)\.", banner) is not None, "sshd OpenSSH 9+: %s" % banner)
+    hk = kx.get("hostkey", [])
+    check(all(any(k.startswith(t) for k in hk) for t in ("rsa-sha2", "ecdsa-sha2", "ssh-ed25519")),
+          "sshd offers the host keys 8.4 did (RSA, ECDSA, Ed25519; first boot made them): %s" % ",".join(hk))
+    check("kex-strict-s-v00@openssh.com" in kx.get("kex", []),
+          "sshd does strict kex (Terrapin, CVE-2023-48795): %s" % ",".join(k for k in kx.get("kex", []) if "strict" in k))
+    t = os.path.join(W, ".sftp-probe")
+    open(t, "w").write("reimu\n")
+    c, env = ssh_cmd()
+    scp = ["scp", "-s", "-P", str(SSH)] + c[3:-1] + [t, "root@127.0.0.1:/tmp/sftp-probe"]
+    r = subprocess.run(scp, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    check(r.returncode == 0 and b.out("cat /tmp/sftp-probe").strip() == "reimu",
+          "scp over SFTP (sftp-server in the image): %s" % (r.stderr.strip()[-160:] or "ok"))
 
 
 def install_b(b):
