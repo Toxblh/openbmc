@@ -16,3 +16,5 @@ do_install_append() {
     sed -i "s|^ExecStart=/usr/bin/obmc-ikvm .*|& -f 60|" ${D}${systemd_system_unitdir}/start-ipkvm.service
     install -m 0755 ${WORKDIR}/create_usbhid.sh ${D}${bindir}/create_usbhid.sh
 }
+# no VNC client: wait 0.25 s, not one frame time (60 wakeups a second, ~4% CPU)
+SRC_URI += " file://0004-idle-wait-without-client.patch "

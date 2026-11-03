@@ -13,7 +13,8 @@ Tests (all by default, one boot):
            collections balanced, the input report = report_length: keyboard
            8, mouse 7), protocol, subclass; /dev/hidg0, /dev/hidg1; the
            gadget bound to a vhub port (the state: "configured" needs a USB
-           host, QEMU has none on the vhub: INFO)
+           host, QEMU has none on the vhub: INFO); obmc-ikvm without a VNC
+           client sleeps (it woke 60 times a second: ~4% of the board's CPU)
   restart  systemctl restart start-ipkvm, then obmc-ikvm killed (-9) three
            times (systemd brings it back, ExecStartPre runs again): the
            descriptors unchanged, the gadget still bound to the same port,
@@ -98,6 +99,17 @@ def t_gadget(b):
         st = b.out("cat /sys/class/udc/%s/state 2>&1" % udc).strip()
         check(b.ssh("test -e /sys/class/udc/%s" % udc).returncode == 0, "/sys/class/udc/%s exists" % udc)
         print("  INFO UDC %s state: %s (configured only with a USB host on the vhub)" % (udc, st))
+    # no VNC client: the wakeups of all its threads in 5 s (a loop at the
+    # frame rate, -f 60, made several hundred)
+    pid = wait_active(b, 30)
+    cnt = "cat /proc/%s/task/*/status | awk '/^voluntary_ctxt_switches/ { n += $2 } END { print n + 0 }'" % pid
+    try:
+        a = int(b.out(cnt).strip())
+        time.sleep(5)
+        n = int(b.out(cnt).strip()) - a
+    except ValueError:
+        n = -1
+    check(0 <= n < 150, "obmc-ikvm without a VNC client: %d wakeups in 5 s (under 150)" % n)
     return fns, udc
 
 

@@ -1,0 +1,28 @@
+obmc-ikvm: no client, no busy loop
+
+Without a VNC client the server thread waited in rfbProcessEvents() only
+for one frame time (-f 60: 16.6 ms) and the video thread answered each
+round: about 60 wakeups a second of two threads for nothing, ~4% of the
+AST2500's one core all the time. Wait 0.25 s then: a connecting client
+ends the wait at once (select() on the listening socket).
+
+diff --git a/ikvm_server.cpp b/ikvm_server.cpp
+index 65c298f..56c22ee 100644
+--- a/ikvm_server.cpp
++++ b/ikvm_server.cpp
+@@ -87,9 +87,14 @@ void Server::resize()
+     }
+ }
+ 
++// With no client the loop only waits for one: at the frame rate (-f 60) it
++// woke 60 times a second for nothing, ~4% of the BMC's one core. A client
++// connecting ends the wait at once (it is a select() on the listening socket).
++#define IDLE_WAIT_US 250000
++
+ void Server::run()
+ {
+-    rfbProcessEvents(server, processTime);
++    rfbProcessEvents(server, server->clientHead ? processTime : IDLE_WAIT_US);
+ 
+     if (server->clientHead)
+     {
