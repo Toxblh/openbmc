@@ -5,6 +5,10 @@
 // against the SHA-256 written into it at the BMC's build, as it checks
 // downloaded ones; the shell never reads past install.sh's own block.
 export const AGENT_FILES = ["reimu-hostd.py", "reimu-hostd.service", "reimu-hostd.conf", "reimu-hostd.init"];
+// the picture services the agent sets up (H.264 of the video card, the mirror
+// into the ASPEED VGA): appended when the BMC has them (install.sh takes them
+// as optional, checked the same way)
+export const KVM_FILES = ["reimu-h264.py", "reimu-host.sh", "reimu-fbmirror.c"];
 const PAIR_RE = /^reimu1:[A-Za-z0-9_-]{16,2000}$/;
 const SLOT = "\nREIMU_PAIR_DEFAULT=''\n";
 
@@ -25,6 +29,7 @@ export function packInstaller(installSh, files, pair) {
     if (!files[f]) throw new Error(`нет ${f}`);
     out += `${f} ${b64(files[f])}\n`;
   }
+  for (const f of KVM_FILES) if (files[f]) out += `${f} ${b64(files[f])}\n`;
   return out;
 }
 
@@ -37,5 +42,6 @@ export async function buildInstaller(pair, base = "/agent/") {
   const sh = new TextDecoder().decode(await get("install.sh"));
   const files = {};
   for (const f of AGENT_FILES) files[f] = await get(f);
+  for (const f of KVM_FILES) files[f] = await get(f).catch(() => null);
   return packInstaller(sh, files, pair);
 }

@@ -903,6 +903,51 @@ static void t_events_ring(void)
     buf_free(&j);
 }
 
+/* the hint for reimu-kvm (UDP on loopback): where the host's H.264 is, or why
+ * there is none. Before: reimu-kvm knew a host only from reimu-h264's own UDP
+ * announcement; an old reimu-h264 without it (the board, 2026-11-03) left the
+ * KVM page on JPEG with the agent connected all along */
+static void t_kvm_hint(void)
+{
+    char m[160];
+    fresh(NULL);
+    CHECK(H.c.kvm_port == 8443, "KVM_PORT default 8443 (%d)", H.c.kvm_port);
+    write_key(KEY);
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264-OFF no_agent"), "no agent: %s", m);
+    struct hl_conn *a = agent("::ffff:10.0.2.2");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264 8555 10.0.2.2"), "an agent, no metrics yet (an older agent): its host, 8555: %s", m);
+    metrics(a, 0, 0, 52, 61);
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264 8555 10.0.2.2"), "metrics without kvm (an older agent): %s", m);
+    send_line(a, "{\"v\":1,\"t\":\"metrics\",\"data\":{\"kvm\":{\"h264\":{\"state\":\"active\",\"port\":8600,\"reason\":null},"
+                 "\"mirror\":{\"state\":\"off\",\"reason\":\"no_ast\"}}}}");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264 8600 10.0.2.2"), "the agent's port: %s", m);
+    send_line(a, "{\"v\":1,\"t\":\"metrics\",\"data\":{\"kvm\":{\"h264\":{\"state\":\"off\",\"port\":8555,\"reason\":\"no_gpu\"}}}}");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264-OFF no_gpu"), "the agent says why not: %s", m);
+    send_line(a, "{\"v\":1,\"t\":\"metrics\",\"data\":{\"kvm\":{\"h264\":{\"state\":\"off\",\"reason\":\"x y\\n<b>ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\"}}}}");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strncmp(m, "REIMU-H264-OFF ", 15) && strlen(m) <= 15 + 24 && !strpbrk(m + 15, " \n<>"), "a reason sanitized: %s", m);
+    send_line(a, "{\"v\":1,\"t\":\"metrics\",\"data\":{\"kvm\":{\"h264\":{\"state\":\"off\"}}}}");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264-OFF inactive"), "off without a reason: %s", m);
+    send_line(a, "{\"v\":1,\"t\":\"metrics\",\"data\":{\"kvm\":{\"h264\":{\"state\":\"active\",\"port\":99999}}}}");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264 8555 10.0.2.2"), "a bad port: 8555 (%s)", m);
+    drop(a);
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264-OFF no_agent"), "the agent gone: %s", m);
+    a = agent("fe80::1%eth0");
+    hl_kvm_hint(&H, m, sizeof(m));
+    CHECK(!strcmp(m, "REIMU-H264 8555 fe80::1%eth0"), "link-local with its interface: %s", m);
+    drop(a);
+    fresh("KVM_PORT=0\n");
+    CHECK(H.c.kvm_port == 0, "KVM_PORT=0: no hints (%d)", H.c.kvm_port);
+}
+
 int main(void)
 {
     snprintf(D, sizeof(D), "%s/hostlink-test-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", getpid());
@@ -919,7 +964,7 @@ int main(void)
         { "inventory_metrics", t_inventory_metrics }, { "edac_events", t_edac_events },
         { "gpu_temp_events", t_gpu_temp_events }, { "lost_back", t_lost_back }, { "ping", t_ping },
         { "replace", t_replace }, { "policy", t_policy }, { "turbo", t_turbo }, { "control", t_control },
-        { "events_ring", t_events_ring },
+        { "events_ring", t_events_ring }, { "kvm_hint", t_kvm_hint },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {

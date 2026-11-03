@@ -28,6 +28,8 @@
  *
  * Files: /etc/reimu-hostlink.conf (KEY=VALUE, see the file), the state in
  * /var/lib/reimu-hostlink (key 0600, cert.pem 0600, policy, edac), and in
+ * and for reimu-kvm a datagram to [::1]:KVM_PORT (8443) every 2 s: where the
+ * host's H.264 is, or why there is none (hl_kvm_hint). In
  * /run/reimu-hostlink: gpu-temp (the GPU's junction temperature in m°C, like
  * a hwmon file, for reimu-fand; absent without a fresh value) and ctl (a
  * root-only socket: reimu-hostlink --ctl CMD).
@@ -56,6 +58,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netinet/in.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -378,6 +381,20 @@ static void publish_files(void)
 #endif
 }
 
+/* where the host's H.264 is, for reimu-kvm (hl_kvm_hint): a datagram to its
+ * port on loopback every 2 s (reimu-kvm keeps it 15 s) */
+static void kvm_hint_send(void)
+{
+    static int fd = -1;
+    if (!H.c.kvm_port) return;
+    if (fd < 0) fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    char m[160];
+    int n = hl_kvm_hint(&H, m, sizeof(m));
+    struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_port = htons(H.c.kvm_port), .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    if (n > 0 && (size_t)n < sizeof(m)) (void)!sendto(fd, m, n, 0, (struct sockaddr *)&a, sizeof(a));
+}
+
 /* ------------------------------------------------------------------ main */
 static int run(void)
 {
@@ -463,6 +480,12 @@ static int run(void)
             hl_tick(&H, now);
             dbus_tick(&H, now);
             if (hl_disk_due(&H)) daemon_disk_stop(&H, now >= H.disk_until ? "time up" : "the agent installed", err, sizeof(err));
+            static int64_t last_hint;
+            if (now - last_hint >= 2000)
+            {
+                last_hint = now;
+                kvm_hint_send();
+            }
         }
         H.now = now;
         net_handle(s_net, p, 0, now); /* what the D-Bus calls and the tick queued */

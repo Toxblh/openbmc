@@ -547,6 +547,163 @@ class Offline(Base):
         self.assertEqual(open(self.lib(), "rb").read(), open(os.path.join(TOOLS, "reimu-hostd.py"), "rb").read())
 
 
+# ------------------------------------------------------------------ the picture services
+KVM_FILES = ("reimu-h264.py", "reimu-host.sh", "reimu-fbmirror.c")
+
+
+class Kvm(Base):
+    """the agent's bundle carries the host's picture services (reimu-h264,
+    reimu-fbmirror): installing or updating the agent installs, enables and
+    restarts them (2026-11-03: reimu-host.sh was a second sudo step, the
+    board's reimu-h264 stayed at an old version without announcements and the
+    KVM page silently showed JPEG)"""
+
+    def video_card(self, boot_vga=True):
+        """/sys/class/drm of the board under REIMU_ROOT: card0 ASPEED, card1 the video card"""
+        r = self.root
+        for card, slot, drv, boot in (("card0", "0000:05:00.0", "ast", not boot_vga), ("card1", "0000:03:00.0", "amdgpu", boot_vga)):
+            dev = os.path.join(r, "sys/devices/pci0000:00", slot)
+            os.makedirs(os.path.join(dev, "drm", card), exist_ok=True)
+            os.makedirs(os.path.join(r, "sys/bus/pci/drivers", drv), exist_ok=True)
+            os.symlink(os.path.relpath(os.path.join(r, "sys/bus/pci/drivers", drv), dev), os.path.join(dev, "driver"))
+            open(os.path.join(dev, "boot_vga"), "w").write("1\n" if boot else "0\n")
+            os.symlink("../..", os.path.join(dev, "drm", card, "device"))
+            os.makedirs(os.path.join(r, "sys/class/drm"), exist_ok=True)
+            os.symlink(os.path.relpath(os.path.join(dev, "drm", card), os.path.join(r, "sys/class/drm")),
+                       os.path.join(r, "sys/class/drm", card))
+        for b in ("ffmpeg", "python3"):
+            os.makedirs(os.path.join(r, "usr/bin"), exist_ok=True)
+            open(os.path.join(r, "usr/bin", b), "w").write("")
+
+    def paired_already(self):
+        os.makedirs(os.path.dirname(self.secret()), exist_ok=True)
+        open(self.secret(), "w").write("KEY=" + "a" * 64 + "\nFINGERPRINT=" + "b" * 64 + "\n")
+        os.makedirs(os.path.dirname(self.conf()), exist_ok=True)
+        open(self.conf(), "w").write("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79\n")
+
+    def h264_unit(self):
+        p = os.path.join(self.root, "etc/systemd/system/reimu-h264.service")
+        return open(p).read() if os.path.exists(p) else None
+
+    def test_bundle_carries_them(self):
+        a = os.path.join(self.out, "agent")
+        sums = dict(reversed(l.split()) for l in open(os.path.join(a, "SHA256SUMS")).read().splitlines() if l.strip())
+        text = open(os.path.join(a, "install.sh")).read()
+        for f in KVM_FILES:
+            self.assertEqual(open(os.path.join(a, f), "rb").read(), open(os.path.join(TOOLS, f), "rb").read(), f)
+            self.assertEqual(sums[f], hashlib.sha256(open(os.path.join(a, f), "rb").read()).hexdigest(), f)
+            self.assertIn("%s  %s" % (sums[f], f), text)
+        rc, out = sh(["mdir", "-b", "-i", os.path.join(self.out, "disk.img"), "::"])
+        names = sorted(os.path.basename(l).upper() for l in out.split())
+        for f in KVM_FILES:
+            self.assertIn(f.upper(), names, "on the USB disk too")
+
+    def test_install_sets_them_up(self):
+        self.paired_already()
+        self.video_card()
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        lib = os.path.dirname(self.lib())
+        self.assertEqual(open(os.path.join(lib, "reimu-h264.py"), "rb").read(), open(os.path.join(TOOLS, "reimu-h264.py"), "rb").read())
+        u = self.h264_unit()
+        self.assertIsNotNone(u, out)
+        self.assertIn("--allow 192.168.10.79,fe80::9aa7:b0ff:fe06:f7e", u)
+        log = self.systemctl()
+        self.assertIn("enable reimu-h264.service", log)
+        self.assertIn("restart reimu-h264.service", log)
+        self.assertIn("reimu-h264: installed", out, "the installer says it")
+
+    def test_update_restarts_them(self):
+        """an update of the agent (install.sh again): the services updated and restarted too"""
+        self.paired_already()
+        self.video_card()
+        for _ in range(2):
+            rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+            self.assertEqual(rc, 0, out)
+        self.assertEqual(self.systemctl().count("restart reimu-h264.service"), 2)
+
+    def test_no_video_card_nothing_and_said(self):
+        self.paired_already()
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.h264_unit())
+        self.assertNotIn("reimu-h264.service", self.systemctl())
+        self.assertIn("reimu-h264: not installed: no video card", out)
+
+    def test_not_before_paired(self):
+        """unpaired: the BMC's address unknown, nothing to allow"""
+        self.video_card()
+        rc, out = sh(["sh", self.installed_script(), "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.h264_unit())
+
+    def test_older_bmc_without_them(self):
+        """an older BMC's USB disk (only the agent's files): the agent installs, nothing else"""
+        self.paired_already()
+        self.video_card()
+        d = os.path.join(self.fake, "usb")
+        os.makedirs(d)
+        for f in FILES + ("install.sh", "README.txt"):
+            shutil.copy(os.path.join(self.out, "agent", f), d)
+        n = len(self.bmc.requests)
+        rc, out = sh(["sh", os.path.join(d, "install.sh")], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(self.lib()))
+        self.assertIsNone(self.h264_unit())
+        self.assertEqual(len(self.bmc.requests), n, "nothing fetched")
+
+    def test_tampered_picture_file_refused(self):
+        self.paired_already()
+        self.video_card()
+        d = os.path.join(self.fake, "usb")
+        os.makedirs(d)
+        for f in FILES + KVM_FILES + ("install.sh", "README.txt"):
+            shutil.copy(os.path.join(self.out, "agent", f), d)
+        open(os.path.join(d, "reimu-h264.py"), "a").write("import os; os.system('id')\n")
+        rc, out = sh(["sh", os.path.join(d, "install.sh")], env=self.env)
+        self.assertEqual(rc, 3, out)
+        self.assertIn("SHA-256", out)
+        self.assertFalse(os.path.exists(self.lib()), "nothing installed")
+
+    def test_uninstall_removes_them(self):
+        self.paired_already()
+        self.video_card()
+        script = self.installed_script()
+        rc, out = sh(["sh", script, "--url", self.bmc.url], env=self.env)
+        self.assertEqual(rc, 0, out)
+        rc, out = sh(["sh", script, "--uninstall"], env=self.env)
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.h264_unit())
+        self.assertIn("disable --now reimu-h264.service", self.systemctl())
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.lib()), "reimu-h264.py")))
+
+    def test_self_contained_with_them(self):
+        """the page's «Скачать установщик» (agent-pack.js) with the picture files in its payload"""
+        self.paired_already()
+        self.video_card()
+        text = open(os.path.join(self.out, "agent", "install.sh")).read()
+        text += "#__REIMU_PAYLOAD__\n" + "".join(
+            "%s %s\n" % (f, base64.b64encode(open(os.path.join(self.out, "agent", f), "rb").read()).decode()) for f in FILES + KVM_FILES)
+        p = os.path.join(self.fake, "reimu-agent-install.sh")
+        open(p, "w").write(text)
+        rc, out = sh(["sh", p, "--url", self.bmc.url], env=self.env, cwd="/")
+        self.assertEqual(rc, 0, out)
+        self.assertIsNotNone(self.h264_unit(), out)
+
+    def test_self_contained_without_them(self):
+        """a payload of the agent's files only (a page of before): installs"""
+        self.paired_already()
+        self.video_card()
+        text = open(os.path.join(self.out, "agent", "install.sh")).read()
+        text += "#__REIMU_PAYLOAD__\n" + "".join(
+            "%s %s\n" % (f, base64.b64encode(open(os.path.join(self.out, "agent", f), "rb").read()).decode()) for f in FILES)
+        p = os.path.join(self.fake, "reimu-agent-install.sh")
+        open(p, "w").write(text)
+        rc, out = sh(["sh", p, "--url", self.bmc.url], env=self.env, cwd="/")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(self.lib()))
+
+
 # ------------------------------------------------------------------ SysV init
 FAKE_PY = r"""#!/bin/sh
 # the agent's run and restore-auto faked; anything else the real python3

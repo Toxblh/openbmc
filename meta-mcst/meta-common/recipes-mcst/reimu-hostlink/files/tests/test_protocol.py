@@ -536,7 +536,56 @@ def t_agent():
         d.cleanup()
 
 
-TESTS = ["tls", "pair", "auth_fail", "replay", "limits", "ipv6", "no_ipv4", "data", "idle_cpu", "gpu_temp_fresh", "agent"]
+def t_kvm_hint():
+    """the daemon tells reimu-kvm (UDP on loopback, KVM_PORT) where the host's
+    H.264 is, from the agent's metrics: before, reimu-kvm only had reimu-h264's
+    own announcement (an old reimu-h264 had none: the KVM page on JPEG)"""
+    u = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    u.bind(("::1", 0))
+    u.settimeout(0.5)
+    d = Daemon("KVM_PORT=%d\n" % u.getsockname()[1]).start()
+    h = Host(d.port)
+
+    def last(timeout=8):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                return u.recv(200).decode()
+            except socket.timeout:
+                pass
+        return None
+
+    def until(want, timeout=20):
+        end, got = time.time() + timeout, None
+        while time.time() < end:
+            got = last(3)
+            if got == want:
+                return got
+        return got
+
+    try:
+        m = last()
+        check(m == "REIMU-H264-OFF no_agent", "no agent: reimu-kvm told so (%s)" % m)
+        h.t.put("/etc/systemd/system/reimu-h264.service", "[Service]\nExecStart=/usr/bin/python3 /x/reimu-h264.py --port 8600\n")
+        s, _ = pair_string(d)
+        r = h.run("pair", "--pair", s, "--config", h.conf, "--secret", h.secret)
+        check(r.returncode == 0, "paired")
+        h.start()
+        m = until("REIMU-H264 8600 127.0.0.1")
+        check(m == "REIMU-H264 8600 127.0.0.1", "the agent's reimu-h264 active on 8600: its address to reimu-kvm (%s)" % m)
+        h.t.rm("/etc/systemd/system/reimu-h264.service")
+        m = until("REIMU-H264-OFF not_installed")
+        check(m == "REIMU-H264-OFF not_installed", "its service gone: why (%s)" % m)
+        h.stop()
+        m = until("REIMU-H264-OFF no_agent", 30)
+        check(m == "REIMU-H264-OFF no_agent", "the agent gone (%s)" % m)
+    finally:
+        u.close()
+        h.cleanup()
+        d.cleanup()
+
+
+TESTS = ["tls", "pair", "auth_fail", "replay", "limits", "ipv6", "no_ipv4", "data", "idle_cpu", "gpu_temp_fresh", "agent", "kvm_hint"]
 
 if __name__ == "__main__":
     d = Daemon().start()
@@ -570,6 +619,8 @@ if __name__ == "__main__":
                     t_gpu_temp_fresh(d, key)
                 elif name == "agent":
                     t_agent()
+                elif name == "kvm_hint":
+                    t_kvm_hint()
             except Exception as e:
                 import traceback
                 traceback.print_exc()

@@ -25,6 +25,21 @@ back (after a reboot of the host).
 после reimu-fand --failsafe); удаление агента возвращает управление хосту
 (после его перезагрузки).
 
+With a video card besides the ASPEED (systemd, ffmpeg with VAAPI) the agent
+also sets up the picture of the BMC's web KVM: reimu-h264 (the screen as H.264
+from the video card, 60 frames/s) and reimu-fbmirror (the X screen into the
+ASPEED VGA for the BMC's own JPEG; built here, needs gcc and the libxcb
+headers, only when the video card is the boot VGA). Every install or update
+of the agent updates and restarts them; the BMC learns their state from the
+agent (the KVM page says why when there is no H.264).
+
+С видеокартой помимо ASPEED (systemd, ffmpeg с VAAPI) агент настраивает и
+картинку веб-KVM BMC: reimu-h264 (экран в H.264 видеокартой, 60 к/с) и
+reimu-fbmirror (экран X в VGA ASPEED для JPEG самого BMC; собирается здесь,
+нужны gcc и заголовки libxcb, только если видеокарта — загрузочная VGA).
+Каждая установка или обновление агента обновляет и перезапускает их; BMC
+узнаёт их состояние от агента (страница KVM скажет, почему нет H.264).
+
 Install / Установка (root, python3 required / нужен python3):
 
   From this disk / с этого диска (the pairing string is in PAIRING.TXT):
@@ -52,7 +67,8 @@ python3 3.6 or newer / python3 версии 3.6 или новее.
 
 Files / файлы: install.sh (checks the SHA-256 of the files below / проверяет
 SHA-256 файлов), reimu-hostd.py, reimu-hostd.service, reimu-hostd.conf,
-reimu-hostd.init,
+reimu-hostd.init, reimu-h264.py, reimu-host.sh, reimu-fbmirror.c (the
+picture services / службы картинки KVM),
 PAIRING.TXT (the one-time pairing string, valid 15 min / одноразовая строка
 привязки, действует 15 минут; the BMC removes this disk after the agent
 connects / BMC отключает этот диск, когда агент подключится).

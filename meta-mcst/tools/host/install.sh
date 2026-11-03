@@ -16,6 +16,10 @@
 # both from the pairing string; or --url). Each file is checked against its
 # SHA-256 below, written in at the BMC's build: this file is fetched over the
 # pinned key, the files it fetches need no trust of their own.
+# Once paired, with a video card besides the ASPEED: the picture services of
+# the web KVM (reimu-h264, reimu-fbmirror; reimu-hostd.py kvm install), set up,
+# enabled and restarted by every install or update; KVM_FILES are optional
+# (an older BMC's bundle or page has none: then they are left as they are).
 # Installed: /usr/local/lib/reimu/reimu-hostd.py, the unit
 # /etc/systemd/system/reimu-hostd.service, /etc/reimu-hostd.conf (kept when
 # there), the key /etc/reimu-hostd/secret (by the pairing), the udev rule
@@ -44,6 +48,8 @@ REIMU_SUMS='
 REIMU_PAIR_DEFAULT=''
 
 FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init"
+# the picture services the agent sets up (optional: an older bundle lacks them)
+KVM_FILES="reimu-h264.py reimu-host.sh reimu-fbmirror.c"
 
 say() { printf '%s\n' "$*"; }
 # ru, then en
@@ -67,6 +73,8 @@ sha256_of() {
     else python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
     fi
 }
+
+optional() { case " $KVM_FILES " in *" $1 "*) return 0 ;; esac; return 1; }
 
 sum_wanted() { # name -> its SHA-256 from REIMU_SUMS
     printf '%s\n' "$REIMU_SUMS" | while read -r h n; do
@@ -149,6 +157,10 @@ get_net() { # dir
                     [ "$f" = "$first" ] && continue
                     fetch_$d "$u/agent/$f" "$1/$f" || die 3 "не удалось скачать $u/agent/$f" "could not download $u/agent/$f"
                 done
+                for f in $KVM_FILES; do
+                    [ -n "$(sum_wanted "$f")" ] || continue
+                    fetch_$d "$u/agent/$f" "$1/$f" || rm -f "$1/$f"
+                done
                 msg "Файлы агента скачаны с $u ($d)" "downloaded with $d from $u"
                 return 0
             fi
@@ -158,8 +170,12 @@ get_net() { # dir
 }
 
 get_payload() { # dir: the files after #__REIMU_PAYLOAD__ in this file
-    for f in $FILES; do
+    for f in $FILES $KVM_FILES; do
         awk -v n="$f" 'p && $1 == n { print $2 } $0 == "#__REIMU_PAYLOAD__" { p = 1 }' "$SELF" > "$1/$f.b64"
+        if [ ! -s "$1/$f.b64" ] && optional "$f"; then
+            rm -f "$1/$f.b64"
+            continue
+        fi
         if have base64; then base64 -d < "$1/$f.b64" > "$1/$f" 2>/dev/null
         else python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' < "$1/$f.b64" > "$1/$f"
         fi || die 3 "встроенный файл $f повреждён" "the embedded $f is damaged"
@@ -170,12 +186,14 @@ get_payload() { # dir: the files after #__REIMU_PAYLOAD__ in this file
 
 get_local() { # dir
     for f in $FILES; do cp "$SRC/$f" "$1/$f" || die 3 "не удалось прочитать $SRC/$f" "could not read $SRC/$f"; done
+    for f in $KVM_FILES; do [ ! -f "$SRC/$f" ] || cp "$SRC/$f" "$1/$f" || die 3 "не удалось прочитать $SRC/$f" "could not read $SRC/$f"; done
     msg "Файлы агента взяты из $SRC" "the agent's files from $SRC"
 }
 
 verify() { # dir
     unbuilt && return 0 # a copy of the source tree: the files next to it are as trusted as it is
-    for f in $FILES; do
+    for f in $FILES $KVM_FILES; do
+        [ -f "$1/$f" ] || ! optional "$f" || continue
         want=$(sum_wanted "$f")
         got=$(sha256_of "$1/$f")
         [ -n "$want" ] && [ "$want" = "$got" ] || die 3 "SHA-256 файла $f не совпадает с указанным в install.sh: файл подменён или повреждён, ничего не установлено" \
@@ -367,6 +385,13 @@ do_install() {
         msg "Не удалось передать шины I²C платформы BMC (агент всё равно отключает драйверы хоста)" \
             "the modprobe.d file or pwmd not handled (the agent unbinds the host's drivers anyway)"
     fi
+    # the picture services of the web KVM (H.264 from the video card, the mirror
+    # into the ASPEED VGA): set up, enabled and restarted with every install or
+    # update; only with a video card besides the ASPEED (the agent decides,
+    # its lines say what it did)
+    REIMU_HOSTD_ROOT="$REIMU_ROOT" REIMU_HOSTD_CONF="$CONF" python3 "$LIB/reimu-hostd.py" kvm install --from "$T" ||
+        msg "Службы картинки KVM (H.264 с видеокарты) не настроены: журнал выше" \
+            "the KVM picture services (H.264 from the video card) not set up: see above"
     if [ "$INIT" = sysv ]; then
         start_sysv
         return 0
@@ -402,6 +427,9 @@ do_uninstall() {
         sh "$INITD/reimu-hostd" stop >/dev/null 2>&1
         boot_off
     fi
+    # the agent's picture services (only those it set up: reimu-host.sh's own stay)
+    [ ! -f "$LIB/reimu-hostd.py" ] ||
+        REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" kvm remove 2>/dev/null
     # the hub rule stays while reimu-host.sh (the KVM side) is installed
     [ -f "$LIB/reimu-host.sh" ] || [ ! -f "$LIB/reimu-hostd.py" ] ||
         REIMU_HOSTD_ROOT="$REIMU_ROOT" python3 "$LIB/reimu-hostd.py" hub-rule remove 2>/dev/null

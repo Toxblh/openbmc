@@ -94,7 +94,8 @@ try {
   const sh = fs.readFileSync(f, "utf8");
   check(sh.startsWith("#!/bin/sh") && sh.includes(`\nREIMU_PAIR_DEFAULT='${out.pair}'\n`), "the installer has the current pairing string");
   const payload = sh.split("\n#__REIMU_PAYLOAD__\n")[1] || "";
-  check(payload.split("\n").filter(Boolean).map((l) => l.split(" ")[0]).join(" ") === "reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init", "and the agent's four files");
+  check(payload.split("\n").filter(Boolean).map((l) => l.split(" ")[0]).join(" ") === "reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init reimu-h264.py reimu-host.sh reimu-fbmirror.c",
+    "and the agent's four files, then the picture services it sets up");
   // the USB disk
   await agent.getByRole("button", { name: /USB-диск/ }).click();
   if ((process.env.AGENT_DISK || "error") === "error") {
@@ -117,5 +118,5 @@ try {
   await page.screenshot({ path: `${OUT}/agent-fail.png` }).catch(() => {});
 }
 check(errors.length === 0, `no page errors ${JSON.stringify(errors)}`);
-await browser.close();
+await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 process.exit(failed ? 1 : 0);

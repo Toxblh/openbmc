@@ -4,7 +4,7 @@ Tools that run on the host (1Э8СВ-uATX, E8C2, ALT-based Linux), not on the BM
 
 | file | what |
 |---|---|
-| `reimu-host.sh` | KVM: the X screen into the ASPEED VGA, H.264 from the GPU (`reimu-h264.py`), EDID, USB hub |
+| `reimu-host.sh` | KVM: the X screen into the ASPEED VGA, H.264 from the GPU (`reimu-h264.py`), EDID, USB hub. The agent's installer now sets up both picture services itself (`reimu-hostd.py kvm install`, files in the bundle); `reimu-host.sh install` is still the one way to the EDID and `console=ttyS1` |
 | `reimu-hostd.py` + `.service` + `.conf` | **the host agent**: inventory, health, GPU fan policy for the BMC (below) |
 | `install.sh` | the installer the BMC serves (`https://BMC/agent/install.sh`) and puts on its USB disk: fetches/checks (SHA-256) the agent's files, installs, pairs, starts; `--uninstall [--purge]` |
 | `mkbundle.sh`, `agent-README.txt` | the build of that bundle and of the USB disk image (recipe `reimu-agent-bundle`) |

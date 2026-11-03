@@ -46,12 +46,37 @@ ap.add_argument("--no-audio", action="store_true")
 ap.add_argument("--audio-bitrate", type=int, default=96, help="kbit/s")
 ap.add_argument("--announce-port", type=int, default=8443, help="reimu-kvm's port on the BMC (UDP)")
 ap.add_argument("--grab", choices=["auto", "kms", "x11"], default="auto")
+ap.add_argument("--state", default="", help="a JSON file with the state for the host agent (reimu-hostd)")
 ap.add_argument("--test", action="store_true")
 args = ap.parse_args()
 
 
 def log(*a):
     print(time.strftime("%F %T"), *a, flush=True)
+
+
+def peer_of(addr):
+    """the address a connection came from, as --allow has it: no ::ffff: of
+    IPv4, no %interface of a link-local address (Python adds it)"""
+    a = addr[0].split("%")[0]
+    return a[7:] if a.startswith("::ffff:") else a
+
+
+STATE = {}
+
+
+def write_state(path, **kw):
+    """what the agent reports to the BMC (reimu-hostd kvm status): the port,
+    the way of the grab, the last capture error (None after a good stream)"""
+    STATE.update(kw, pid=os.getpid(), at=int(time.time()))
+    if not path:
+        return
+    try:
+        with open(path + ".new", "w") as f:
+            json.dump(STATE, f)
+        os.rename(path + ".new", path)
+    except OSError:
+        pass
 
 
 def gpu():
@@ -332,6 +357,7 @@ def serve(conn, peer):
         w, h = size()
     except (RuntimeError, OSError) as e:
         log(f"{peer}: {e}")
+        write_state(args.state, error=str(e)[:200])
         conn.close()
         return
     p = subprocess.Popen(ffmpeg_cmd(w, h, "-"), stdout=subprocess.PIPE)
@@ -368,6 +394,10 @@ def serve(conn, peer):
                 proc.kill()
         conn.close()
         log(f"{peer}: closed after {n} frames")
+        if n:
+            write_state(args.state, error=None)
+        elif p.returncode not in (None, 0, -15):
+            write_state(args.state, error=f"ffmpeg ended ({p.returncode}) without a frame")
 
 
 def announce(bmcs):
@@ -392,6 +422,7 @@ def main():
     if GRAB == "kms":
         CARD = gpu()
         if not CARD:
+            write_state(args.state, port=args.port, grab=GRAB, error="no video card with a monitor (besides the ASPEED)")
             sys.exit("no video card with a monitor (besides the ASPEED)")
     elif not find_x():
         # the sound alone can still be served; the picture waits for a login
@@ -419,11 +450,12 @@ def main():
     s.listen(4)
     what = CARD if GRAB == "kms" else "display " + os.environ.get("DISPLAY", "(none yet)")
     log(f"reimu-h264 on :{args.port}, {GRAB} grab of {what}, allowed: {', '.join(sorted(allow))}")
+    write_state(args.state, port=args.port, grab=GRAB, card=what, error=None)
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     threading.Thread(target=announce, args=(sorted(allow),), daemon=True).start()
     while True:
         conn, addr = s.accept()
-        peer = addr[0].removeprefix("::ffff:")
+        peer = peer_of(addr)
         if peer not in allow:
             log(f"{peer}: refused (not in --allow)")
             conn.close()

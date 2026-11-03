@@ -1963,6 +1963,314 @@ class TestTransport(Base):
         self.assertIsNone(hd.parse_discovery(b"REIMU-HOSTLINK 2 5564 ab"))
 
 
+# ------------------------------------------------------------------ the picture services (KVM)
+import unittest.mock
+
+
+def mock_env(**kw):
+    return unittest.mock.patch.dict(os.environ, kw)
+
+
+AST = "/sys/devices/pci0000:00/0000:00:04.0/0000:05:00.0"
+H264_SRC = "#!/usr/bin/env python3\n# reimu-h264 (test copy)\n"
+HOST_SH = "#!/bin/sh\n# reimu-host.sh (test copy)\n"
+FBM_C = "/* reimu-fbmirror.c (test copy) */\n"
+
+
+def drm_cards(t, ast=True, dgpu=True, dgpu_boot=True):
+    """the DRM side of the board: card0 the ASPEED (the BMC's VGA), card1 the
+    video card, as /sys/class/drm shows them"""
+    if ast:
+        pci_dev(t, "0000:05:00.0", "/sys/devices/pci0000:00/0000:00:04.0", "1a03", "2000", "030000", "ast")
+        t.put(AST + "/boot_vga", "1" if not (dgpu and dgpu_boot) else "0")
+        d = AST + "/drm/card0"
+        t.link(d + "/device", AST)
+        t.put(d + "/card0-VGA-1/status", "connected")
+        t.link("/sys/class/drm/card0", d)
+        t.link("/sys/class/drm/card0-VGA-1", d + "/card0-VGA-1")
+    if dgpu:
+        t.put(GPU_DEV + "/boot_vga", "1" if dgpu_boot else "0")
+        d = GPU_DEV + "/drm/card1"
+        t.link(d + "/device", GPU_DEV)
+        t.put(d + "/card1-DP-1/status", "connected")
+        t.put(d + "/card1-HDMI-A-1/status", "disconnected")
+        t.link("/sys/class/drm/card1", d)
+        t.link("/sys/class/drm/card1-DP-1", d + "/card1-DP-1")
+
+
+class TestKvm(Base):
+    """the agent installs, updates and reports the host's picture services
+    (reimu-h264: H.264 from the video card; reimu-fbmirror: the X screen into
+    the ASPEED VGA for the BMC's JPEG): before, reimu-host.sh was a second
+    manual sudo step nobody updated, and the BMC never knew whether the host
+    could give H.264 (2026-11-03: an old reimu-h264 without announcements, the
+    KVM page silently on JPEG)"""
+
+    CFG = "BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79\n"
+
+    def setUp(self):
+        super().setUp()
+        self.src = tempfile.mkdtemp(prefix="kvmsrc-")
+        for n, body in (("reimu-h264.py", H264_SRC), ("reimu-host.sh", HOST_SH), ("reimu-fbmirror.c", FBM_C)):
+            open(os.path.join(self.src, n), "w").write(body)
+        self.t.put("/usr/bin/ffmpeg", "")
+        self.t.put("/usr/bin/python3", "")
+        self.run.table["pkg-config"] = (0, "-lxcb -lxcb-shm -lxcb-damage -lxcb-xfixes\n")
+
+        def gcc(argv):
+            out = argv[argv.index("-o") + 1]
+            open(out, "w").write("ELF")
+            return 0, ""
+        self.run.table["gcc"] = gcc
+        self.run.table["systemctl"] = (0, "")
+        self.env = mock_env(REIMU_INIT="systemd")
+        self.env.__enter__()
+
+    def tearDown(self):
+        self.env.__exit__(None, None, None)
+        shutil.rmtree(self.src, ignore_errors=True)
+        super().tearDown()
+
+    def install(self, cfg=None):
+        return hd.kvm_install(self.fs, self.run, hd.parse_config(cfg if cfg is not None else self.CFG), self.src)
+
+    def unit(self, name):
+        try:
+            return self.t.get("/etc/systemd/system/%s.service" % name)
+        except OSError:
+            return None
+
+    def sysctl(self):
+        return [c[1:] for c in self.run.calls if c[0] == "systemctl"]
+
+    def test_video_card_h264_and_mirror_installed_enabled_restarted(self):
+        drm_cards(self.t)
+        st = self.install()
+        self.assertEqual((st["h264"]["on"], st["mirror"]["on"]), (True, True), st)
+        u = self.unit("reimu-h264")
+        self.assertIn(hd.KVM_MARK, u)
+        self.assertRegex(u, r"ExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py .*--allow 192.168.10.79,fe80::9aa7:b0ff:fe06:f7e")
+        self.assertIn("--state /run/reimu-h264/state", u)
+        self.assertIn("RuntimeDirectory=reimu-h264", u)
+        self.assertIn("ProtectSystem=strict", u)
+        m = self.unit("reimu-fbmirror")
+        self.assertIn("ExecStart=/usr/local/lib/reimu/reimu-host.sh run-mirror", m)
+        self.assertIn(hd.KVM_MARK, m)
+        for f, body in (("reimu-h264.py", H264_SRC), ("reimu-host.sh", HOST_SH), ("reimu-fbmirror", "ELF")):
+            self.assertEqual(self.t.get("/usr/local/lib/reimu/" + f), body.strip(), f)
+        self.assertTrue(os.access(self.t.p("/usr/local/lib/reimu/reimu-h264.py"), os.X_OK))
+        calls = self.sysctl()
+        self.assertIn(["daemon-reload"], calls)
+        for s in ("reimu-h264.service", "reimu-fbmirror.service"):
+            self.assertIn(["enable", s], calls)
+            self.assertIn(["restart", s], calls)
+        self.assertLess(calls.index(["daemon-reload"]), calls.index(["restart", "reimu-h264.service"]))
+        self.assertIn('Option "AutoAddGPU" "false"', self.t.get(hd.KVM_XCONF), "X leaves the ASPEED to the mirror")
+        self.assertEqual(json.loads(self.t.get(hd.KVM_STATE))["h264"]["on"], True)
+
+    def test_no_video_card_nothing_installed(self):
+        """only the ASPEED: X draws on it itself; a mirror would write over it,
+        reimu-h264 would restart forever"""
+        drm_cards(self.t, dgpu=False)
+        st = self.install()
+        self.assertEqual((st["h264"]["on"], st["h264"]["reason"]), (False, "no_gpu"))
+        self.assertEqual((st["mirror"]["on"], st["mirror"]["reason"]), (False, "no_gpu"))
+        self.assertIsNone(self.unit("reimu-h264"))
+        self.assertIsNone(self.unit("reimu-fbmirror"))
+        self.assertFalse(self.t_exists(hd.KVM_XCONF))
+        self.assertFalse([c for c in self.sysctl() if c[:1] in (["enable"], ["restart"])], self.sysctl())
+
+    def test_no_drm_at_all(self):
+        st = self.install()
+        self.assertEqual(st["h264"]["reason"], "no_gpu")
+        self.assertIsNone(self.unit("reimu-h264"))
+
+    def test_video_card_gone_its_old_units_stopped(self):
+        """a unit of before (reimu-host.sh) on a host without the card now: stopped, not looping"""
+        drm_cards(self.t, dgpu=False)
+        self.t.put("/etc/systemd/system/reimu-h264.service", "[Service]\nExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py\n")
+        self.install()
+        self.assertIn(["disable", "--now", "reimu-h264.service"], self.sysctl())
+        self.assertIsNone(self.unit("reimu-h264"))
+
+    def test_card_not_the_boot_vga_no_mirror_no_xconf(self):
+        drm_cards(self.t, dgpu_boot=False)
+        st = self.install()
+        self.assertTrue(st["h264"]["on"])
+        self.assertEqual((st["mirror"]["on"], st["mirror"]["reason"]), (False, "not_boot_vga"))
+        self.assertIsNone(self.unit("reimu-fbmirror"))
+        self.assertFalse(self.t_exists(hd.KVM_XCONF))
+
+    def test_existing_x_config_kept(self):
+        drm_cards(self.t)
+        self.t.put("/etc/X11/xorg.conf.d/90-reimu-no-autogpu.conf", "# the user's own")
+        self.install()
+        self.assertFalse(self.t_exists(hd.KVM_XCONF))
+        self.assertEqual(self.t.get("/etc/X11/xorg.conf.d/90-reimu-no-autogpu.conf"), "# the user's own")
+
+    def test_no_ffmpeg(self):
+        drm_cards(self.t)
+        self.t.rm("/usr/bin/ffmpeg")
+        st = self.install()
+        self.assertEqual((st["h264"]["on"], st["h264"]["reason"]), (False, "no_ffmpeg"))
+        self.assertIsNone(self.unit("reimu-h264"))
+
+    def test_mirror_build_fails_h264_still_there(self):
+        drm_cards(self.t)
+        self.run.table["gcc"] = (1, "fatal error: xcb/xcb.h: No such file or directory")
+        st = self.install()
+        self.assertTrue(st["h264"]["on"])
+        self.assertEqual((st["mirror"]["on"], st["mirror"]["reason"]), (False, "build_failed"))
+        self.assertIn("xcb.h", st["mirror"]["text"])
+        self.assertIsNone(self.unit("reimu-fbmirror"))
+
+    def test_mirror_build_fails_old_binary_used(self):
+        drm_cards(self.t)
+        self.run.table["gcc"] = (1, "no gcc")
+        self.t.put("/usr/local/lib/reimu/reimu-fbmirror", "OLD")
+        st = self.install()
+        self.assertTrue(st["mirror"]["on"])
+        self.assertEqual(self.t.get("/usr/local/lib/reimu/reimu-fbmirror"), "OLD")
+
+    def test_bitrate_and_fps_of_before_kept(self):
+        drm_cards(self.t)
+        self.t.put("/etc/systemd/system/reimu-h264.service",
+                   "[Service]\nExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py --allow 192.168.10.79 --bitrate 12 --fps 30\n")
+        self.install()
+        u = self.unit("reimu-h264")
+        self.assertIn("--bitrate 12", u)
+        self.assertIn("--fps 30", u)
+        self.assertIn(hd.KVM_MARK, u)
+
+    def test_allow_from_an_explicit_bmc(self):
+        drm_cards(self.t)
+        self.install("BMC=10.0.0.5:5564\n")
+        self.assertIn("--allow 10.0.0.5 ", self.unit("reimu-h264"))
+
+    def test_no_systemd(self):
+        drm_cards(self.t)
+        with mock_env(REIMU_INIT="sysv"):
+            st = self.install()
+        self.assertEqual((st["h264"]["on"], st["h264"]["reason"]), (False, "no_systemd"))
+        self.assertIsNone(self.unit("reimu-h264"))
+
+    def test_files_missing_in_the_bundle(self):
+        """an older BMC's bundle (no picture files): the agent installs, the services are left as they are"""
+        drm_cards(self.t)
+        os.remove(os.path.join(self.src, "reimu-h264.py"))
+        st = self.install()
+        self.assertEqual(st["h264"]["reason"], "not_in_bundle")
+        self.assertIsNone(self.unit("reimu-h264"))
+
+    def test_remove_only_ours(self):
+        drm_cards(self.t)
+        self.install()
+        hd.kvm_remove(self.fs, self.run)
+        self.assertIsNone(self.unit("reimu-h264"))
+        self.assertIsNone(self.unit("reimu-fbmirror"))
+        self.assertIn(["disable", "--now", "reimu-h264.service"], self.sysctl())
+        self.assertFalse(self.t_exists("/usr/local/lib/reimu/reimu-h264.py"))
+        self.assertFalse(self.t_exists(hd.KVM_XCONF))
+        self.t.put("/etc/systemd/system/reimu-h264.service", "[Service]\nExecStart=/x\n")  # reimu-host.sh's
+        hd.kvm_remove(self.fs, self.run)
+        self.assertIsNotNone(self.unit("reimu-h264"), "not the agent's: left")
+
+    # -- the state the BMC gets
+    def is_active(self, word):
+        self.run.table["systemctl"] = lambda a: ((0 if word == "active" else 3), word + "\n") if a[1] == "is-active" else (0, "")
+
+    def test_status_active_with_port(self):
+        drm_cards(self.t)
+        self.install()
+        self.is_active("active")
+        s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual((s["h264"]["state"], s["h264"]["port"]), ("active", 8555))
+        self.assertEqual(s["mirror"]["state"], "active")
+
+    def test_status_port_from_the_unit(self):
+        self.t.put("/etc/systemd/system/reimu-h264.service", "[Service]\nExecStart=/usr/bin/python3 /x/reimu-h264.py --port 8600\n")
+        self.is_active("active")
+        self.assertEqual(hd.kvm_status(self.fs, self.run)["h264"]["port"], 8600)
+
+    def test_status_failed(self):
+        drm_cards(self.t)
+        self.install()
+        self.is_active("failed")
+        s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual((s["h264"]["state"], s["h264"]["reason"]), ("off", "failed"))
+
+    def test_status_capture_error_of_reimu_h264(self):
+        drm_cards(self.t)
+        self.install()
+        self.is_active("active")
+        self.t.put("/run/reimu-h264/state", json.dumps({"port": 8555, "error": "/dev/dri/card1: nothing on screen (blanked?)"}))
+        s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual(s["h264"]["state"], "active")
+        self.assertEqual(s["h264"]["error"], "/dev/dri/card1: nothing on screen (blanked?)")
+
+    def test_status_not_installed_says_why(self):
+        drm_cards(self.t, dgpu=False)
+        self.install()
+        s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual((s["h264"]["state"], s["h264"]["reason"]), ("off", "no_gpu"))
+
+    def test_status_never_installed(self):
+        s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual((s["h264"]["state"], s["h264"]["reason"]), ("off", "not_installed"))
+
+    def test_status_sysv(self):
+        with mock_env(REIMU_INIT="sysv"):
+            s = hd.kvm_status(self.fs, self.run)
+        self.assertEqual(s["h264"]["reason"], "no_systemd")
+
+    def test_metrics_carry_it(self):
+        drm_cards(self.t)
+        self.install()
+        self.is_active("active")
+        ag = hd.Agent(hd.parse_config(self.CFG), {}, self.fs, self.run)
+        m = ag.metrics(0, {"transport": "ipv4"})
+        self.assertEqual(m["kvm"]["h264"]["state"], "active")
+        self.assertEqual(m["kvm"]["h264"]["port"], 8555)
+        self.assertEqual(m["agent"]["version"], hd.VERSION)
+
+    def t_exists(self, path):
+        return os.path.exists(self.t.p(path))
+
+
+class TestH264(unittest.TestCase):
+    """reimu-h264.py itself: who may connect, what it tells the agent"""
+
+    @classmethod
+    def setUpClass(cls):
+        argv = sys.argv
+        sys.argv = ["reimu-h264.py"]
+        try:
+            loader = importlib.machinery.SourceFileLoader("reimu_h264", os.path.join(HERE, "..", "reimu-h264.py"))
+            spec = importlib.util.spec_from_loader("reimu_h264", loader)
+            cls.m = importlib.util.module_from_spec(spec)
+            loader.exec_module(cls.m)
+        finally:
+            sys.argv = argv
+
+    def test_peer_link_local_scope_dropped(self):
+        """Python gives a link-local peer with its %interface: it was never in --allow"""
+        self.assertEqual(self.m.peer_of(("fe80::9aa7:b0ff:fe06:f7e%enp1s1f1", 40000, 0, 2)), "fe80::9aa7:b0ff:fe06:f7e")
+        self.assertEqual(self.m.peer_of(("::ffff:192.168.10.79", 40000, 0, 0)), "192.168.10.79")
+
+    def test_state_file(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "state")
+            self.m.write_state(p, port=8555, error="x")
+            self.assertEqual(json.load(open(p))["error"], "x")
+            self.m.write_state(p, port=8555, error=None)
+            self.assertIsNone(json.load(open(p))["error"])
+            self.m.write_state("", port=1)  # no file asked: nothing
+            self.m.write_state("/nonexistent/dir/state", port=1)  # unwritable: no exception
+        finally:
+            shutil.rmtree(d)
+
+
 # ------------------------------------------------------------------ protocol
 class TestProtocol(unittest.TestCase):
     KEY = bytes(range(32))

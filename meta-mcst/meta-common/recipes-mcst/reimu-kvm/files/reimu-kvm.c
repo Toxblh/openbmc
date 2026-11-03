@@ -33,6 +33,11 @@
 // reimu-h264 announces itself every few seconds with a UDP datagram
 // "REIMU-H264 <port>" to this port: the BMC learns the host's address from it
 // (DHCP or not) and the stats carry it as "host" while it keeps coming.
+// reimu-hostlink (the host agent's link) says it too, on loopback only, every
+// 2 s: "REIMU-H264 <port> <address>" (the agent's host, the port of the
+// reimu-h264 the agent runs) or "REIMU-H264-OFF <reason>" (no_agent, no_gpu,
+// failed, ...: the stats carry it as "hoststate", the page says why). The
+// agent's word goes first; with no agent the host's own announcement counts.
 // And for H.264 (from the host's GPU encoder, while its OS runs), server -> browser:
 //   {"t":"h264","codec":...,"w":..,"h":..}  then  6  u8 type, u8 key frame, access unit
 //   (u8 2 instead of the key flag: an Opus packet of the host's sound, 48 kHz stereo)
@@ -835,14 +840,57 @@ static char announced[64];
 static double announced_at;
 #define ANNOUNCE_TTL 15.0
 
+// the agent's word (reimu-hostlink, loopback)
+static char hint_addr[80], hint_state[32];
+static double hint_at;
+
 static const char *announced_host(void)
 {
+    int hint = hint_at && now() - hint_at < ANNOUNCE_TTL;
+    if (hint && hint_addr[0]) return hint_addr;
+    if (hint && hint_state[0] && strcmp(hint_state, "no_agent")) return ""; // the agent says it can't
     return announced[0] && now() - announced_at < ANNOUNCE_TTL ? announced : "";
+}
+
+// why there is no host stream ("" while there is one, or nobody said)
+static const char *host_state(void)
+{
+    return hint_at && now() - hint_at < ANNOUNCE_TTL && !*announced_host() ? hint_state : "";
+}
+
+static int loopback(const struct sockaddr_storage *sa)
+{
+    if (sa->ss_family == AF_INET6) {
+        const struct in6_addr *a = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(a) || (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
+    }
+    return sa->ss_family == AF_INET && (ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr) >> 24) == 127;
+}
+
+// reimu-hostlink's "REIMU-H264 PORT ADDR" / "REIMU-H264-OFF REASON": 1 when it was one
+static int hint_read(const char *buf)
+{
+    char a[64], why[32];
+    int hport;
+    char was[80];
+    snprintf(was, sizeof was, "%s%s", hint_addr, hint_state);
+    if (sscanf(buf, "REIMU-H264-OFF %31[a-z0-9_]", why) == 1) {
+        hint_addr[0] = 0;
+        snprintf(hint_state, sizeof hint_state, "%s", why);
+    } else if (sscanf(buf, "REIMU-H264 %d %63[0-9A-Za-z.:%_-]", &hport, a) == 2 && hport > 0 && hport < 65536) {
+        snprintf(hint_addr, sizeof hint_addr, strchr(a, ':') ? "[%s]:%d" : "%s:%d", a, hport);
+        hint_state[0] = 0;
+    } else return 0;
+    hint_at = now();
+    char is[80];
+    snprintf(is, sizeof is, "%s%s", hint_addr, hint_state);
+    if (strcmp(was, is)) LOG("host agent: %s", hint_addr[0] ? hint_addr : hint_state);
+    return 1;
 }
 
 static void announce_read(int ufd)
 {
-    char buf[64];
+    char buf[128];
     struct sockaddr_storage sa;
     socklen_t sl = sizeof sa;
     ssize_t n;
@@ -850,7 +898,8 @@ static void announce_read(int ufd)
         buf[n] = 0;
         int hport;
         char ip[INET6_ADDRSTRLEN];
-        if (sscanf(buf, "REIMU-H264 %d", &hport) != 1 || hport < 1 || hport > 65535) continue;
+        if (loopback(&sa) && hint_read(buf)) { sl = sizeof sa; continue; }
+        if (sscanf(buf, "REIMU-H264 %d", &hport) != 1 || hport < 1 || hport > 65535) { sl = sizeof sa; continue; }
         if (sa.ss_family == AF_INET6) {
             struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&sa;
             if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr)) inet_ntop(AF_INET, &a6->sin6_addr.s6_addr[12], ip, sizeof ip);
@@ -1310,9 +1359,9 @@ int main(int argc, char **argv)
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 struct client *c = clients[i];
                 if (!c || c->state != C_WS) continue;
-                char s[400];
-                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d,\"host\":\"%s\",\"leds\":%d}",
-                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming, announced_host(), leds);
+                char s[512];
+                snprintf(s, sizeof s, "{\"t\":\"stat\",\"cap\":%.1f,\"same\":%.1f,\"kbps\":%.0f,\"sent\":%ld,\"skipped\":%ld,\"w\":%u,\"h\":%u,\"fps\":%d,\"q\":%d,\"sub420\":%d,\"viewers\":%d,\"signal\":%d,\"host\":\"%s\",\"hoststate\":\"%s\",\"leds\":%d}",
+                         n_frames / (t - stat_t), n_same / (t - stat_t), n_bytes * 8 / (t - stat_t) / 1000, c->frames, c->skipped, vw, vh, want_fps, quality, sub420, ws_clients(), streaming, announced_host(), host_state(), leds);
                 c->frames = c->skipped = 0;
                 // stats go out only between frames, never into the middle of one
                 if (c->outlen == c->outoff) ws_text(c, "%s", s);

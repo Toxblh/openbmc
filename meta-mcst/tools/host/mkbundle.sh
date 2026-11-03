@@ -3,7 +3,9 @@
 # reimu-agent-bundle runs it at build time; tests/test_install_sh.py too):
 #   OUT/agent/      install.sh (the SHA-256 of the files written into it),
 #                   reimu-hostd.py, reimu-hostd.service, reimu-hostd.conf,
-#                   reimu-hostd.init, SHA256SUMS, README.txt
+#                   reimu-hostd.init, the picture services the agent sets up
+#                   (reimu-h264.py, reimu-host.sh, reimu-fbmirror.c),
+#                   SHA256SUMS, README.txt
 #                                                  -> /usr/share/www/agent/
 #   --disk: OUT/disk.img  a FAT12 image «REIMU-AGENT» (1 MiB) with the same
 #                   files and PAIRING.TXT, 512 bytes of placeholder: the BMC's
@@ -14,7 +16,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$1
 DISK=${2:-}
-FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init"
+FILES="reimu-hostd.py reimu-hostd.service reimu-hostd.conf reimu-hostd.init reimu-h264.py reimu-host.sh reimu-fbmirror.c"
 A=$OUT/agent
 mkdir -p "$A"
 for f in $FILES; do

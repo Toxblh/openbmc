@@ -27,6 +27,12 @@ Tests (all by default, one boot):
   control   SetGpuFan over REST -> the fake pwm1 on this machine; a "GPU
             reset" re-applied; GpuTurbo; reimu-fand's SetTurbo followed;
             OsPower -> systemctl (the fake runner); bad arguments refused
+  kvm       the agent reports its reimu-h264 (a fake on this machine at
+            HL_PORT+3): reimu-hostlink tells reimu-kvm, the stat carries the
+            host, the page's request is relayed (a key frame through a wss
+            client on a forward HL_PORT+4 -> 8443 added by the monitor); its
+            service gone: hoststate not_installed. KVM_BINS=DIR: reimu-kvm and
+            reimu-hostlink from DIR over the image's
   drop      the daemon stopped: the agent returns the GPU to the driver
             (pwm1_enable 2) after LINK_LOST_SEC; started: it reconnects and
             sets the policy again; SIGKILL: systemd brings it back; the agent
@@ -36,7 +42,7 @@ Tests (all by default, one boot):
             ../e2e/host.qemu.mjs of the page (copied there; CHROME: chromium)
   memory    RSS of reimu-hostlink, its fds steady
 """
-import base64, hashlib, json, os, signal, socket, ssl, subprocess, sys, time
+import base64, hashlib, json, os, signal, socket, ssl, struct, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_ab_qemu as ab  # noqa: E402  (takes WORKDIR from sys.argv[1])
@@ -155,6 +161,7 @@ def main():
             t_agent(b, h)
             t_control(b, h)
             t_e2e()
+            t_kvm(b, h)
             t_drop(b, h)
         t_web(b)
         t_memory(b)
@@ -322,6 +329,193 @@ def t_e2e():
     if r.returncode:
         print(out[-1500:])
     action("SetGpuFan", "manual", 45)  # the page test left it on auto
+
+
+def hmp(b, line):
+    """a monitor command of the BMC's QEMU (its second QMP socket)"""
+    s = socket.socket(socket.AF_UNIX)
+    s.connect("%s/%s.qmp2" % (ab.RQ, b.name))
+    f = s.makefile("rw")
+    f.readline()
+    f.write('{"execute": "qmp_capabilities"}\n')
+    f.flush()
+    f.readline()
+    f.write('{"execute": "human-monitor-command", "arguments": {"command-line": "%s"}}\n' % line)
+    f.flush()
+    r = f.readline()
+    s.close()
+    return r
+
+
+class FakeH264:
+    """reimu-h264 on this machine (the guest reaches it as 10.0.2.2): the
+    BMC's request line, then the stream header and one key frame"""
+
+    def __init__(self, port):
+        self.port, self.requests = port, []
+        self.s = socket.socket()
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(("127.0.0.1", port))
+        self.s.listen(4)
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                c, _ = self.s.accept()
+            except OSError:
+                return
+            c.settimeout(3)
+            try:
+                self.requests.append(c.recv(16).decode(errors="replace").strip())
+                c.sendall(b'{"codec":"avc1.640028","w":1920,"h":1080,"fps":60,"audio":""}\n')
+                au = b"\x00\x00\x00\x01\x65" + b"\x88" * 100
+                c.sendall(struct.pack(">IB", len(au), 1) + au)
+                time.sleep(2)
+            except OSError:
+                pass
+            c.close()
+
+    def close(self):
+        self.s.close()
+
+
+class Ws:
+    """a websocket client of reimu-kvm (wss, the ticket from D-Bus)"""
+
+    def __init__(self, port, ticket):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        self.s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=20))
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall(("GET /kvm?t=%s HTTP/1.1\r\nHost: bmc\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (ticket, key)).encode())
+        self.buf = b""
+        while b"\r\n\r\n" not in self.buf:
+            d = self.s.recv(4096)
+            if not d:
+                raise OSError("closed in the handshake")
+            self.buf += d
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise OSError(head.split(b"\r\n")[0].decode())
+
+    def _need(self, n):
+        while len(self.buf) < n:
+            d = self.s.recv(65536)
+            if not d:
+                raise OSError("closed")
+            self.buf += d
+
+    def recv(self):
+        """(opcode, payload)"""
+        self._need(2)
+        op, ln = self.buf[0] & 15, self.buf[1] & 127
+        off = 2
+        if ln == 126:
+            self._need(4)
+            ln, off = struct.unpack(">H", self.buf[2:4])[0], 4
+        elif ln == 127:
+            self._need(10)
+            ln, off = struct.unpack(">Q", self.buf[2:10])[0], 10
+        self._need(off + ln)
+        p, self.buf = self.buf[off:off + ln], self.buf[off + ln:]
+        return op, p
+
+    def send_bin(self, data):
+        mask = os.urandom(4)
+        self.s.sendall(bytes([0x82, 0x80 | len(data)]) + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(data)))
+
+    def until(self, fn, timeout):
+        """the first message fn(op, payload) takes (returns not None), or None"""
+        end = time.time() + timeout
+        self.s.settimeout(2)
+        while time.time() < end:
+            try:
+                op, p = self.recv()
+            except socket.timeout:
+                continue
+            v = fn(op, p)
+            if v is not None:
+                return v
+        return None
+
+    def close(self):
+        self.s.close()
+
+
+def stat_of(op, p):
+    if op == 1:
+        m = json.loads(p)
+        if m.get("t") == "stat":
+            return m
+    return None
+
+
+def t_kvm(b, h):
+    """the host's H.264 from the agent's word: the agent reports its
+    reimu-h264 (kvm.h264 in the metrics), reimu-hostlink tells reimu-kvm the
+    agent's address, the page's request (7, no address) is relayed. Before:
+    only reimu-h264's own UDP announcement (an old reimu-h264 had none: the
+    board's KVM page stayed on JPEG, 2026-11-03). KVM_BINS=DIR: reimu-kvm and
+    reimu-hostlink from DIR bind-mounted over the image's (a build of the
+    tree before the image)"""
+    print("== kvm", flush=True)
+    bins = os.environ.get("KVM_BINS")
+    if bins:
+        ok = True
+        for n in ("reimu-kvm", "reimu-hostlink"):
+            ok &= b.scp(os.path.join(bins, n), "/tmp/%s.new" % n)
+            b.ssh("chmod +x /tmp/%s.new; umount /usr/sbin/%s 2>/dev/null; mount --bind /tmp/%s.new /usr/sbin/%s" % (n, n, n, n))
+        b.ssh("systemctl restart reimu-hostlink reimu-kvm")
+        check(ok, "KVM_BINS: reimu-kvm and reimu-hostlink of %s in place" % bins)
+        wait(lambda: state()["agent"]["connected"], 60)
+    hport, kport = HL_PORT + 3, HL_PORT + 4
+    fake = FakeH264(hport)
+    h.t.put("/etc/systemd/system/reimu-h264.service",
+            "[Service]\nExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py --port %d\n" % hport)
+    ws = None
+    try:
+        k = wait(lambda: ((state()["metrics"] or {}).get("kvm") or {}).get("h264", {}).get("state") == "active", 40)
+        check(k, "the agent reports its reimu-h264 active (metrics kvm.h264)")
+        want = "10.0.2.2:%d" % hport
+        j = wait(lambda: want in b.out("journalctl -u reimu-kvm -b --no-pager -o cat | grep 'host agent'"), 30)
+        check(j, "reimu-kvm: host agent: %s (from reimu-hostlink)" % want)
+        hmp(b, "hostfwd_remove n0 tcp:127.0.0.1:%d" % kport)
+        hmp(b, "hostfwd_add n0 tcp:127.0.0.1:%d-:8443" % kport)
+        t = b.out("busctl call xyz.openbmc_project.Reimu.Kvm /xyz/openbmc_project/reimu/kvm xyz.openbmc_project.Reimu.Kvm Ticket")
+        try:
+            tk = json.loads(json.loads(t.split(" ", 1)[1]))
+        except (ValueError, IndexError):
+            tk = {}
+        if not check(tk.get("ticket"), "a ticket from reimu-kvm: %s" % t.strip()[:80]):
+            return
+        ws = Ws(kport, tk["ticket"])
+        st = ws.until(lambda op, p: (lambda m: m if m and m.get("host") else None)(stat_of(op, p)), 20)
+        check(st and st["host"] == want and st.get("hoststate") == "",
+              "the page's stat: host %s, no hoststate (%r)" % (want, st and (st.get("host"), st.get("hoststate"))))
+        ws.send_bin(b"\x07")  # the page in Авто: the host that reimu-kvm knows
+        hdr = ws.until(lambda op, p: (lambda m: m if m.get("t") in ("h264", "h264off") else None)(json.loads(p)) if op == 1 else None, 20)
+        check(hdr and hdr["t"] == "h264" and hdr.get("w") == 1920, "the host's stream starts: %s" % hdr)
+        fr = ws.until(lambda op, p: p if op == 2 and p[:1] == b"\x06" else None, 15)
+        check(fr is not None and fr[1] == 1 and fr[2:7] == b"\x00\x00\x00\x01\x65", "a key frame relayed (type 6)")
+        check(fake.requests[:1] == ["VIDEO"], "reimu-h264 got the BMC's VIDEO request: %s" % fake.requests)
+        ws.close()
+        ws = None
+        # the agent says why there is none
+        h.t.rm("/etc/systemd/system/reimu-h264.service")
+        tk = json.loads(json.loads(b.out("busctl call xyz.openbmc_project.Reimu.Kvm /xyz/openbmc_project/reimu/kvm "
+                                         "xyz.openbmc_project.Reimu.Kvm Ticket").split(" ", 1)[1]))
+        ws = Ws(kport, tk["ticket"])
+        st = ws.until(lambda op, p: (lambda m: m if m and m.get("hoststate") else None)(stat_of(op, p)), 40)
+        check(st and st["hoststate"] == "not_installed" and st["host"] == "",
+              "its service gone: no host, hoststate not_installed (%r)" % ((st and (st.get("host"), st.get("hoststate"))),))
+    finally:
+        if ws:
+            ws.close()
+        fake.close()
+        hmp(b, "hostfwd_remove n0 tcp:127.0.0.1:%d" % kport)
+        h.t.rm("/etc/systemd/system/reimu-h264.service")
 
 
 def t_drop(b, h):

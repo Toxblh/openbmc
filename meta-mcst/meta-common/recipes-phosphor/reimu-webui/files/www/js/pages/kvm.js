@@ -4,8 +4,11 @@
 //  - H.264 from the host: while the platform's OS runs, reimu-h264 there
 //    encodes the desktop on the video card, reimu-kvm relays it (60 frames/s);
 //  - VNC: noVNC over bmcweb's /kvm/0 websocket to obmc-ikvm (works everywhere).
-// "Auto" takes H.264 when a host address is set and it answers, the direct
-// JPEG stream when reimu-kvm runs and the browser accepts its port, VNC otherwise.
+// "Auto" takes H.264 when reimu-kvm knows the host's reimu-h264 (the host agent
+// sets it up and tells the BMC: stat.host) or an address is set by hand, the
+// direct JPEG stream when reimu-kvm runs and the browser accepts its port, VNC
+// otherwise. Why there is no host stream comes as stat.hoststate (the agent's
+// word): said when H.264 is chosen, or in Auto when the capture failed.
 
 import { api, h, icon, toast } from "../api.js";
 import { RFB, KeyTable } from "../../vendor/novnc/novnc.js";
@@ -288,8 +291,21 @@ const ENGINE_TEXT = {
   vnc: "JPEG видеодвижка AST2500 → obmc-ikvm → bmcweb",
 };
 
+// stat.hoststate (reimu-hostlink -> reimu-kvm): why there is no H.264 from the host
+const HOST_STATE = {
+  no_agent: "агент хоста не подключён (страница «Хост» → «Подключить агент хоста»)",
+  not_installed: "агент хоста без захвата экрана: обновите агента (страница «Хост»)",
+  not_in_bundle: "агент хоста без захвата экрана: обновите агента (страница «Хост»)",
+  no_gpu: "на платформе нет видеокарты, кроме ASPEED",
+  no_ffmpeg: "на платформе нет ffmpeg",
+  no_systemd: "захват экрана агентом работает только с systemd",
+  failed: "служба захвата экрана на платформе (reimu-h264) упала: journalctl -u reimu-h264",
+  inactive: "служба захвата экрана на платформе (reimu-h264) остановлена",
+};
+const hostStateText = (st) => HOST_STATE[st] || (st ? `захват экрана на платформе: ${st}` : "агент хоста не сообщил о захвате экрана");
+
 function askHost() {
-  const v = prompt("Адрес reimu-h264 на платформе (IP[:порт], порт по умолчанию 8555). Пусто — автоматически: хост сам сообщает BMC свой адрес (на платформе один раз: sudo reimu-host.sh install)", prefs.h264Host || "");
+  const v = prompt("Адрес reimu-h264 на платформе (IP[:порт], порт по умолчанию 8555). Пусто — автоматически: адрес сообщает агент хоста", prefs.h264Host || "");
   if (v === null) return false;
   prefs.h264Host = v.trim() && !/:\d+$/.test(v.trim()) ? `${v.trim()}:8555` : v.trim();
   savePrefs();
@@ -372,6 +388,8 @@ async function connect() {
 
 let connecting = false;
 let hostAddr = ""; // reimu-h264 that announced itself to reimu-kvm
+let hostState = ""; // why there is none (the agent's word, stat.hoststate)
+let failSaid = false; // the capture's failure said once in Auto
 let hostRetryAt = 0; // no new H.264 attempt before this (after one failed)
 const wantH264 = () => prefs.source === "h264" || prefs.source === "auto";
 
@@ -395,7 +413,7 @@ function connectDirect(ticket) {
       r.useHost(prefs.h264Host);
       return;
     } else if (prefs.source === "h264") {
-      setTimeout(() => rfb === r && source === "direct" && !hostAddr && toast("Хост не найден: reimu-h264 на платформе не запущен (sudo reimu-host.sh install). Показываю JPEG видеодвижка", "err"), 4000);
+      setTimeout(() => rfb === r && source === "direct" && !hostAddr && toast(`H.264 с хоста недоступен: ${hostStateText(hostState)}. Показываю JPEG видеодвижка`, "err"), 4000);
     }
     toast("KVM подключён: прямой поток", "ok");
   });
@@ -409,6 +427,11 @@ function connectDirect(ticket) {
     }
     if (m.t === "stat") {
       hostAddr = m.host || "";
+      hostState = m.hoststate || "";
+      if (hostState === "failed" && prefs.source === "auto" && !failSaid && h264Supported()) {
+        failSaid = true;
+        toast(`H.264 с хоста: ${hostStateText(hostState)}. Показываю JPEG видеодвижка`, "err");
+      }
       if (hostAddr && !prefs.h264Host && source === "direct" && wantH264() && h264Supported() && Date.now() > hostRetryAt) {
         hostRetryAt = Date.now() + 30000;
         r.useHost("");

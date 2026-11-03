@@ -62,6 +62,12 @@ ignored. See README.md next to this file.
   sudo ./reimu-hostd.py bus-owner install|remove      the BMC the only master of
                      the shared I2C buses: the modules kept out, pwmd disabled
                      (its state written down; remove gives both back)
+  sudo ./reimu-hostd.py kvm install [--from DIR] | remove | status
+                     the picture services for the BMC's web KVM (reimu-h264:
+                     H.264 from the video card; reimu-fbmirror: the X screen
+                     into the ASPEED VGA) from the bundle's files in DIR, only
+                     with a video card besides the ASPEED; their state goes to
+                     the BMC in the metrics ("kvm"). install.sh runs it
 
 Config /etc/reimu-hostd.conf (KEY=VALUE), the key /etc/reimu-hostd/secret
 (root only). REIMU_HOSTD_ROOT=DIR: every /sys, /proc, /etc, /dev path under
@@ -1569,6 +1575,287 @@ def parse_pair_string(s):
     return d
 
 
+# ------------------------------------------------------------------ the picture services (KVM)
+# Installed, updated, enabled and restarted by the agent's installer (install.sh
+# runs `reimu-hostd.py kvm install` after each install or update), their state
+# reported to the BMC in every metrics ("kvm"): reimu-kvm takes the H.264 from
+# the address of the host the agent is on, the KVM page says why when there is
+# none. Only with a video card besides the ASPEED (card with a driver other
+# than ast): without one X draws on the ASPEED itself, a mirror would write
+# over it and reimu-h264 would restart forever. The mirror (reimu-fbmirror,
+# built here) only when that card is the boot VGA (X takes it, not the
+# ASPEED); its X config (AutoAddGPU off) only then and only when none is there.
+# The EDID of the ASPEED and the console= of boot.conf stay reimu-host.sh's.
+KVM_MARK = "# reimu-hostd kvm install: the agent's unit, written again by its updates"
+KVM_STATE = "/var/lib/reimu-hostd/kvm"
+KVM_UNIT_DIR = "/etc/systemd/system"
+KVM_XCONF = "/etc/X11/xorg.conf.d/20-reimu-ast-off.conf"
+KVM_XCONFS = (KVM_XCONF, "/etc/X11/xorg.conf.d/90-reimu-no-autogpu.conf")
+H264_STATE = "/run/reimu-h264/state"
+H264_PORT = 8555
+KVM_FILES = ("reimu-h264.py", "reimu-host.sh", "reimu-fbmirror.c")
+KVM_SERVICES = (("h264", "reimu-h264"), ("mirror", "reimu-fbmirror"))
+XCB = ["xcb", "xcb-shm", "xcb-damage", "xcb-xfixes"]
+
+
+def kvm_detect(fs):
+    """the DRM cards: the video card (not the ASPEED) and whether it is the boot VGA"""
+    out = {"dgpu": None, "dgpu_boot_vga": False, "ast": False}
+    for c in fs.glob("/sys/class/drm/card[0-9]*"):
+        name = os.path.basename(c)
+        if "-" in name:
+            continue
+        drv = fs.link_name(c + "/device/driver")
+        if drv == "ast":
+            out["ast"] = True
+        elif drv and out["dgpu"] is None:
+            out["dgpu"] = "/dev/dri/" + name
+            out["dgpu_boot_vga"] = fs.read(c + "/device/boot_vga") == "1"
+    return out
+
+
+def _on_path(fs, name):
+    return next((d + "/" + name for d in SYS_PATH.split(":") if fs.exists(d + "/" + name)), None)
+
+
+def _unit_path(name):
+    return "%s/%s.service" % (KVM_UNIT_DIR, name)
+
+
+def _put(fs, path, text, mode=0o644):
+    p = fs.p(path)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".new", "w") as f:
+        f.write(text)
+    os.chmod(p + ".new", mode)
+    os.rename(p + ".new", p)
+
+
+def _copy(fs, src, dst, mode):
+    p = fs.p(dst)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    shutil.copyfile(src, p + ".new")
+    os.chmod(p + ".new", mode)
+    os.rename(p + ".new", p)
+
+
+def _h264_allow(cfg):
+    out = []
+    if cfg.get("BMC"):
+        h = cfg["BMC"]
+        h = h[1:].split("]")[0] if h.startswith("[") else (h.rsplit(":", 1)[0] if h.count(":") == 1 else h)
+        out.append(h.split("%")[0])
+    if cfg.get("BMC_IPV4"):
+        out.append(cfg["BMC_IPV4"])
+    ll = ll_from_mac(cfg.get("BMC_MAC") or "")
+    if ll:
+        out.append(ll)
+    return ",".join(dict.fromkeys(out)) or "192.168.10.79"
+
+
+def _old_opt(text, opt, default):
+    m = re.search(r"%s\s+([0-9.]+)" % re.escape(opt), text or "")
+    return m.group(1) if m else default
+
+
+def h264_unit(fs, cfg):
+    old = fs.read(_unit_path("reimu-h264"), "")
+    py = _on_path(fs, "python3") or "/usr/bin/python3"
+    return """[Unit]
+Description=REIMU KVM: H.264 of the screen from the video card for the BMC (reimu-hostd)
+After=network.target
+%s
+
+[Service]
+ExecStart=%s %s/reimu-h264.py --allow %s --bitrate %s --fps %s --state %s
+Restart=always
+RestartSec=3
+# /run/user stays visible: the sound comes from the logged-in user's PipeWire
+InaccessiblePaths=-/root
+ProtectSystem=strict
+PrivateTmp=yes
+# Mesa's shader cache (the home directory is hidden from the service)
+CacheDirectory=reimu
+Environment=XDG_CACHE_HOME=/var/cache/reimu
+# its state for the agent (H264_STATE)
+RuntimeDirectory=reimu-h264
+
+[Install]
+WantedBy=multi-user.target
+""" % (KVM_MARK, py, LIB, _h264_allow(cfg), _old_opt(old, "--bitrate", "8"), _old_opt(old, "--fps", "60"), H264_STATE)
+
+
+def mirror_unit(fs):
+    old = fs.read(_unit_path("reimu-fbmirror"), "")
+    return """[Unit]
+Description=REIMU KVM: the X screen into the ASPEED VGA, the BMC's video engine (reimu-hostd)
+After=display-manager.service
+%s
+
+[Service]
+ExecStart=%s/reimu-host.sh run-mirror -f %s
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target
+""" % (KVM_MARK, LIB, _old_opt(old, "-f", "60"))
+
+
+def _ours(fs, name):
+    return KVM_MARK in (fs.read(_unit_path(name), "") or "")
+
+
+def _stop_unit(fs, run, name):
+    """a unit that can't work here: stopped, its file gone (it would restart forever)"""
+    if fs.exists(_unit_path(name)):
+        run(["systemctl", "disable", "--now", name + ".service"], timeout=60)
+        os.remove(fs.p(_unit_path(name)))
+        return True
+    return False
+
+
+def build_mirror(fs, run, src):
+    """reimu-fbmirror from its source: (ok, text); a binary of before stays on failure"""
+    rc, flags = run(["pkg-config", "--cflags", "--libs"] + XCB, timeout=30)
+    if rc == 0:
+        dst = fs.p(LIB + "/reimu-fbmirror")
+        rc, out = run(["gcc", "-O2", "-o", dst + ".new", src] + flags.split(), timeout=300)
+        if rc == 0 and os.path.exists(dst + ".new"):
+            os.chmod(dst + ".new", 0o755)
+            os.rename(dst + ".new", dst)
+            return True, ""
+    else:
+        out = flags
+    if fs.exists(LIB + "/reimu-fbmirror"):
+        return True, "built before: " + out.strip()[-200:]
+    return False, (out.strip() or "gcc or the libxcb headers missing")[-200:]
+
+
+def kvm_install(fs, run, cfg, here):
+    """the picture services from the files in HERE (the bundle): see above.
+    Returns, and keeps in KVM_STATE, {"h264"|"mirror": {"on", "reason", "text"}}"""
+    st = {k: {"on": False, "reason": None, "text": ""} for k, _ in KVM_SERVICES}
+
+    def off(k, reason, text=""):
+        st[k].update(on=False, reason=reason, text=text)
+
+    hw = kvm_detect(fs)
+    have = {f: os.path.exists(os.path.join(here, f)) for f in KVM_FILES}
+    if Init(fs, run).kind != "systemd":
+        for k, _ in KVM_SERVICES:
+            off(k, "no_systemd", "the picture services need systemd")
+    else:
+        changed = False
+        # H.264 of the video card
+        if not have["reimu-h264.py"]:
+            off("h264", "not_in_bundle", "reimu-h264.py not in the agent's bundle (an older BMC)")
+        elif not hw["dgpu"]:
+            off("h264", "no_gpu", "no video card besides the ASPEED")
+            changed |= _stop_unit(fs, run, "reimu-h264")
+        elif not _on_path(fs, "ffmpeg"):
+            off("h264", "no_ffmpeg", "ffmpeg not installed")
+        else:
+            if os.path.realpath(os.path.join(here, "reimu-h264.py")) != os.path.realpath(fs.p(LIB + "/reimu-h264.py")):
+                _copy(fs, os.path.join(here, "reimu-h264.py"), LIB + "/reimu-h264.py", 0o755)
+            _put(fs, _unit_path("reimu-h264"), h264_unit(fs, cfg))
+            st["h264"].update(on=True, text=hw["dgpu"])
+            changed = True
+        # the mirror into the ASPEED
+        if not (have["reimu-host.sh"] and have["reimu-fbmirror.c"]):
+            off("mirror", "not_in_bundle", "reimu-fbmirror.c or reimu-host.sh not in the agent's bundle")
+        elif not hw["dgpu"]:
+            off("mirror", "no_gpu", "no video card besides the ASPEED")
+            changed |= _stop_unit(fs, run, "reimu-fbmirror")
+        elif not hw["ast"]:
+            off("mirror", "no_ast", "no ASPEED VGA")
+        elif not hw["dgpu_boot_vga"]:
+            off("mirror", "not_boot_vga", "the video card is not the boot VGA: X may take the ASPEED")
+        else:
+            for f in ("reimu-host.sh", "reimu-fbmirror.c"):
+                if os.path.realpath(os.path.join(here, f)) != os.path.realpath(fs.p(LIB + "/" + f)):
+                    _copy(fs, os.path.join(here, f), LIB + "/" + f, 0o755 if f.endswith(".sh") else 0o644)
+            ok, text = build_mirror(fs, run, fs.p(LIB + "/reimu-fbmirror.c"))
+            if not ok:
+                off("mirror", "build_failed", text)
+            else:
+                if not any(fs.exists(x) for x in KVM_XCONFS):
+                    _put(fs, KVM_XCONF, "%s\n# X leaves the ASPEED card (BMC VGA) alone, reimu-fbmirror copies the screen into it\n"
+                         "Section \"ServerFlags\"\n    Option \"AutoAddGPU\" \"false\"\nEndSection\n" % KVM_MARK)
+                _put(fs, _unit_path("reimu-fbmirror"), mirror_unit(fs))
+                st["mirror"].update(on=True, text=text)
+                changed = True
+        if changed:
+            os.sync()  # a BMC reboot resets this host: no empty files
+            run(["systemctl", "daemon-reload"], timeout=60)
+        for k, name in KVM_SERVICES:
+            if st[k]["on"]:
+                run(["systemctl", "enable", name + ".service"], timeout=60)
+                rc, out = run(["systemctl", "restart", name + ".service"], timeout=60)
+                if rc:
+                    st[k]["text"] = ("restart: " + out.strip())[-200:]
+    try:
+        fs.write_atomic(KVM_STATE, json.dumps(st))
+    except OSError as e:
+        log("%s: %s" % (KVM_STATE, e))
+    for k, name in KVM_SERVICES:
+        log("%s: %s" % (name, "installed" + (" (%s)" % st[k]["text"] if st[k]["text"] else "") if st[k]["on"]
+                        else "not installed: %s" % (st[k]["text"] or st[k]["reason"])))
+    return st
+
+
+def kvm_remove(fs, run):
+    """only what kvm install wrote (its mark): reimu-host.sh's own units stay"""
+    gone = False
+    for _, name in KVM_SERVICES:
+        if _ours(fs, name):
+            gone |= _stop_unit(fs, run, name)
+    if gone:
+        for f in ("reimu-h264.py", "reimu-host.sh", "reimu-fbmirror.c", "reimu-fbmirror"):
+            if fs.exists(LIB + "/" + f):
+                os.remove(fs.p(LIB + "/" + f))
+        run(["systemctl", "daemon-reload"], timeout=60)
+    if KVM_MARK in (fs.read(KVM_XCONF, "") or ""):
+        os.remove(fs.p(KVM_XCONF))
+    if fs.exists(KVM_STATE):
+        os.remove(fs.p(KVM_STATE))
+
+
+def kvm_status(fs, run):
+    """for the BMC: {"h264"|"mirror": {"state": active|off|starting, "reason",
+    "port" (h264), "error" (the capture's last, by reimu-h264)}}"""
+    try:
+        inst = json.loads(fs.read(KVM_STATE) or "{}")
+    except ValueError:
+        inst = {}
+    sysv = Init(fs, run).kind != "systemd"
+    out = {}
+    for k, name in KVM_SERVICES:
+        s = {"state": "off", "reason": None}
+        if k == "h264":
+            s["port"] = int(_old_opt(fs.read(_unit_path(name), ""), "--port", str(H264_PORT)))
+        if sysv:
+            s["reason"] = "no_systemd"
+        elif fs.exists(_unit_path(name)):
+            rc, word = run(["systemctl", "is-active", name + ".service"], timeout=15)
+            word = (word.strip().splitlines() or [""])[-1].strip()
+            if word == "active" or (rc == 0 and not word):
+                s["state"] = "active"
+            elif word in ("activating", "reloading"):
+                s["state"] = "starting"
+            else:
+                s["reason"] = "failed" if word == "failed" else "inactive"
+        else:
+            s["reason"] = (inst.get(k) or {}).get("reason") or "not_installed"
+        if k == "h264" and s["state"] != "off":
+            try:
+                s["error"] = json.loads(fs.read(H264_STATE) or "{}").get("error")
+            except (ValueError, AttributeError):
+                s["error"] = None
+        out[k] = s
+    return out
+
+
 # ------------------------------------------------------------------ transport
 def ll_from_mac(mac):
     """the EUI-64 link-local address of a MAC (the BMC's eth0)"""
@@ -1889,10 +2176,7 @@ class Agent:
                     link.send({"t": "event", "data": e})
             if now >= next_metrics:
                 next_metrics = now + self.cfg["INTERVAL"]
-                m = self.col.metrics(now)
-                if m.get("gpu") is not None:
-                    m["gpu"]["policy"] = self.fan.state(now)
-                m["agent"] = {"version": VERSION, "interval": self.cfg["INTERVAL"], "transport": cand["transport"]}
+                m = self.metrics(now, cand)
                 link.send({"t": "metrics", "data": m})
                 self.after_metrics(link, m)
             if now >= next_inv:
@@ -1907,6 +2191,17 @@ class Agent:
                 for l in link.lines():
                     self.last_rx = time.monotonic()
                     self.on_message(link, l)
+
+    def metrics(self, now, cand):
+        m = self.col.metrics(now)
+        if m.get("gpu") is not None:
+            m["gpu"]["policy"] = self.fan.state(now)
+        m["agent"] = {"version": VERSION, "interval": self.cfg["INTERVAL"], "transport": cand["transport"]}
+        try:
+            m["kvm"] = kvm_status(self.fs, self.run)
+        except (OSError, ValueError) as e:
+            m["kvm"] = {"h264": {"state": "off", "reason": "error", "error": str(e)[:200], "port": H264_PORT}}
+        return m
 
     def on_message(self, link, l):
         m = parse_line(l)
@@ -2139,6 +2434,21 @@ def main(argv):
                 return 1
         except OSError as e:
             log_error("the BMC's I2C buses: %s" % e)
+            return 1
+    elif cmd == "kvm":
+        if len(argv) < 3 or argv[2] not in ("install", "remove", "status"):
+            raise SystemExit("usage: reimu-hostd.py kvm install [--from DIR] | remove | status")
+        if argv[2] == "status":
+            print(json.dumps(kvm_status(fs, run), indent=1))
+            return 0
+        try:
+            if argv[2] == "remove":
+                kvm_remove(fs, run)
+                return 0
+            src = argv[4] if len(argv) > 4 and argv[3] == "--from" else os.path.dirname(os.path.abspath(__file__))
+            kvm_install(fs, run, cfg, src)
+        except OSError as e:
+            log_error("the picture services: %s" % e)
             return 1
     elif cmd == "restore-auto":
         f = GpuFan(fs, load=False)

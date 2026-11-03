@@ -190,6 +190,7 @@ void hl_config_defaults(struct hl_config *c)
     c->logging = 1;
     snprintf(c->https_cert, sizeof(c->https_cert), "/etc/ssl/certs/https/server.pem");
     snprintf(c->disk_helper, sizeof(c->disk_helper), "/usr/libexec/reimu-agent-disk");
+    c->kvm_port = 8443;
 }
 
 int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int maxerr)
@@ -214,6 +215,7 @@ int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int 
         { "LOGGING", 'b', O(logging), 0, 0 },
         { "HTTPS_CERT", 'p', O(https_cert), 0, 0 },
         { "DISK_HELPER", 'p', O(disk_helper), 0, 0 },
+        { "KVM_PORT", 'i', O(kvm_port), 0, 65535 },
 #undef O
     };
     int nerr = 0;
@@ -1209,4 +1211,40 @@ void hl_json(struct hl *h, struct buf *b)
         buf_printf(b, "}");
     }
     buf_printf(b, "]}");
+}
+
+/* ------------------------------------------------------------------ the KVM hint */
+int hl_kvm_hint(const struct hl *h, char *out, size_t n)
+{
+    if (!hl_connected(h)) return snprintf(out, n, "REIMU-H264-OFF no_agent");
+    const char *peer = h->agent_peer;
+    if (!strncmp(peer, "::ffff:", 7) && strchr(peer + 7, '.')) peer += 7;
+    char state[16] = "active", reason[32] = "";
+    double port = 8555;
+    if (h->metrics.len)
+    {
+        struct jtok *t = malloc(sizeof(struct jtok) * 4096);
+        int k = t ? json_parse(h->metrics.s, h->metrics.len, t, 4096) : -1;
+        int v = k > 0 ? json_get(h->metrics.s, t, 0, "kvm.h264") : -1;
+        if (v >= 0 && t[v].type == J_OBJ)
+        {
+            const char *s = h->metrics.s;
+            if (json_str(s, t, json_get(s, t, v, "state"), state, sizeof(state))) snprintf(state, sizeof(state), "off");
+            json_str(s, t, json_get(s, t, v, "reason"), reason, sizeof(reason));
+            double p;
+            if (!json_num(s, t, json_get(s, t, v, "port"), &p) && p >= 1 && p <= 65535 && p == (int)p) port = p;
+        }
+        free(t);
+    }
+    if (strcmp(state, "active") && strcmp(state, "starting"))
+    {
+        /* a word for the page, nothing else: [a-z0-9_], at most 24 */
+        char r[25];
+        size_t j = 0;
+        for (const char *c = reason; *c && j < sizeof(r) - 1; c++)
+            if ((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_') r[j++] = *c;
+        r[j] = 0;
+        return snprintf(out, n, "REIMU-H264-OFF %s", j ? r : "inactive");
+    }
+    return snprintf(out, n, "REIMU-H264 %d %s", (int)port, peer);
 }

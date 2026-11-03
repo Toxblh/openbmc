@@ -80,6 +80,7 @@ struct hl_config
     int logging;          /* warning/critical events as Logging entries */
     char https_cert[128]; /* bmcweb's: the pin of its key for the install command */
     char disk_helper[128]; /* reimu-agent-disk: the installer's USB disk */
+    int kvm_port;          /* reimu-kvm's UDP port on loopback for hl_kvm_hint, 0 = none */
 };
 void hl_config_defaults(struct hl_config *c);
 /* KEY=VALUE text over c: the number of errors (in err[], defaults kept) */
@@ -229,6 +230,12 @@ void hl_json(struct hl *h, struct buf *b);
 const char *hl_heartbeat(const struct hl *h);
 int hl_connected(const struct hl *h);
 void hl_event(struct hl *h, int prio, const char *kind, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+/* for reimu-kvm (a datagram to [::1]:KVM_PORT every few seconds): where the
+ * host's H.264 (reimu-h264) is, "REIMU-H264 PORT ADDR" (the agent's address,
+ * the port its metrics kvm.h264 report; an older agent without kvm: 8555), or
+ * why there is none, "REIMU-H264-OFF REASON" (no_agent, or the agent's reason:
+ * no_gpu, failed, ...). Into out (always terminated), its length */
+int hl_kvm_hint(const struct hl *h, char *out, size_t n);
 /* the GPU temperature for reimu-fand: junction (edge if none), °C, NAN */
 double hl_gpu_temp(const struct hl *h);
 
