@@ -24,6 +24,11 @@ S = "${WORKDIR}/linux-${LINUX_VERSION}"
 # virtual media: DVD-sized ISOs (Windows, Linux installers) as a CD-ROM, not
 # cut at 2.2 GiB
 SRC_URI += "file://0002-usb-gadget-f_mass_storage-CD-ROM-images-bigger-than-2.2-GiB.patch"
+# QEMU's mx66l51235f (the A/B tests' BMC flash) has an SFDP that mainline's
+# Macronix table without the fixed fields can't parse ("BFPT parsing
+# failed"): the revert openbmc/linux dev-6.18 carries (61e0f969ac7d). The
+# board's flashes are Micron n25q512ax3, not affected.
+SRC_URI += "file://0003-Revert-mtd-spi-nor-macronix-Drop-the-redundant-flash-info-fields.patch"
 LIC_FILES_CHKSUM = "file://COPYING;md5=6bc538ed5bd9a7fc9398086aedcd7e46"
 
 do_add_mcst_files () {

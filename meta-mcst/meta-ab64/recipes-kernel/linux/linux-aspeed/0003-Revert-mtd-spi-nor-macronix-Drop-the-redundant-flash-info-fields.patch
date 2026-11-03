@@ -1,0 +1,117 @@
+From 61e0f969ac7d324436fcbee7d1f3e4312afa8ccb Mon Sep 17 00:00:00 2001
+From: Andrew Jeffery <andrew@codeconstruct.com.au>
+Date: Wed, 17 Dec 2025 11:58:48 +1030
+Subject: [PATCH] Revert "mtd: spi-nor: macronix: Drop the redundant flash info
+ fields"
+
+This reverts commit 947c86e481a027ed5948434096e506f307bd7114.
+
+Unfortunately, booting QEMU's ast2600-evb with 947c86e481a0 ("mtd:
+spi-nor: macronix: Drop the redundant flash info fields") fails as
+the MTD drivers fail to bind. Instead, they report:
+
+   BFPT parsing failed. Please consider using SPI_NOR_SKIP_SFDP when declaring the flash
+
+The failure does not occur on equivalent hardware. Reverting the change
+yields a successful boot in both environments, so do that while we track
+down the deficiency in QEMU.
+
+Signed-off-by: Andrew Jeffery <andrew@codeconstruct.com.au>
+---
+ drivers/mtd/spi-nor/macronix.c | 36 +++++++++++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/mtd/spi-nor/macronix.c b/drivers/mtd/spi-nor/macronix.c
+index e97f5cbd9aad23..538e2f16e2fd70 100644
+--- a/drivers/mtd/spi-nor/macronix.c
++++ b/drivers/mtd/spi-nor/macronix.c
+@@ -117,8 +117,10 @@ static const struct flash_info macronix_nor_parts[] = {
+ 		.name = "mx25l8005",
+ 		.size = SZ_1M,
+ 	}, {
+-		/* MX25L1606E */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x15),
++		.name = "mx25l1606e",
++		.size = SZ_2M,
++		.no_sfdp_flags = SECT_4K,
+ 	}, {
+ 		.id = SNOR_ID(0xc2, 0x20, 0x16),
+ 		.name = "mx25l3205d",
+@@ -130,21 +132,29 @@ static const struct flash_info macronix_nor_parts[] = {
+ 		.size = SZ_8M,
+ 		.no_sfdp_flags = SECT_4K,
+ 	}, {
+-		/* MX25L12805D */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x18),
++		.name = "mx25l12805d",
++		.size = SZ_16M,
+ 		.flags = SPI_NOR_HAS_LOCK | SPI_NOR_4BIT_BP,
++		.no_sfdp_flags = SECT_4K,
+ 	}, {
+-		/* MX25L25635E, MX25L25645G */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x19),
++		.name = "mx25l25635e",
++		.size = SZ_32M,
++		.no_sfdp_flags = SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+ 		.fixups = &mx25l25635_fixups
+ 	}, {
+-		/* MX66L51235F */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x1a),
++		.name = "mx66l51235f",
++		.size = SZ_64M,
++		.no_sfdp_flags = SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+ 		.fixup_flags = SPI_NOR_4B_OPCODES,
+ 		.fixups = &macronix_qpp4b_fixups,
+ 	}, {
+-		/* MX66L1G45G */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x1b),
++		.name = "mx66l1g45g",
++		.size = SZ_128M,
++		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+ 		.fixups = &macronix_qpp4b_fixups,
+ 	}, {
+ 		/* MX66L2G45G */
+@@ -186,16 +196,22 @@ static const struct flash_info macronix_nor_parts[] = {
+ 		.size = SZ_16M,
+ 		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+ 	}, {
+-		/* MX25U51245G */
+ 		.id = SNOR_ID(0xc2, 0x25, 0x3a),
++		.name = "mx25u51245g",
++		.size = SZ_64M,
++		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
++		.fixup_flags = SPI_NOR_4B_OPCODES,
+ 		.fixups = &macronix_qpp4b_fixups,
+ 	}, {
+ 		/* MX66U1G45G */
+ 		.id = SNOR_ID(0xc2, 0x25, 0x3b),
+ 		.fixups = &macronix_qpp4b_fixups,
+ 	}, {
+-		/* MX66U2G45G */
+ 		.id = SNOR_ID(0xc2, 0x25, 0x3c),
++		.name = "mx66u2g45g",
++		.size = SZ_256M,
++		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
++		.fixup_flags = SPI_NOR_4B_OPCODES,
+ 		.fixups = &macronix_qpp4b_fixups,
+ 	}, {
+ 		.id = SNOR_ID(0xc2, 0x26, 0x18),
+@@ -221,14 +237,16 @@ static const struct flash_info macronix_nor_parts[] = {
+ 		.size = SZ_4M,
+ 		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
+ 	}, {
+-		/* MX25UW51245G */
+ 		.id = SNOR_ID(0xc2, 0x81, 0x3a),
++		.name = "mx25uw51245g",
+ 		.n_banks = 4,
+ 		.flags = SPI_NOR_RWW,
+ 	}, {
+-		/* MX25L3255E */
+ 		.id = SNOR_ID(0xc2, 0x9e, 0x16),
+ 		.fixups = &mx25l3255e_fixups,
++		.name = "mx25l3255e",
++		.size = SZ_4M,
++		.no_sfdp_flags = SECT_4K,
+ 	},
+ 	/*
+ 	 * This spares us of adding new flash entries for flashes that can be
