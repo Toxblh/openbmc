@@ -1,15 +1,23 @@
-# openbmc/linux dev-6.18 instead of dev-5.10: the whole config in
-# reimu-5564/defconfig (the machine directory, ahead of meta-aspeed's aspeed-g5/)
-# (the 5.10 fragments and patches of the other layers don't apply)
+# Linux 7.3 stable from kernel.org instead of openbmc/linux dev-6.18 (an
+# experiment): none of the openbmc tree's own commits is used by this board
+# (its drivers are all upstream). The whole config in reimu-5564/defconfig
+# (the machine directory, ahead of meta-aspeed's aspeed-g5/), a minimal one
+# (make savedefconfig of 7.3).
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
-KBRANCH = "dev-6.18"
-LINUX_VERSION = "6.18.57"
-SRCREV = "0168b08a4c77fb172f2edc68551d8c16e511ecd4"
-SRC_URI = "git://github.com/openbmc/linux;protocol=https;branch=${KBRANCH} \
+LINUX_VERSION = "7.3.1"
+PV = "${LINUX_VERSION}"
+# a tarball (kernel-yocto makes it a git tree with one commit, branch master):
+# no SRCREV to check, no openbmc/linux clone on every CI build
+SRCREV = "INVALID"
+KBRANCH = "master"
+LINUX_VERSION_EXTENSION = "-reimu"
+SRC_URI = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${LINUX_VERSION}.tar.xz;name=kernel \
            file://defconfig \
            file://aspeed-bmc-mcst-reimu-5564.dts \
            file://reimu-ab64.dtsi \
           "
+SRC_URI[kernel.sha256sum] = "fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231"
+S = "${WORKDIR}/linux-${LINUX_VERSION}"
 # (no vhub remote-wakeup patch: making the manual remote wakeup an edge each
 # time did not wake the host's suspended hub on the board, 2026-10-25; the
 # host keeps the hub awake instead: power/control "on" for 1d6b:0107)
@@ -46,10 +54,10 @@ do_configure_prepend() {
 # no copy of the kernel in the rootfs' /boot (it is in the kernel partition)
 RDEPENDS_${KERNEL_PACKAGE_NAME}-base = ""
 
-# the kconfiglib of this Yocto's kern-tools can't parse 6.18's Kconfig
+# the kconfiglib of this Yocto's kern-tools can't parse 6.18+'s Kconfig
 do_kernel_configcheck[noexec] = "1"
 
-# 6.18's modules_install makes no "source" link, which kernel_do_install of
+# 6.18+'s modules_install makes no "source" link, which kernel_do_install of
 # this Yocto removes
 do_install_prepend() {
     install -d ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}
