@@ -3,6 +3,8 @@
 //    over its own wss://BMC:8443 (keyboard/mouse go back as USB HID usages);
 //  - H.264 from the host: while the platform's OS runs, reimu-h264 there
 //    encodes the desktop on the video card, reimu-kvm relays it (60 frames/s);
+//    H.265 instead when the browser decodes it (fewer bits for the BMC to
+//    relay); the host says which it sends;
 //  - VNC: noVNC over bmcweb's /kvm/0 websocket to obmc-ikvm (works everywhere).
 // "Auto" takes H.264 when reimu-kvm knows the host's reimu-h264 (the host agent
 // sets it up and tells the BMC: stat.host) or an address is set by hand, the
@@ -15,7 +17,7 @@ import { RFB, KeyTable } from "../../vendor/novnc/novnc.js";
 import { installAccel, accelStats } from "../lib/novnc-accel.js";
 import { keyBar, ARROWS, FKEYS } from "../lib/keybar.js";
 import { touchpad } from "../lib/touchpad.js";
-import { DirectKvm, directTicket, directStats, h264Supported, audioSupported } from "../lib/directkvm.js";
+import { DirectKvm, directTicket, directStats, h264Supported, hevcSupported, audioSupported } from "../lib/directkvm.js";
 
 export const fill = true;
 
@@ -26,6 +28,11 @@ const st = { frames: 0, lastFrames: 0, fps: 0, bytes: 0, lastBytes: 0, bps: 0 };
 let source = null; // "h264" | "direct" | "vnc" while connected
 let directFailed = false; // the direct stream did not open: fall back to VNC in auto
 const SOURCES = { auto: "Авто", h264: "H.264 с хоста (видеокарта)", direct: "Прямой JPEG (видеодвижок BMC)", vnc: "VNC" };
+// the host's codec: what the browser decodes before a stream, what the host
+// sends once there is one
+let hevcOk = false;
+let hostCodec = "";
+const hostName = () => hostCodec || (hevcOk ? "H.265" : "H.264");
 const QUALITY = [
   ["Экономно (≈30 к/с, 4:2:0)", { fps: 30, quality: 0, sub420: true }],
   ["Плавно (до 60 к/с, 4:2:0)", { fps: 60, quality: 0, sub420: true }],
@@ -118,9 +125,10 @@ export async function mount(el) {
           { class: "dropdown-menu", id: "kvm-src-menu" },
           h("div", { class: "dropdown-label" }, "Источник"),
           Object.entries(SOURCES).map(([k, v]) => h("button", { "data-src": k }, v)),
-          h("div", { class: "dropdown-label" }, "H.264 с хоста"),
+          // by hand only while no agent gives the address (or one was typed before)
           h("button", { "data-host": "1", title: "Адрес reimu-h264 на платформе (её IP и порт, по умолчанию 8555)" }, "Адрес хоста…"),
-          h("div", { class: "dropdown-label" }, "Прямой JPEG"),
+          // the JPEG's settings only while the JPEG is shown
+          h("div", { class: "dropdown-label", "data-qlabel": "1" }, "Качество JPEG"),
           QUALITY.map(([label], i) => h("button", { "data-q": i }, label)),
         ),
       ),
@@ -237,6 +245,10 @@ export async function mount(el) {
     else screen.requestFullscreen().catch((e) => toast(e.message, "err"));
   });
   statTimer = setInterval(updateStats, 1000);
+  hevcSupported().then((v) => {
+    hevcOk = v;
+    if (root) applyPrefs();
+  });
   connect();
 }
 
@@ -247,10 +259,11 @@ function applyPrefs() {
   $("kvm-view").classList.toggle("active", prefs.viewOnly);
   $("kvm-tp").classList.toggle("active", prefs.touchpad);
   $("kvm-more").querySelector('[data-for="kvm-view"]').textContent = `${prefs.viewOnly ? "✓ " : ""}Только просмотр`;
-  for (const b of root.querySelectorAll("#kvm-src-menu [data-src]")) b.textContent = `${b.dataset.src === prefs.source ? "✓ " : ""}${SOURCES[b.dataset.src]}`;
+  for (const b of root.querySelectorAll("#kvm-src-menu [data-src]"))
+    b.textContent = `${b.dataset.src === prefs.source ? "✓ " : ""}${b.dataset.src === "h264" ? `${hostName()} с хоста (видеокарта)` : SOURCES[b.dataset.src]}`;
   for (const b of root.querySelectorAll("#kvm-src-menu [data-q]")) b.textContent = `${+b.dataset.q === prefs.quality ? "✓ " : ""}${QUALITY[b.dataset.q][0]}`;
-  $("kvm-src-btn").textContent = { auto: "Источник", h264: "H.264", direct: "JPEG", vnc: "VNC" }[prefs.source];
-  $("kvm-src-menu").querySelector("[data-host]").textContent = `Адрес хоста: ${prefs.h264Host || `авто${hostAddr ? `, ${hostAddr}` : ""}`}…`;
+  $("kvm-src-btn").textContent = { auto: "Источник", h264: hostName(), direct: "JPEG", vnc: "VNC" }[prefs.source];
+  menuItems();
   const hint = $("kvm-touch-hint");
   if (hint) hint.textContent = prefs.touchpad ? "тап — клик · 2 пальца — правый клик, прокрутка · двойной тап и вести — перетащить" : "тап — клик · 2 пальца — правый клик, прокрутка";
   if (tp) tp.set(coarse && prefs.touchpad && !prefs.viewOnly);
@@ -267,6 +280,18 @@ function applyPrefs() {
   }
 }
 
+// what the source menu shows besides the sources: the host address while no
+// agent gives it (or while one typed before is in use, to clear it), the JPEG
+// quality while the JPEG is shown
+function menuItems() {
+  if (!root) return;
+  const host = root.querySelector("#kvm-src-menu [data-host]");
+  host.hidden = !prefs.h264Host && !!hostAddr;
+  host.textContent = `Адрес хоста: ${prefs.h264Host || "авто"}…`;
+  const jpeg = source ? source === "direct" : prefs.source === "direct";
+  for (const b of root.querySelectorAll("#kvm-src-menu [data-q], #kvm-src-menu [data-qlabel]")) b.hidden = !jpeg;
+}
+
 function setState(text, showOverlay, withButton, ...extra) {
   if (!root) return;
   root.querySelector("#kvm-state").textContent = text;
@@ -281,14 +306,14 @@ function setState(text, showOverlay, withButton, ...extra) {
 }
 
 const SRC_TEXT = {
-  h264: "H.264 с хоста",
-  direct: "прямой JPEG",
-  vnc: "VNC",
+  h264: () => `${hostName()} с хоста`,
+  direct: () => "прямой JPEG",
+  vnc: () => "VNC",
 };
 const ENGINE_TEXT = {
-  h264: "H.264 видеокарты хоста (reimu-h264) → BMC → браузер",
-  direct: "JPEG видеодвижка AST2500 → браузер (reimu-kvm, :8443)",
-  vnc: "JPEG видеодвижка AST2500 → obmc-ikvm → bmcweb",
+  h264: () => `${hostName()} видеокарты хоста (reimu-h264) → BMC → браузер`,
+  direct: () => "JPEG видеодвижка AST2500 → браузер (reimu-kvm, :8443)",
+  vnc: () => "JPEG видеодвижка AST2500 → obmc-ikvm → bmcweb",
 };
 
 // stat.hoststate (reimu-hostlink -> reimu-kvm): why there is no H.264 from the host
@@ -319,8 +344,9 @@ function setSource(s) {
   st.lastFrames = s === "direct" ? directStats.frames : accelStats.frames;
   st.lastBytes = s === "direct" ? directStats.bytes : st.bytes;
   if (!root) return;
-  root.querySelector("#kvm-src").textContent = s ? SRC_TEXT[s] : "—";
-  root.querySelector("#kvm-engine").textContent = ENGINE_TEXT[s] || "";
+  root.querySelector("#kvm-src").textContent = s ? SRC_TEXT[s]() : "—";
+  root.querySelector("#kvm-engine").textContent = s ? ENGINE_TEXT[s]() : "";
+  menuItems();
 }
 
 function reconnect() {
@@ -392,6 +418,8 @@ let hostState = ""; // why there is none (the agent's word, stat.hoststate)
 let failSaid = false; // the capture's failure said once in Auto
 let hostRetryAt = 0; // no new H.264 attempt before this (after one failed)
 const wantH264 = () => prefs.source === "h264" || prefs.source === "auto";
+// the host's stream, as H.265 when the browser decodes it
+const askHostStream = (r, addr) => hevcSupported().then((hevc) => rfb === r && r.useHost(addr, hevc));
 
 function connectDirect(ticket) {
   const r = (rfb = new DirectKvm(screen, ticket));
@@ -410,23 +438,28 @@ function connectDirect(ticket) {
     if (wantH264() && !h264Supported()) {
       if (prefs.source === "h264") toast("Браузер не умеет WebCodecs (H.264): показываю JPEG видеодвижка", "err");
     } else if (wantH264() && prefs.h264Host) {
-      r.useHost(prefs.h264Host);
+      askHostStream(r, prefs.h264Host);
       return;
     } else if (prefs.source === "h264") {
-      setTimeout(() => rfb === r && source === "direct" && !hostAddr && toast(`H.264 с хоста недоступен: ${hostStateText(hostState)}. Показываю JPEG видеодвижка`, "err"), 4000);
+      setTimeout(() => rfb === r && source === "direct" && !hostAddr && toast(`${hostName()} с хоста недоступен: ${hostStateText(hostState)}. Показываю JPEG видеодвижка`, "err"), 4000);
     }
     toast("KVM подключён: прямой поток", "ok");
   });
   r.addEventListener("status", (e) => {
     const m = e.detail;
     if (m.t === "h264") {
+      hostCodec = /^(hev1|hvc1)/.test(m.codec || "") ? "H.265" : "H.264";
       setSource("h264");
+      applyPrefs();
       setState("подключено", false);
-      toast(`KVM: H.264 с хоста, ${m.w}×${m.h} до ${m.fps} к/с${m.audio ? ", со звуком" : ""}`, "ok");
+      toast(`KVM: ${hostCodec} с хоста, ${m.w}×${m.h} до ${m.fps} к/с${m.audio ? ", со звуком" : ""}`, "ok");
       return;
     }
     if (m.t === "stat") {
-      hostAddr = m.host || "";
+      if ((m.host || "") !== hostAddr) {
+        hostAddr = m.host || "";
+        menuItems();
+      }
       hostState = m.hoststate || "";
       if (hostState === "failed" && prefs.source === "auto" && !failSaid && h264Supported()) {
         failSaid = true;
@@ -434,14 +467,15 @@ function connectDirect(ticket) {
       }
       if (hostAddr && !prefs.h264Host && source === "direct" && wantH264() && h264Supported() && Date.now() > hostRetryAt) {
         hostRetryAt = Date.now() + 30000;
-        r.useHost("");
+        askHostStream(r, "");
       }
     }
     if (m.t === "audio") return toast("Звук с хоста", "ok");
     if (m.t === "audiooff") return;
     if (m.t === "h264off") {
       hostRetryAt = Date.now() + 30000;
-      if (source === "h264" || prefs.source === "h264") toast(`H.264 с хоста недоступен (${m.reason}): показываю JPEG видеодвижка`, "err");
+      if (source === "h264" || prefs.source === "h264") toast(`${hostName()} с хоста недоступен (${m.reason}): показываю JPEG видеодвижка`, "err");
+      hostCodec = "";
       setSource("direct");
       return;
     }

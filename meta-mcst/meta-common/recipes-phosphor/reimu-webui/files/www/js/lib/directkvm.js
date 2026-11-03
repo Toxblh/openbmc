@@ -55,6 +55,19 @@ ASCII[" "] = ["Space", false];
 export const directStats = { frames: 0, bytes: 0, dropped: 0, decodeMs: 0, server: null, codec: "jpeg" };
 
 export const h264Supported = () => typeof VideoDecoder === "function" && typeof EncodedVideoChunk === "function";
+// H.265 (Main, level 4.1, Annex B as the host's hevc_vaapi sends it): about a
+// third fewer bits than H.264 for the same picture, less for the BMC to relay;
+// only where the browser decodes it (a hardware decoder, mostly)
+const HEVC = "hev1.1.6.L123.B0";
+let hevcOk = null;
+export async function hevcSupported() {
+  if (hevcOk === null) {
+    hevcOk = h264Supported()
+      ? VideoDecoder.isConfigSupported({ codec: HEVC, optimizeForLatency: true }).then((r) => !!r.supported, () => false)
+      : Promise.resolve(false);
+  }
+  return hevcOk;
+}
 export const audioSupported = () => typeof AudioDecoder === "function" && typeof AudioContext === "function";
 
 // a ticket for one connection, or null when reimu-kvm does not run
@@ -169,10 +182,12 @@ export class DirectKvm extends EventTarget {
   }
 
   // ---- H.264 from the host
-  // ask reimu-kvm to take the host's stream ("host:port" of reimu-h264)
-  useHost(addr) {
+  // ask reimu-kvm to take the host's stream ("host:port" of reimu-h264; then
+  // "\nhevc" when H.265 is welcome: the host says what it sends)
+  useHost(addr, hevc = false) {
     if (this._ws.readyState !== 1) return;
-    this._ws.send(new Uint8Array([7, ...new TextEncoder().encode(addr)]));
+    this._hostAddr = addr;
+    this._ws.send(new Uint8Array([7, ...new TextEncoder().encode(addr + (hevc ? "\nhevc" : ""))]));
   }
 
   useEngine() {
@@ -184,30 +199,44 @@ export class DirectKvm extends EventTarget {
     this._h264Stop();
     this._needKey = true;
     this._ts = 0;
+    const hevc = /^(hev1|hvc1)/.test(m.codec);
+    let shown = 0;
     const dec = (this._dec = new VideoDecoder({
       output: (frame) => {
         if (this._dec !== dec) return frame.close();
-        const w = frame.displayWidth, hh = frame.displayHeight;
+        // the screen's size from the host's header: Mesa's H.265 encoder
+        // (radeonsi) writes a wrong crop window, the frame comes out wider and
+        // taller (1366x768 as 1406x768, 1920x1080 as 1920x1088) with junk at
+        // the right and the bottom
+        const w = Math.min(m.w || frame.displayWidth, frame.displayWidth), hh = Math.min(m.h || frame.displayHeight, frame.displayHeight);
         if (this._canvas.width !== w || this._canvas.height !== hh) {
           this._canvas.width = this._fbWidth = w;
           this._canvas.height = this._fbHeight = hh;
           this._applyView();
         }
-        this._ctx.drawImage(frame, 0, 0);
+        this._ctx.drawImage(frame, 0, 0, w, hh, 0, 0, w, hh);
         frame.close();
+        shown++;
         directStats.frames++;
         if (this._t0.length) directStats.decodeMs = directStats.decodeMs * 0.9 + (performance.now() - this._t0.shift()) * 0.1;
       },
       error: (e) => {
         // a broken frame: wait for the next key frame (one a second)
-        console.warn("H.264 decoder:", e.message);
-        if (this._dec === dec) this._h264Start(m);
+        console.warn(`${hevc ? "H.265" : "H.264"} decoder:`, e.message);
+        if (this._dec !== dec) return;
+        // H.265 said to be decodable, but not a frame came out: H.264 then
+        if (hevc && !shown) {
+          hevcOk = Promise.resolve(false);
+          this._h264Stop();
+          return this.useHost(this._hostAddr || "", false);
+        }
+        this._h264Start(m);
       },
     }));
     this._t0 = [];
     // Annex B input: no description
     dec.configure({ codec: m.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
-    directStats.codec = "h264";
+    directStats.codec = /^(hev1|hvc1)/.test(m.codec) ? "h265" : "h264";
   }
 
   _h264Stop() {

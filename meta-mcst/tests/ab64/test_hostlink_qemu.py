@@ -349,7 +349,8 @@ def hmp(b, line):
 
 class FakeH264:
     """reimu-h264 on this machine (the guest reaches it as 10.0.2.2): the
-    BMC's request line, then the stream header and one key frame"""
+    BMC's request line, then the stream header and one key frame (H.265 when
+    the request says "hevc")"""
 
     def __init__(self, port):
         self.port, self.requests = port, []
@@ -367,9 +368,14 @@ class FakeH264:
                 return
             c.settimeout(3)
             try:
-                self.requests.append(c.recv(16).decode(errors="replace").strip())
-                c.sendall(b'{"codec":"avc1.640028","w":1920,"h":1080,"fps":60,"audio":""}\n')
-                au = b"\x00\x00\x00\x01\x65" + b"\x88" * 100
+                req = c.recv(64).decode(errors="replace").strip()
+                self.requests.append(req)
+                if "hevc" in req.split()[1:]:
+                    c.sendall(b'{"codec":"hev1.1.6.L123.B0","w":1920,"h":1080,"fps":60,"audio":""}\n')
+                    au = b"\x00\x00\x00\x01\x26\x01" + b"\x88" * 100  # IDR_W_RADL
+                else:
+                    c.sendall(b'{"codec":"avc1.640028","w":1920,"h":1080,"fps":60,"audio":""}\n')
+                    au = b"\x00\x00\x00\x01\x65" + b"\x88" * 100
                 c.sendall(struct.pack(">IB", len(au), 1) + au)
                 time.sleep(2)
             except OSError:
@@ -500,6 +506,14 @@ def t_kvm(b, h):
         fr = ws.until(lambda op, p: p if op == 2 and p[:1] == b"\x06" else None, 15)
         check(fr is not None and fr[1] == 1 and fr[2:7] == b"\x00\x00\x00\x01\x65", "a key frame relayed (type 6)")
         check(fake.requests[:1] == ["VIDEO"], "reimu-h264 got the BMC's VIDEO request: %s" % fake.requests)
+        # a page that decodes H.265 says so after the address (none: the
+        # agent's host); reimu-kvm passes it on, the host's header says what comes
+        ws.send_bin(b"\x07\nhevc")
+        hdr = ws.until(lambda op, p: (lambda m: m if m.get("t") in ("h264", "h264off") else None)(json.loads(p)) if op == 1 else None, 20)
+        check(hdr and hdr["t"] == "h264" and str(hdr.get("codec", "")).startswith("hev1"), "H.265 asked for: the host's H.265 header relayed: %s" % hdr)
+        fr = ws.until(lambda op, p: p if op == 2 and p[:1] == b"\x06" else None, 15)
+        check(fr is not None and fr[1] == 1 and fr[2:8] == b"\x00\x00\x00\x01\x26\x01", "an H.265 key frame relayed (type 6)")
+        check(fake.requests[1:2] == ["VIDEO hevc"], "reimu-h264 got the BMC's request for H.265: %s" % fake.requests)
         ws.close()
         ws = None
         # the agent says why there is none

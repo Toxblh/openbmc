@@ -23,7 +23,9 @@
 //   4  u8 type                               release all keys and buttons
 //   5  u8 type, u8 fps, u8 quality, u8 420   capture settings (0 keeps one)
 //   7  u8 type, "host:port"                  take H.264 from reimu-h264 on the host
-//                                            (empty: the host that announced itself)
+//                                            (empty: the host that announced itself);
+//                                            "\nhevc" after it: H.265 welcome too
+//                                            (the host's header says what comes)
 //   8  u8 type                               back to the engine's JPEG
 //  11  u8 type, u8 on                         the host's sound while on the engine's JPEG
 //                                            (an audio-only stream from reimu-h264)
@@ -578,6 +580,7 @@ struct upstream {
     int kind; // K_UP
     int fd, connected, need_key, have_hdr;
     int audio_only; // the host's sound next to the engine's JPEG
+    int hevc;       // the viewer decodes H.265: asked of the host
     struct client *c;
     unsigned char *buf;
     size_t len, cap;
@@ -914,7 +917,7 @@ static void announce_read(int ufd)
     }
 }
 
-static void up_open(struct client *c, const char *addr, int audio_only)
+static void up_open(struct client *c, const char *addr, int audio_only, int hevc)
 {
     char host[128], port[16] = "8555";
     const char *off = audio_only ? "audiooff" : "h264off";
@@ -941,11 +944,11 @@ static void up_open(struct client *c, const char *addr, int audio_only)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
     struct upstream *u = calloc(1, sizeof *u);
-    u->kind = K_UP, u->fd = fd, u->c = c, u->need_key = 1, u->audio_only = audio_only;
+    u->kind = K_UP, u->fd = fd, u->c = c, u->need_key = 1, u->audio_only = audio_only, u->hevc = hevc;
     c->up = u;
     struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.ptr = u };
     epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
-    LOG("host %s: connecting to %s:%s", audio_only ? "sound" : "stream", host, port);
+    LOG("host %s: connecting to %s:%s%s", audio_only ? "sound" : "stream", host, port, hevc ? " (H.265 welcome)" : "");
     if (audio_only) return;
     // the JPEG capture may not be needed any more
     if (!jpeg_clients() && streaming) video_stop();
@@ -961,8 +964,9 @@ static void up_io(struct upstream *u, uint32_t events)
         if (err) { up_close(c, strerror(err)); return; }
         u->connected = 1;
         // the request: "AUDIO" for the sound alone (anything else, or nothing
-        // within a moment, is the picture with its sound)
-        const char *req = u->audio_only ? "AUDIO\n" : "VIDEO\n";
+        // within a moment, is the picture with its sound); "VIDEO hevc": H.265
+        // welcome (a reimu-h264 that knows only H.264 reads it as VIDEO)
+        const char *req = u->audio_only ? "AUDIO\n" : u->hevc ? "VIDEO hevc\n" : "VIDEO\n";
         if (write(u->fd, req, strlen(req)) < 0) { up_close(c, strerror(errno)); return; }
         struct epoll_event ev = { .events = EPOLLIN, .data.ptr = u };
         epoll_ctl(ep, EPOLL_CTL_MOD, u->fd, &ev);
@@ -1051,7 +1055,10 @@ static void handle_ws(struct client *c)
                 size_t n = len - 1 < sizeof addr - 1 ? len - 1 : sizeof addr - 1;
                 memcpy(addr, d + 1, n);
                 addr[n] = 0;
-                up_open(c, addr, 0);
+                // "host:port" then the codecs the page decodes besides H.264
+                char *opts = strchr(addr, '\n');
+                if (opts) *opts++ = 0;
+                up_open(c, addr, 0, opts && strstr(opts, "hevc") != NULL);
                 break;
             }
             case 8: up_close(c, NULL); break;
@@ -1342,7 +1349,7 @@ int main(int argc, char **argv)
             struct client *c = clients[i];
             if (on_jpeg(c) && c->want_audio && !c->up && t > c->audio_retry && *announced_host()) {
                 c->audio_retry = t + 10;
-                up_open(c, "", 1);
+                up_open(c, "", 1, 0);
             }
         }
         if (jpeg_clients()) {

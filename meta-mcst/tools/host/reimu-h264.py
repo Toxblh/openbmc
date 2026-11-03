@@ -16,9 +16,10 @@ The picture is taken in one of two ways:
 
   ./reimu-h264.py                     serve on :8555 to the BMC 192.168.10.79
   ./reimu-h264.py --allow 10.0.0.5    the BMC's address (only it may connect)
-  ./reimu-h264.py --fps 60 --bitrate 8   frames/s, Mbit/s (peak 2x)
+  ./reimu-h264.py --fps 60 --bitrate 8   frames/s, Mbit/s of H.264 (peak 2x)
+  ./reimu-h264.py --hevc-bitrate 5    Mbit/s of H.265 (when the page asks for it)
   ./reimu-h264.py --grab x11          force a way (default: kms when root)
-  ./reimu-h264.py --test              encode 5 s locally and print the rate
+  ./reimu-h264.py --test [--codec hevc]   encode 5 s locally and print the rate
 
 The encoder runs only while the BMC is connected; each connection starts with a
 key frame. Every 5 s a UDP datagram "REIMU-H264 <port>" goes to the BMC's
@@ -29,18 +30,24 @@ PulseAudio (its monitor), as Opus 48 kHz stereo; off with --no-audio.
 
 The BMC starts with a line "VIDEO" (the picture and its sound) or "AUDIO" (the
 sound alone, while the KVM page shows the BMC's own JPEG of the screen).
+"VIDEO hevc": the page decodes H.265 too. Then it gets H.265 (about a third
+fewer bits for the same picture: less for the BMC to relay) unless the card's
+encoder can't: H.264, and no H.265 tried again until a restart.
 
-Stream to the BMC: one JSON line {"codec","w","h","fps","audio"}, then frames
-as u32 length (big endian), u8 kind, payload: kind 0/1 = H.264 access unit
-(Annex B; 1 = key frame), kind 2 = one Opus packet.
+Stream to the BMC: one JSON line {"codec","w","h","fps","audio"} (codec: the
+WebCodecs string, avc1.* or hev1.*), then frames as u32 length (big endian),
+u8 kind, payload: kind 0/1 = H.264/H.265 access unit (Annex B; 1 = key frame),
+kind 2 = one Opus packet.
 """
-import argparse, ctypes, glob, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
+import argparse, ctypes, glob, itertools, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
 
 ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 ap.add_argument("--port", type=int, default=8555)
 ap.add_argument("--allow", default="192.168.10.79", help="BMC address allowed to connect (comma separated)")
 ap.add_argument("--fps", type=int, default=60)
-ap.add_argument("--bitrate", type=float, default=8, help="Mbit/s")
+ap.add_argument("--bitrate", type=float, default=8, help="Mbit/s of H.264")
+ap.add_argument("--hevc-bitrate", type=float, default=5, help="Mbit/s of H.265")
+ap.add_argument("--codec", choices=["h264", "hevc"], default="h264", help="for --test")
 ap.add_argument("--gop", type=float, default=1.0, help="seconds between key frames")
 ap.add_argument("--no-audio", action="store_true")
 ap.add_argument("--audio-bitrate", type=int, default=96, help="kbit/s")
@@ -191,8 +198,21 @@ def size():
     return w, h
 
 
-def ffmpeg_cmd(w, h, out):
-    b = args.bitrate
+# per codec: the encoder and its profile, the access unit delimiter it writes
+# (-aud 1), the WebCodecs codec string of what it makes
+CODECS = {
+    "h264": {"enc": "h264_vaapi", "profile": "high", "fmt": "h264", "aud": b"\x00\x00\x00\x01\x09",
+             "webcodecs": "avc1.640028", "name": "H.264"},
+    # Main, level 4.1 (1080p60)
+    "hevc": {"enc": "hevc_vaapi", "profile": "main", "fmt": "hevc", "aud": b"\x00\x00\x00\x01\x46\x01",
+             "webcodecs": "hev1.1.6.L123.B0", "name": "H.265", "level": "4.1"},
+}
+HEVC_OK = None  # None: not tried yet; False: the encoder gave nothing
+
+
+def ffmpeg_cmd(w, h, out, codec="h264"):
+    c = CODECS[codec]
+    b = args.hevc_bitrate if codec == "hevc" else args.bitrate
     if GRAB == "kms":
         # the scanout buffer as a DRM PRIME frame, mapped into VAAPI on the same card
         src = ["-device", CARD, "-f", "kmsgrab", "-plane_id", str(PLANE), "-framerate", str(args.fps), "-i", "-",
@@ -204,17 +224,14 @@ def ffmpeg_cmd(w, h, out):
                "-vf", "hwupload,scale_vaapi=format=nv12"]
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", *src,
-        "-c:v", "h264_vaapi", "-profile:v", "high", "-rc_mode", "VBR",
-        "-b:v", f"{b}M", "-maxrate", f"{2 * b}M", "-g", str(max(1, int(args.fps * args.gop))), "-bf", "0",
-        "-aud", "1", "-flush_packets", "1", "-f", "h264", out,
+        "-c:v", c["enc"], "-profile:v", c["profile"], *(["-level", c["level"]] if "level" in c else []), "-rc_mode", "VBR",
+        "-b:v", f"{b:g}M", "-maxrate", f"{2 * b:g}M", "-g", str(max(1, int(args.fps * args.gop))), "-bf", "0",
+        "-aud", "1", "-flush_packets", "1", "-f", c["fmt"], out,
     ]
 
 
-AUD = b"\x00\x00\x00\x01\x09"
-
-
-def access_units(stream):
-    """Split an Annex B stream (with access unit delimiters) into access units."""
+def access_units(stream, AUD=CODECS["h264"]["aud"]):
+    """Split an Annex B stream (with access unit delimiters AUD) into access units."""
     buf = b""
     while True:
         chunk = stream.read1(1 << 16) if hasattr(stream, "read1") else os.read(stream.fileno(), 1 << 16)
@@ -231,14 +248,17 @@ def access_units(stream):
             buf = buf[i:]
 
 
-def is_key(au):
-    # NAL types after start codes: 5 = IDR slice
+def is_key(au, codec="h264"):
+    # NAL types after start codes: H.264 5 = IDR slice; H.265 16-21 = IRAP
+    # (BLA, IDR, CRA: decodable from there)
     i = 0
     while True:
         i = au.find(b"\x00\x00\x01", i)
         if i < 0 or i + 3 >= len(au):
             return False
-        if au[i + 3] & 0x1F == 5:
+        if codec == "hevc" and 16 <= (au[i + 3] >> 1) & 0x3F <= 21:
+            return True
+        if codec == "h264" and au[i + 3] & 0x1F == 5:
             return True
         i += 3
 
@@ -316,14 +336,18 @@ def send_audio(conn, lock, p, stop):
 
 
 def request(conn):
-    """The BMC's first line; reimu-kvm before 2026-10 sent none: the picture."""
+    """The BMC's first line: (what, options); reimu-kvm before 2026-10 sent
+    none: the picture. "VIDEO hevc": the page decodes H.265 too."""
     conn.settimeout(0.3)
     try:
-        line = conn.recv(16)
+        line = conn.recv(64)
     except (socket.timeout, OSError):
         line = b""
     conn.settimeout(None)
-    return "AUDIO" if line.startswith(b"AUDIO") else "VIDEO"
+    words = line.decode(errors="replace").split("\n")[0].split()
+    if words[:1] == ["AUDIO"]:
+        return "AUDIO", set()
+    return "VIDEO", set(words[1:])
 
 
 def serve_audio(conn, peer):
@@ -350,8 +374,25 @@ def serve_audio(conn, peer):
         log(f"{peer}: sound closed")
 
 
+def first_unit(w, h, codec):
+    """the encoder for CODEC started: (process, its access units, the first
+    one); None when it ended without a frame"""
+    p = subprocess.Popen(ffmpeg_cmd(w, h, "-", codec), stdout=subprocess.PIPE)
+    units = access_units(p.stdout, CODECS[codec]["aud"])
+    for au in units:
+        return p, units, au
+    p.terminate()
+    try:
+        p.wait(2)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return None
+
+
 def serve(conn, peer):
-    if request(conn) == "AUDIO":
+    global HEVC_OK
+    what, opts = request(conn)
+    if what == "AUDIO":
         return serve_audio(conn, peer)
     try:
         w, h = size()
@@ -360,20 +401,38 @@ def serve(conn, peer):
         write_state(args.state, error=str(e)[:200])
         conn.close()
         return
-    p = subprocess.Popen(ffmpeg_cmd(w, h, "-"), stdout=subprocess.PIPE)
+    # H.265 when the page decodes it and the card encodes it, else H.264
+    codec, started = "h264", None
+    if "hevc" in opts and HEVC_OK is not False:
+        started = first_unit(w, h, "hevc")
+        if started:
+            codec, HEVC_OK = "hevc", True
+        else:
+            HEVC_OK = False
+            log(f"{peer}: the video card's H.265 encoder gave nothing: H.264 from now on")
+    if not started:
+        started = first_unit(w, h, "h264")
+    if not started:
+        log(f"{peer}: the encoder gave nothing")
+        write_state(args.state, error="ffmpeg ended without a frame")
+        conn.close()
+        return
+    p, units, first = started
+    c = CODECS[codec]
     who = None if args.no_audio else pulse_user()
     a = subprocess.Popen(audio_cmd(), stdout=subprocess.PIPE, cwd="/", **who) if who is not None else None
-    hdr = {"codec": "avc1.640028", "w": w, "h": h, "fps": args.fps, "audio": "opus" if a else ""}
-    log(f"{peer}: streaming {w}x{h}@{args.fps} H.264 {args.bitrate} Mbit/s ({GRAB}){', Opus sound' if a else ''}")
+    hdr = {"codec": c["webcodecs"], "w": w, "h": h, "fps": args.fps, "audio": "opus" if a else ""}
+    rate = args.hevc_bitrate if codec == "hevc" else args.bitrate
+    log(f"{peer}: streaming {w}x{h}@{args.fps} {c['name']} {rate} Mbit/s ({GRAB}){', Opus sound' if a else ''}")
     n = 0
     lock, stop = threading.Lock(), threading.Event()
     try:
         conn.sendall((json.dumps(hdr) + "\n").encode())
         if a:
             threading.Thread(target=send_audio, args=(conn, lock, a, stop), daemon=True).start()
-        for au in access_units(p.stdout):
+        for au in itertools.chain([first], units):
             with lock:
-                conn.sendall(struct.pack(">IB", len(au), 1 if is_key(au) else 0) + au)
+                conn.sendall(struct.pack(">IB", len(au), 1 if is_key(au, codec) else 0) + au)
             n += 1
             # a size change of the desktop: start over with the new size
             # (kmsgrab stops by itself when the buffer on screen changes)
@@ -430,12 +489,12 @@ def main():
     if args.test:
         w, h = size()
         t = time.time()
-        p = subprocess.Popen(ffmpeg_cmd(w, h, "-"), stdout=subprocess.PIPE)
+        p = subprocess.Popen(ffmpeg_cmd(w, h, "-", args.codec), stdout=subprocess.PIPE)
         n = size = keys = 0
-        for au in access_units(p.stdout):
+        for au in access_units(p.stdout, CODECS[args.codec]["aud"]):
             n += 1
             size += len(au)
-            keys += is_key(au)
+            keys += is_key(au, args.codec)
             if time.time() - t > 5:
                 break
         p.terminate()

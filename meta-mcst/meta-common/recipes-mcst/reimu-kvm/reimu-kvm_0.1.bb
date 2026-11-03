@@ -1,7 +1,7 @@
 SUMMARY = "KVM straight to the browser"
 DESCRIPTION = "Pushes the ASPEED video engine's JPEG frames (or the host's H.264 from reimu-h264) to the web UI over its own TLS websocket (port 8443) and writes keyboard/mouse to the USB HID gadget; D-Bus xyz.openbmc_project.Reimu.Kvm hands out the connection tickets"
 SECTION = "base"
-PR = "r3"
+PR = "r4"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 

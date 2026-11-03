@@ -26,15 +26,16 @@ back (after a reboot of the host).
 (после его перезагрузки).
 
 With a video card besides the ASPEED (systemd, ffmpeg with VAAPI) the agent
-also sets up the picture of the BMC's web KVM: reimu-h264 (the screen as H.264
-from the video card, 60 frames/s) and reimu-fbmirror (the X screen into the
+also sets up the picture of the BMC's web KVM: reimu-h264 (the screen as H.264,
+or H.265 where the browser decodes it, from the video card, 60 frames/s) and reimu-fbmirror (the X screen into the
 ASPEED VGA for the BMC's own JPEG; built here, needs gcc and the libxcb
 headers, only when the video card is the boot VGA). Every install or update
 of the agent updates and restarts them; the BMC learns their state from the
 agent (the KVM page says why when there is no H.264).
 
 С видеокартой помимо ASPEED (systemd, ffmpeg с VAAPI) агент настраивает и
-картинку веб-KVM BMC: reimu-h264 (экран в H.264 видеокартой, 60 к/с) и
+картинку веб-KVM BMC: reimu-h264 (экран в H.264, или в H.265, если браузер
+его декодирует, видеокартой, 60 к/с) и
 reimu-fbmirror (экран X в VGA ASPEED для JPEG самого BMC; собирается здесь,
 нужны gcc и заголовки libxcb, только если видеокарта — загрузочная VGA).
 Каждая установка или обновление агента обновляет и перезапускает их; BMC

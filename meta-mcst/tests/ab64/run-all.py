@@ -30,7 +30,10 @@ CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab
                     "test_check_image": ["python3", AB + "/test_check_image.py"],
                     "test_ota_tool": ["python3", AB + "/test_ota_tool.py"],
                     "test_ipmi_version": ["python3", AB + "/test_ipmi_version.py"],
-                    "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST]}
+                    "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST],
+                    # the host's tools (tools/host/tests)
+                    "test_reimu_h264": ["python3", AB + "/../../tools/host/tests/test_reimu_h264.py"],
+                    "test_reimu_hostd": ["python3", AB + "/../../tools/host/tests/test_reimu_hostd.py"]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
                "kvm_hid", "logs", "overheatd", "pns", "regressions"]
