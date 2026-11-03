@@ -585,9 +585,13 @@ def t_web(b):
 def t_memory(b):
     print("== memory", flush=True)
     pid = b.out("systemctl show -p MainPID --value reimu-hostlink").strip()
+    # its own memory (what a leak grows), not the pages of the shared libraries
+    # it maps: with OpenSSL 3 (a larger libcrypto) those went from ~4 to ~6 MB
     rss = b.out("grep VmRSS /proc/%s/status" % pid).split()
+    anon = b.out("grep RssAnon /proc/%s/status" % pid).split()
+    print("  INFO %s" % " ".join(b.out("grep -E '^(RssAnon|RssFile|RssShmem)' /proc/%s/status" % pid).split()), flush=True)
     fds = b.out("ls /proc/%s/fd | wc -l" % pid).strip()
-    check(rss and int(rss[1]) < 6000, "RSS %s kB" % (rss[1] if rss else "?"))
+    check(anon and int(anon[1]) < 3000, "its own memory (RssAnon) %s kB, RSS %s kB" % (anon[1] if anon else "?", rss[1] if rss else "?"))
     check(fds.isdigit() and int(fds) < 20, "%s fds" % fds)
     sz = b.out("ls -l /usr/sbin/reimu-hostlink").split()
     print("    /usr/sbin/reimu-hostlink %s bytes" % (sz[4] if len(sz) > 4 else "?"))
