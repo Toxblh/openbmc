@@ -138,6 +138,8 @@
 &video {
 	status = "okay";
 	memory-region = <&video_engine_memory>;
+	/* mainline aspeed-video wants its reset (openbmc dev-6.18 did without) */
+	resets = <&syscon ASPEED_RESET_VIDEO>;
 };
 
 &rtc { status = "okay"; };
