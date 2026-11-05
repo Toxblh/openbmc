@@ -291,27 +291,235 @@ int daemon_disk_start(struct hl *h, struct buf *out, char *err, size_t n)
 }
 
 /* ------------------------------------------------------------------ the USB network */
-int daemon_usbnet(struct hl *h, const char *what, int on, struct buf *out, char *err, size_t n)
+#define USBNET_TIMEOUT_MS 20000
+#define USBNET_FRESH_MS   5000
+
+/* the helper's run: a child, its stdout and stderr pipes in the poll set */
+static struct
+{
+    pid_t pid;          /* 0: none */
+    int ofd, efd;
+    int exited, st;
+    int64_t started, exited_at;
+    int set, on;        /* a set (else a status) */
+    char what[16];
+    struct buf out;
+    char err[1024];
+    size_t elen;
+    hl_usbnet_done done;
+    void *ctx;
+} U = { .ofd = -1, .efd = -1 };
+static struct buf s_us; /* the last status answer */
+static int64_t s_us_at; /* when (0: none yet) */
+
+static void usbnet_close_fds(void)
+{
+    if (U.ofd >= 0) close(U.ofd);
+    if (U.efd >= 0) close(U.efd);
+    U.ofd = U.efd = -1;
+}
+
+static int usbnet_spawn(struct hl *h, const char *const argv[], char *err, size_t n)
+{
+    int so[2], se[2];
+    if (pipe2(so, O_CLOEXEC | O_NONBLOCK)) return snprintf(err, n, "pipe: %s", strerror(errno)), -1;
+    if (pipe2(se, O_CLOEXEC | O_NONBLOCK))
+    {
+        close(so[0]), close(so[1]);
+        return snprintf(err, n, "pipe: %s", strerror(errno)), -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(so[0]), close(so[1]), close(se[0]), close(se[1]);
+        return snprintf(err, n, "fork: %s", strerror(errno)), -1;
+    }
+    if (pid == 0)
+    {
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGPIPE, SIG_DFL);
+        int nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0) dup2(nul, 0);
+        dup2(so[1], 1);
+        dup2(se[1], 2);
+        for (int fd = 3; fd < 1024; fd++) close(fd);
+        execv(argv[0], (char *const *)argv);
+        fprintf(stderr, "%s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+    close(so[1]);
+    close(se[1]);
+    buf_free(&U.out);
+    memset(&U.out, 0, sizeof(U.out));
+    U.pid = pid;
+    U.ofd = so[0];
+    U.efd = se[0];
+    U.exited = U.st = 0;
+    U.started = now_ms();
+    U.elen = 0;
+    U.err[0] = 0;
+    return 0;
+}
+
+static void usbnet_kill(void)
+{
+    if (!U.pid) return;
+    if (!U.exited)
+    {
+        kill(U.pid, SIGKILL);
+        waitpid(U.pid, &U.st, 0);
+    }
+    usbnet_close_fds();
+    U.pid = 0;
+}
+
+static void usbnet_status_start(struct hl *h)
 {
     char e[160];
-    struct buf o = { 0 };
-    err[0] = 0;
-    if (what && hl_usbnet_check(what, err, n)) return -1;
-    const char *st[] = { h->c.usbnet_helper, "status", NULL };
-    const char *set[] = { h->c.usbnet_helper, "set", what, on ? "on" : "off", NULL };
-    int r = run_cmd(what ? set : st, NULL, &o, e, sizeof(e));
-    hl_usbnet_answer(o.s, r, e, out);
-    buf_free(&o);
-    if (!what) return 0;
-    if (r)
+    const char *argv[] = { h->c.usbnet_helper, "status", NULL };
+    U.set = 0;
+    U.done = NULL;
+    if (usbnet_spawn(h, argv, e, sizeof(e)))
     {
-        snprintf(err, n, "%s", e[0] ? e : "reimu-usbnet failed");
-        hl_log(4, "USB network: %s %s: %s", what, on ? "on" : "off", err);
-        return -1;
+        buf_free(&s_us);
+        memset(&s_us, 0, sizeof(s_us));
+        hl_usbnet_answer(NULL, -1, e, &s_us);
+        s_us_at = now_ms();
     }
-    if (!strcmp(what, "internet")) hl_event(h, 5, "usbnet", "USB network: internet for the host %s (through the BMC's port)", on ? "on" : "off");
-    else hl_event(h, 5, "usbnet", "USB network with the host %s", on ? "on" : "off");
+}
+
+void daemon_usbnet_status(struct hl *h, struct buf *out)
+{
+    if (s_us_at && s_us.s) buf_add(out, s_us.s, s_us.len);
+    else buf_printf(out, "{\"pending\":true}");
+    if (!U.pid && (!s_us_at || now_ms() - s_us_at >= USBNET_FRESH_MS)) usbnet_status_start(h);
+}
+
+int daemon_usbnet_set(struct hl *h, const char *what, int on, hl_usbnet_done done, void *ctx, char *err, size_t n)
+{
+    err[0] = 0;
+    if (hl_usbnet_check(what, err, n)) return -1;
+    if (U.pid && U.set) return snprintf(err, n, "busy: another change of the USB network is being applied"), -1;
+    usbnet_kill(); /* a status refresh: the change's answer is the new status */
+    const char *argv[] = { h->c.usbnet_helper, "set", what, on ? "on" : "off", NULL };
+    if (usbnet_spawn(h, argv, err, n)) return -1;
+    U.set = 1;
+    U.on = on;
+    snprintf(U.what, sizeof(U.what), "%s", what);
+    U.done = done;
+    U.ctx = ctx;
     return 0;
+}
+
+static void usbnet_read(void)
+{
+    char b[1024];
+    ssize_t r;
+    while (U.ofd >= 0 && (r = read(U.ofd, b, sizeof(b))) != 0)
+    {
+        if (r < 0)
+        {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN) close(U.ofd), U.ofd = -1;
+            break;
+        }
+        if (U.out.len + r <= 16384) buf_add(&U.out, b, r);
+    }
+    if (U.ofd >= 0 && r == 0) close(U.ofd), U.ofd = -1;
+    while (U.efd >= 0 && (r = read(U.efd, U.err + U.elen, sizeof(U.err) - 1 - U.elen)) != 0)
+    {
+        if (r < 0)
+        {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN) close(U.efd), U.efd = -1;
+            break;
+        }
+        U.elen += r;
+        if (U.elen >= sizeof(U.err) - 1)
+        {
+            memmove(U.err, U.err + U.elen / 2, U.elen - U.elen / 2);
+            U.elen -= U.elen / 2;
+        }
+    }
+    if (U.efd >= 0 && r == 0) close(U.efd), U.efd = -1;
+}
+
+/* every turn of the loop: what the helper wrote, whether it is done */
+static void usbnet_poll(struct hl *h)
+{
+    if (!U.pid) return;
+    int64_t now = now_ms();
+    usbnet_read();
+    if (!U.exited && waitpid(U.pid, &U.st, WNOHANG) == U.pid) U.exited = 1, U.exited_at = now;
+    int timeout = now - U.started >= USBNET_TIMEOUT_MS;
+    /* done: exited and its pipes closed, or something it left behind holds them (1 s) */
+    if (!timeout && !(U.exited && ((U.ofd < 0 && U.efd < 0) || now - U.exited_at >= 1000))) return;
+    char e[300] = "";
+    int rc;
+    if (timeout && !U.exited)
+    {
+        usbnet_kill();
+        snprintf(e, sizeof(e), "%s %s: timed out after %d s (killed)", h->c.usbnet_helper, U.set ? "set" : "status",
+                 USBNET_TIMEOUT_MS / 1000);
+        rc = -1;
+    }
+    else
+    {
+        usbnet_close_fds();
+        U.pid = 0;
+        U.err[U.elen] = 0;
+        size_t l = U.elen;
+        while (l && (U.err[l - 1] == '\n' || U.err[l - 1] == '\r')) U.err[--l] = 0;
+        char *last = strrchr(U.err, '\n');
+        snprintf(e, sizeof(e), "%s", last ? last + 1 : U.err);
+        rc = WIFEXITED(U.st) && WEXITSTATUS(U.st) == 0 ? 0 : -1;
+        if (rc && !e[0])
+            snprintf(e, sizeof(e), "%s %s: %s %d", h->c.usbnet_helper, U.set ? "set" : "status", WIFEXITED(U.st) ? "exit" : "signal",
+                     WIFEXITED(U.st) ? WEXITSTATUS(U.st) : WTERMSIG(U.st));
+    }
+    struct buf a = { 0 };
+    hl_usbnet_answer(U.out.s, rc, e, &a);
+    buf_free(&U.out);
+    memset(&U.out, 0, sizeof(U.out));
+    if (rc == 0 || !U.set)
+    {
+        /* the new status (a set prints it): the cache */
+        buf_free(&s_us);
+        s_us = a;
+        memset(&a, 0, sizeof(a));
+        s_us_at = now;
+    }
+    if (U.set)
+    {
+        if (rc) hl_log(4, "USB network: %s %s: %s", U.what, U.on ? "on" : "off", e[0] ? e : "reimu-usbnet failed");
+        else if (!strcmp(U.what, "internet"))
+            hl_event(h, 5, "usbnet", "USB network: internet for the host %s (through the BMC's port)", U.on ? "on" : "off");
+        else hl_event(h, 5, "usbnet", "USB network with the host %s", U.on ? "on" : "off");
+        hl_usbnet_done done = U.done;
+        U.done = NULL;
+        U.set = 0;
+        if (done) done(U.ctx, rc == 0, s_us.s ? s_us.s : "{}", e[0] ? e : "reimu-usbnet failed");
+        if (rc) s_us_at = 0; /* what it left: asked again */
+    }
+    buf_free(&a);
+}
+
+static int usbnet_pollfds(struct pollfd *p)
+{
+    int n = 0;
+    if (U.ofd >= 0) p[n++] = (struct pollfd){ U.ofd, POLLIN, 0 };
+    if (U.efd >= 0) p[n++] = (struct pollfd){ U.efd, POLLIN, 0 };
+    return n;
+}
+
+/* the daemon stops: a change still running answered */
+static void usbnet_stop(void)
+{
+    if (U.pid && U.set && U.done) U.done(U.ctx, 0, "{}", "reimu-hostlink stopped");
+    U.done = NULL;
+    usbnet_kill();
 }
 
 /* ------------------------------------------------------------------ ctl */
@@ -325,7 +533,16 @@ static void ctl_reply(int fd, int ok, const char *err, const char *data)
     buf_free(&b);
 }
 
-static void ctl_command(int fd, char *cmd)
+/* a change of the USB network done: its ctl connection answered and closed */
+static void ctl_usbnet_done(void *ctx, int ok, const char *json, const char *err)
+{
+    int fd = (int)(intptr_t)ctx;
+    ctl_reply(fd, ok, ok ? "" : err, json);
+    close(fd);
+}
+
+/* 1: the connection kept, answered later (a USB network change) */
+static int ctl_command(int fd, char *cmd)
 {
     char err[160] = "", a[16] = "";
     double d = 0;
@@ -344,13 +561,14 @@ static void ctl_command(int fd, char *cmd)
     else if (!strcmp(cmd, "unpair")) hl_unpair(&H);
     else if (!strcmp(cmd, "disk")) r = daemon_disk_start(&H, &out, err, sizeof(err));
     else if (!strcmp(cmd, "diskoff")) daemon_disk_stop(&H, "asked", err, sizeof(err)), err[0] = 0;
-    else if (!strcmp(cmd, "usbnet")) daemon_usbnet(&H, NULL, 0, &out, err, sizeof(err));
+    else if (!strcmp(cmd, "usbnet")) daemon_usbnet_status(&H, &out);
     else if (IS("usbnet"))
     {
         char w[16], o[8], extra[2];
         if (sscanf(cmd + 7, "%15s %7s %1s", w, o, extra) != 2 || (strcmp(o, "on") && strcmp(o, "off")))
             r = -1, snprintf(err, sizeof(err), "usbnet internet|enabled on|off");
-        else r = daemon_usbnet(&H, w, !strcmp(o, "on"), &out, err, sizeof(err));
+        else if ((r = daemon_usbnet_set(&H, w, !strcmp(o, "on"), ctl_usbnet_done, (void *)(intptr_t)fd, err, sizeof(err))) == 0)
+            return 1;
     }
 #ifndef HL_DBUS
     else if (IS("fandturbo") && sscanf(cmd + 10, "%lf", &d) == 1) hl_fand_turbo(&H, (int)d);
@@ -359,6 +577,7 @@ static void ctl_command(int fd, char *cmd)
     else r = -1, snprintf(err, sizeof(err), "unknown command");
     ctl_reply(fd, r == 0, err, out.s);
     buf_free(&out);
+    return 0;
 }
 
 static void ctl_accept(void)
@@ -373,7 +592,7 @@ static void ctl_accept(void)
     if (n > 0)
     {
         b[n] = 0;
-        ctl_command(fd, b);
+        if (ctl_command(fd, b)) return;
     }
     close(fd);
 }
@@ -506,6 +725,8 @@ static int run(void)
            H.paired ? "paired" : "not paired", H.fingerprint);
     /* a disk a crash left behind (its pairing string is gone with the old process) */
     if (access(H.c.disk_helper, X_OK) == 0) daemon_disk_stop(&H, "start", err, sizeof(err));
+    /* the USB network's status ready for the page's first look */
+    usbnet_status_start(&H);
     dbus_notify("READY=1");
     int64_t last_tick = 0, last_wd = 0;
     for (;;)
@@ -517,6 +738,8 @@ static int run(void)
         if (s_ctl >= 0) p[nn++] = (struct pollfd){ s_ctl, POLLIN, 0 };
         int bi = nn;
         nn += dbus_pollfd(&p[nn]);
+        int ui = nn;
+        nn += usbnet_pollfds(&p[nn]);
         int64_t now = now_ms();
         int timeout = (int)(1000 - (now - last_tick));
         if (timeout < 0) timeout = 0;
@@ -546,7 +769,8 @@ static int run(void)
         }
         if (s_ctl >= 0 && p[n + 1].revents) ctl_accept();
         net_handle(s_net, p, n, now);
-        if (bi < nn) dbus_process();
+        if (bi < ui) dbus_process();
+        usbnet_poll(&H);
         if (now - last_tick >= 1000)
         {
             last_tick = now;
@@ -570,6 +794,8 @@ static int run(void)
             dbus_notify("WATCHDOG=1");
         }
     }
+    usbnet_stop();
+    dbus_publish(&H); /* its answer out */
     if (H.disk_on) daemon_disk_stop(&H, "reimu-hostlink stopped", err, sizeof(err));
     hl_log(5, "stopped");
     put_run("gpu-temp", NULL);

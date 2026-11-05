@@ -16,6 +16,9 @@ SRC_URI = "git://github.com/openbmc/linux;protocol=https;branch=${KBRANCH} \
 # virtual media: DVD-sized ISOs (Windows, Linux installers) as a CD-ROM, not
 # cut at 2.2 GiB
 SRC_URI += "file://0002-usb-gadget-f_mass_storage-CD-ROM-images-bigger-than-2.2-GiB.patch"
+# the USB network to the host: no zero-length packets from NCM (a bulk IN
+# endpoint in descriptor mode stopped for good under load on the board)
+SRC_URI += "file://0003-usb-gadget-aspeed-vhub-no-zero-length-packets-for-network.patch"
 LIC_FILES_CHKSUM = "file://COPYING;md5=6bc538ed5bd9a7fc9398086aedcd7e46"
 
 do_add_mcst_files () {

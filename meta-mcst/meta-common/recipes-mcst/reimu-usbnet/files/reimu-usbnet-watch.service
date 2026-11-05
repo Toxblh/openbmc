@@ -1,0 +1,14 @@
+[Unit]
+Description=REIMU USB network to the host: its sending endpoint watched (plugged in again when it stalls)
+After=reimu-usbnet.service
+BindsTo=reimu-usbnet.service
+
+[Service]
+ExecStart=/usr/libexec/reimu-usbnet watch
+Restart=always
+RestartSec=5
+# a side service: below the BMC's own daemons when the CPU is busy
+Nice=5
+
+[Install]
+WantedBy=reimu-usbnet.service

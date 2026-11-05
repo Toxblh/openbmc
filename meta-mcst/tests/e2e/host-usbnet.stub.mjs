@@ -1,7 +1,9 @@
 // E2E without a BMC: the card «USB-сеть с хостом» on the page Хост
 // (js/pages/host.js, the real file), reimu-hostlink's REST answers stubbed:
-// UsbNet (reimu-usbnet's status) and UsbNetSet (the USB network, the host's
-// internet through the BMC's port) and how the agent is connected.
+// UsbNet (reimu-usbnet's status, the BMC's last one: {"pending":true} before
+// it has one) and UsbNetSet (the USB network, the host's internet through the
+// BMC's port; it answers when the change is done, seconds later) and how the
+// agent is connected.
 //
 //     node host-usbnet.stub.mjs       # WWW: the web tree, CHROME: chromium
 import { chromium } from "playwright";
@@ -33,7 +35,7 @@ const state = (via) => ({
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open({ via = "usb", usb = USB, failSet = null, answer = true } = {}) {
+async function open({ via = "usb", usb = USB, failSet = null, answer = true, pending = 0, setDelay = 0 } = {}) {
   const ctx = await browser.newContext({ locale: "ru-RU", viewport: { width: 1300, height: 1000 } });
   const page = await ctx.newPage();
   const s = { page, ctx, usb: { ...usb }, calls: [], sets: [], dialogs: [], errors: [], failSet };
@@ -45,10 +47,14 @@ async function open({ via = "usb", usb = USB, failSet = null, answer = true } = 
     const json = (o, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(o) });
     if (p === "/harness.html") return route.fulfill({ contentType: "text/html", body: HARNESS });
     if (p === HL) return json({ data: { Json: JSON.stringify(state(via)), Connected: !!via, Paired: true, Heartbeat: "ok" } });
-    if (p === `${HL}/action/UsbNet`) { s.calls.push("UsbNet"); return json({ data: JSON.stringify(s.usb), message: "200 OK", status: "ok" }); }
+    if (p === `${HL}/action/UsbNet`) {
+      s.calls.push("UsbNet");
+      return json({ data: JSON.stringify(s.calls.length <= pending ? { pending: true } : s.usb), message: "200 OK", status: "ok" });
+    }
     if (p === `${HL}/action/UsbNetSet`) {
       const [what, on] = req.postDataJSON().data;
       s.sets.push([what, on]);
+      if (setDelay) await new Promise((r) => setTimeout(r, setDelay));
       if (s.failSet) return json({ data: { description: "xyz.openbmc_project.Common.Error" }, message: s.failSet, status: "error" }, 400);
       s.usb[what] = on;
       if (what === "enabled" && !on) Object.assign(s.usb, { port: "", state: "", host_ipv4: "" });
@@ -97,6 +103,25 @@ const text = async (l) => (await l.innerText()).replace(/\s+/g, " ");
   check(await s.card.getByLabel(/Интернет для хоста через порт BMC/).isDisabled(), "internet can't be set with the USB network off");
   check(!s.errors.length, `no page errors ${s.errors}`);
   await s.ctx.close();
+}
+{
+  // the BMC has no status yet (hostlink just started): loading, asked again
+  const s = await open({ pending: 2 });
+  await s.card.getByText("хост подключён").waitFor({ timeout: 10000 });
+  check(s.calls.length === 3, `pending twice, then the status (${s.calls.length} UsbNet calls)`);
+  // a change takes seconds (the USB card plugged in again): said meanwhile, no second one
+  const s2 = await open({ setDelay: 2500 });
+  await s2.card.getByLabel(/Интернет для хоста через порт BMC/).check();
+  await s2.page.waitForTimeout(500);
+  check(/Применяется/.test(await text(s2.card)), "applying: said");
+  check(await s2.card.getByLabel(/^USB-сеть/).isDisabled() && await s2.card.getByLabel(/Интернет для хоста/).isDisabled(), "both boxes held meanwhile");
+  check(await s2.card.getByLabel(/Интернет для хоста/).isChecked(), "the box shows what is being set");
+  await s2.page.waitForTimeout(3000);
+  check(!/Применяется/.test(await text(s2.card)) && await s2.card.getByLabel(/Интернет для хоста/).isChecked() && await s2.card.getByLabel(/^USB-сеть/).isEnabled(),
+    "done: on, the boxes free");
+  check(s2.sets.length === 1, "one change sent");
+  await s.ctx.close();
+  await s2.ctx.close();
 }
 {
   // refused at the question: nothing asked, the box back on

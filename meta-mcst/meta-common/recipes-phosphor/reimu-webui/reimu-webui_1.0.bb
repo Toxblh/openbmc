@@ -1,7 +1,7 @@
 SUMMARY = "REIMU web UI"
 DESCRIPTION = "Web interface of REIMU BMC: KVM (noVNC over bmcweb /kvm/0), serial consoles with timestamped history, read-write virtual media, sensors, inventory and host boot firmware (PNS) information"
 SECTION = "base"
-PR = "r3"
+PR = "r4"
 # REIMU code is GPLv2, bundled noVNC is MPL-2.0, xterm.js is MIT
 LICENSE = "GPLv2 & MPL-2.0 & MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263 \

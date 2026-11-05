@@ -9,7 +9,8 @@ tests/hidvm/run-usbnet.sh.
 WORKDIR holds ab.mtd as for test_ab_qemu.py (RQ, AB_SSH, AB_HTTPS too).
 Tests (all by default, one boot):
 
-  boot      reimu-usbnet active; the gadget reimu_net: ncm.usb0 with eth0's
+  boot      reimu-usbnet and its watcher active (the watcher leaves a
+            card that sends alone); the gadget reimu_net: ncm.usb0 with eth0's
             MAC at the BMC's end, the host's end with the locally
             administered bit flipped, "REIMU BMC network", on vhub p2
             (obmc_hid still on p1); usb0 has 172.31.83.1/29 from
@@ -107,6 +108,13 @@ def t_boot(b):
         ok = bool(re.search(r"listening.*usb0|usb0.*listening", b.out("journalctl -u reimu-hostlink --no-pager | tail -50")))
         time.sleep(0 if ok else 2)
     check(ok, "reimu-hostlink listens on usb0")
+    # the watcher of the card's sending endpoint: running, and it leaves a
+    # card that isn't stuck alone (no "plugged in again" in 15 s)
+    check(b.out("systemctl is-active reimu-usbnet-watch").strip() == "active", "reimu-usbnet-watch active")
+    time.sleep(15)
+    j = b.out("journalctl -u reimu-usbnet-watch --no-pager")
+    check("stalled" not in j and not b.ssh("test -e /run/reimu-usbnet/rebind.log").returncode == 0,
+          "the watcher left the card alone (%s)" % j.strip().splitlines()[-1:])
     s = status(b)
     check(s.get("enabled") is True and s.get("internet") is False and s.get("port") == VHUB + ":p2" and s.get("error") == "",
           "status: %s" % s)

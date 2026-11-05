@@ -26,6 +26,12 @@
 #           asks for a lease at once, with the router or without it (its
 #           renewal came up to 5 min later; the agent reconnects in seconds)
 #   set enabled on|off   the USB network itself
+#   watch   (reimu-usbnet-watch.service) the card's bulk IN endpoint on the
+#           virtual hub: a DMA descriptor pending and the hub not moving
+#           past it for STUCK polls (6 s) = the BMC sends nothing to the
+#           host any more (board, beta5: under load the endpoint stopped
+#           for good with one descriptor pending, no error anywhere; the
+#           host's packets still came in): the card plugged in again
 #   (set: kept in /etc/reimu-usbnet.conf, applied at once, prints status)
 #
 # Addresses: the BMC's end has eth0's MAC, so its IPv6 link-local address on
@@ -43,7 +49,9 @@
 #
 # REIMU_CONFIGFS, REIMU_UDC_CLASS, REIMU_NET_CLASS, REIMU_USBNET_CONF,
 # REIMU_NETWORK_DIR, REIMU_RESOLV, REIMU_USBNET_RUN, REIMU_IPTABLES,
-# REIMU_SYSCTL, REIMU_ARP, REIMU_NETWORKD_RELOAD: other paths and commands
+# REIMU_SYSCTL, REIMU_ARP, REIMU_NETWORKD_RELOAD, REIMU_DEVMEM,
+# REIMU_WATCH_ROUNDS, REIMU_WATCH_POLL, REIMU_WATCH_STUCK: other paths,
+# commands and timings
 # (tests).
 
 CFS=${REIMU_CONFIGFS:-/sys/kernel/config}
@@ -56,6 +64,8 @@ RUN=${REIMU_USBNET_RUN:-/run/reimu-usbnet}
 IPT=${REIMU_IPTABLES:-iptables}
 SYSCTL=${REIMU_SYSCTL:-sysctl}
 ARP=${REIMU_ARP:-/proc/net/arp}
+DEVMEM=${REIMU_DEVMEM:-devmem}
+EPN=0x1E6A0200                  # the vhub's endpoint registers, 0x10 each
 RELOAD=${REIMU_NETWORKD_RELOAD:-networkd_reload}
 G=$CFS/usb_gadget/reimu_net
 F=functions/ncm.usb0
@@ -324,7 +334,53 @@ do_set() {
     do_status
 }
 
+# the bulk IN endpoints of the card's port: "N STATUS" each (STATUS: the
+# descriptor ring's AST_VHUB_EP_DESC_STATUS: read pointer in bits 15:8, the
+# CPU's write pointer in 7:0)
+in_eps() {
+    dev=${1##*:p}
+    n=0
+    while [ $n -lt 15 ]; do
+        b=$((EPN + n * 16))
+        c=$(( $($DEVMEM $b 2>/dev/null || echo 0) ))
+        # enabled, this port's device, bulk, IN
+        if [ $((c & 1)) = 1 ] && [ $(((c >> 1) & 7)) = "$dev" ] && [ $(((c >> 5) & 3)) = 1 ] && [ $((c & 16)) = 0 ]; then
+            echo "$n $(( $($DEVMEM $((b + 12)) 2>/dev/null || echo 0) ))"
+        fi
+        n=$((n + 1))
+    done
+}
+
+do_watch() {
+    rounds=${REIMU_WATCH_ROUNDS:-0} poll=${REIMU_WATCH_POLL:-2} stuck=${REIMU_WATCH_STUCK:-3}
+    mkdir -p "$RUN"
+    i=0 seen= cnt=0
+    while [ "$rounds" = 0 ] || [ $i -lt "$rounds" ]; do
+        i=$((i + 1))
+        p=$(port_of)
+        case $p in
+            $VHUB:p*)
+                now=
+                for e in $(in_eps "$p" | tr ' ' ':'); do
+                    st=${e#*:}
+                    [ $(((st >> 8) & 255)) != $((st & 255)) ] && now="$now $e"
+                done
+                if [ -n "$now" ] && [ "$now" = "$seen" ]; then cnt=$((cnt + 1)); else cnt=0; fi
+                seen=$now
+                if [ -n "$now" ] && [ $cnt -ge $((stuck - 1)) ]; then
+                    e=${now# }; e=${e%% *}
+                    echo "reimu-usbnet: the card's IN endpoint ep${e%%:*} stalled (descriptor status $(printf '%#x' ${e#*:}) for $stuck polls): plugged in again"
+                    reconnect "ep${e%%:*} stalled" || true
+                    seen= cnt=0
+                fi ;;
+            *) seen= cnt=0 ;;
+        esac
+        [ "$poll" = 0 ] || sleep "$poll"
+    done
+}
+
 case ${1:-} in
+    watch) do_watch ;;
     start) do_start ;;
     stop) do_stop ;;
     status) do_status ;;

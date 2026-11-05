@@ -232,11 +232,19 @@ void hl_disk_end(struct hl *h);
  * DISK_HELPER stop; 0 ok, -1 with err */
 int daemon_disk_start(struct hl *h, struct buf *out, char *err, size_t n);
 int daemon_disk_stop(struct hl *h, const char *why, char *err, size_t n);
-/* the USB network with the host (USBNET_HELPER, reimu-usbnet): what = NULL its
- * status, else "internet" / "enabled" set on or off (USBNET_HELPER set WHAT
- * on|off); out: the helper's status JSON object, or {"error":...}; -1 with err
- * when a set failed or what is refused (the status: always 0) */
-int daemon_usbnet(struct hl *h, const char *what, int on, struct buf *out, char *err, size_t n);
+/* the USB network with the host (USBNET_HELPER, reimu-usbnet, a shell script:
+ * seconds on a loaded BMC). The helper runs as a child the poll loop watches
+ * (one at a time, killed after 20 s), never waited for.
+ * daemon_usbnet_status: at once, the last status JSON (the helper's object, or
+ * {"error":...}; none yet: {"pending":true}); older than 5 s: refreshed in the
+ * background.
+ * daemon_usbnet_set: "internet" / "enabled" on or off (USBNET_HELPER set WHAT
+ * on|off): 0 started, done(ctx, ok, the new status JSON, the error) is called
+ * when the helper is done; -1 + err at once (refused, another change running:
+ * busy, no fork) and done is not called */
+typedef void (*hl_usbnet_done)(void *ctx, int ok, const char *json, const char *err);
+void daemon_usbnet_status(struct hl *h, struct buf *out);
+int daemon_usbnet_set(struct hl *h, const char *what, int on, hl_usbnet_done done, void *ctx, char *err, size_t n);
 /* what UsbNetSet may set: 0 ok, -1 + err */
 int hl_usbnet_check(const char *what, char *err, size_t n);
 /* the helper's output (rc: its exit, 0 ok; err: its message) as the answer

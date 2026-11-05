@@ -7,9 +7,12 @@ import { buildInstaller } from "../lib/agent-pack.js";
 
 const PATH = "/xyz/openbmc_project/reimu/hostlink";
 let root, timer, ticker, usbTimer, pairInfo = null;
-// reimu-usbnet's status (UsbNet: a shell script on the BMC): at the page's
-// start, after a change and every 30 s, not with every refresh
-let usb = null;
+// reimu-usbnet's status (UsbNet: reimu-hostlink's last one, refreshed in the
+// background): at the page's start, after a change and every 30 s, not with
+// every refresh; {"pending":true} before the BMC has one: asked again soon.
+// usbApplying: the change on its way (UsbNetSet answers when it is done:
+// seconds, the USB card is plugged in again)
+let usb = null, usbApplying = null, usbRetry = null;
 const ceHistory = []; // [time ms, ce_total] of this page's visit: the ECC trend
 
 const num = (v, d = 0) => (v === undefined || v === null ? "—" : Number(v).toFixed(d));
@@ -65,15 +68,25 @@ export function unmount() {
   clearInterval(timer);
   clearInterval(ticker);
   clearInterval(usbTimer);
+  clearTimeout(usbRetry);
   root = null;
 }
 
 async function loadUsb() {
+  let u;
   try {
-    usb = JSON.parse((await api.post(`${PATH}/action/UsbNet`, { data: [] })).data);
+    u = JSON.parse((await api.post(`${PATH}/action/UsbNet`, { data: [] })).data);
   } catch (e) {
-    usb = { error: e.message || String(e) };
+    u = { error: e.message || String(e) };
   }
+  if (u.pending) {
+    // the last status kept meanwhile; asked again in 2 s
+    if (!usb) usb = u;
+    clearTimeout(usbRetry);
+    usbRetry = setTimeout(() => root && loadUsb().then(refresh), 2000);
+    return;
+  }
+  usb = u;
 }
 
 async function refresh() {
@@ -179,29 +192,31 @@ async function usbSet(st, what, box) {
     box.checked = !on;
     return;
   }
-  box.disabled = true;
+  usbApplying = what;
+  refresh();
   try {
     usb = JSON.parse((await api.post(`${PATH}/action/UsbNetSet`, { data: [what, on] })).data);
     toast(USB_SET[what][on ? 0 : 1], "ok");
   } catch (e) {
-    box.checked = !on;
     toast(`USB-сеть: ${e.message || e}`, "err");
+    await loadUsb(); // what the BMC has now
   }
-  box.disabled = false;
+  usbApplying = null;
   refresh();
 }
 
 function usbNetCard(st) {
   const u = usb || {};
   const title = (badge) => h("h3", {}, "USB-сеть с хостом", badge);
-  if (usb && usb.enabled === undefined)
+  if (!usb || usb.pending) return h("div", { class: "card section" }, title(null), h("div", { class: "empty" }, "Загрузка…"));
+  if (usb.enabled === undefined)
     return h("div", { class: "card section" }, title(h("span", { class: "badge err" }, "недоступна")), h("div", { class: "note warn" }, `USB-сеть недоступна: ${u.error || "нет ответа"}`));
-  if (!usb) return h("div", { class: "card section" }, title(null), h("div", { class: "empty" }, "Загрузка…"));
   const [cls, txt, why] = !u.enabled ? ["", "выключена"] : !u.port ? ["warn", "не на USB-хабе BMC", "нет свободного порта на виртуальном хабе BMC"]
     : u.state === "configured" ? ["ok", "хост подключён"] : ["warn", "хост не подключил", "хост выключен, или в его ОС нет драйвера cdc_ncm"];
   const ag = st.agent || {};
   const box = (what, label, attrs) => {
-    const i = h("input", { type: "checkbox", checked: !!u[what], ...attrs });
+    const i = h("input", { type: "checkbox", checked: usbApplying === what ? !u[what] : !!u[what], ...attrs });
+    if (usbApplying) i.disabled = true;
     i.addEventListener("change", () => usbSet(st, what, i));
     return h("label", { class: "inline" }, i, label);
   };
@@ -217,7 +232,8 @@ function usbNetCard(st) {
       ["Агент", ag.connected ? (ag.via === "usb" ? "подключён по USB-сети" : "подключён по локальной сети") : "не подключён"],
       ["Ошибка", u.error || undefined],
     ]),
-    h("div", { class: "row section" }, box("enabled", "USB-сеть"), box("internet", "Интернет для хоста через порт BMC", { disabled: !u.enabled })),
+    h("div", { class: "row section" }, box("enabled", "USB-сеть"), box("internet", "Интернет для хоста через порт BMC", { disabled: !u.enabled }),
+      usbApplying ? h("span", { class: "muted small usb-applying" }, "Применяется… (USB-карта переподключается к хосту)") : null),
     h("div", { class: "muted small" }, "Хост видит BMC как сетевую карту USB и получает от него адрес по DHCP: агенту не нужен кабель локальной сети. С интернетом BMC раздаёт хосту и шлюз: трафик идёт через сетевой порт BMC — до 100 Мбит/с, нагружает процессор BMC. Если у хоста подключён свой кабель, трафик идёт по нему."),
   );
 }

@@ -141,14 +141,23 @@ static int m_disk_off(sd_bus_message *m, void *ud, sd_bus_error *err)
     return sd_bus_reply_method_return(m, "s", "off");
 }
 
+/* at once, the last status (refreshed in the background) */
 static int m_usbnet(sd_bus_message *m, void *ud, sd_bus_error *err)
 {
-    char e[160];
     struct buf b = { 0 };
-    daemon_usbnet(H, NULL, 0, &b, e, sizeof(e));
+    daemon_usbnet_status(H, &b);
     int r = sd_bus_reply_method_return(m, "s", b.s && !b.oom ? b.s : "{}");
     buf_free(&b);
     return r;
+}
+
+/* the change's reply when the helper is done (the message kept meanwhile) */
+static void usbnet_set_done(void *ctx, int ok, const char *json, const char *e)
+{
+    sd_bus_message *m = ctx;
+    if (ok) sd_bus_reply_method_return(m, "s", json);
+    else sd_bus_reply_method_errorf(m, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+    sd_bus_message_unref(m);
 }
 
 static int m_usbnet_set(sd_bus_message *m, void *ud, sd_bus_error *err)
@@ -156,12 +165,15 @@ static int m_usbnet_set(sd_bus_message *m, void *ud, sd_bus_error *err)
     const char *what;
     int on;
     char e[160];
-    struct buf b = { 0 };
     int r = sd_bus_message_read(m, "sb", &what, &on);
     if (r < 0) return r;
-    r = reply(m, err, daemon_usbnet(H, what, on, &b, e, sizeof(e)), e, b.s && !b.oom ? b.s : "{}");
-    buf_free(&b);
-    return r;
+    sd_bus_message_ref(m);
+    if (daemon_usbnet_set(H, what, on, usbnet_set_done, m, e, sizeof(e)))
+    {
+        sd_bus_message_unref(m);
+        return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, e);
+    }
+    return 1;
 }
 
 static int m_unpair(sd_bus_message *m, void *ud, sd_bus_error *err)

@@ -247,6 +247,59 @@ class T(unittest.TestCase):
         self.assertEqual(self.run_("set", "internet", "off")[0], 0)
         self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "no change, no reconnect")
 
+    # ------------------------------------------------------------------ watch
+    def regs(self, eps):
+        """a fake vhub: {ep: (cfg, desc_status)}; the devmem stub answers from it"""
+        d = os.path.join(self.d, "regs")
+        os.makedirs(d, exist_ok=True)
+        for n, (cfg, st) in eps.items():
+            b = 0x1E6A0200 + n * 0x10
+            open(os.path.join(d, "%#x" % b), "w").write("%#010x\n" % cfg)
+            open(os.path.join(d, "%#x" % (b + 12)), "w").write("%#010x\n" % st)
+        dm = os.path.join(self.d, "bin", "devmem")
+        open(dm, "w").write('#!/bin/sh\nf="%s/$(printf %%#x $(($1)))"\n[ -f "$f" ] && cat "$f" || echo 0x00000000\n' % d)
+        os.chmod(dm, 0o755)
+        self.env["REIMU_DEVMEM"] = dm
+
+    def watch(self, rounds):
+        e = dict(self.env, REIMU_WATCH_ROUNDS=str(rounds), REIMU_WATCH_POLL="0", REIMU_WATCH_STUCK="3")
+        r = subprocess.run(SH + [SCRIPT, "watch"], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        return r.returncode, r.stdout.decode() + r.stderr.decode()
+
+    # the board, beta5 under load: ep4 = the NCM bulk IN on p2 (dev 2, ep 1,
+    # bulk, IN, 512), its read pointer one behind the write pointer for good
+    NCM_IN = 0x02000125      # max 512, ep 1, bulk, IN, dev 2, enabled
+    HID_IN = 0x00080143      # max 8, ep 1, interrupt, IN, dev 1
+
+    def test_watch_stalled_in_endpoint_reconnects(self):
+        self.assertEqual(self.run_("start")[0], 0)
+        self.regs({1: (self.HID_IN, 0x80004242), 4: (self.NCM_IN, 0x00546869)})
+        os.utime(self.g("UDC"), (1, 1))
+        rc, out = self.watch(5)
+        self.assertEqual(rc, 0, out)
+        self.assertNotEqual(os.stat(self.g("UDC")).st_mtime, 1, "the card plugged in again: %s" % out)
+        self.assertEqual(self.read("UDC"), VHUB + ":p2")
+        self.assertIn("stalled", out)
+        self.assertIn("ep4", out)
+
+    def test_watch_moving_or_idle_left_alone(self):
+        self.assertEqual(self.run_("start")[0], 0)
+        os.utime(self.g("UDC"), (1, 1))
+        self.regs({4: (self.NCM_IN, 0x80808282)})          # idle: pointers equal
+        self.assertEqual(self.watch(5)[0], 0)
+        self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "idle: left alone")
+        # another port's bulk IN stuck (a virtual disk on p4): not ours
+        self.regs({4: (0x02000129, 0x00546869)})          # dev 4
+        self.assertEqual(self.watch(5)[0], 0)
+        self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "another port's endpoint: left alone")
+
+    def test_watch_not_bound_nothing(self):
+        self.assertEqual(self.run_("set", "enabled", "off")[0], 0)
+        self.regs({4: (self.NCM_IN, 0x00546869)})
+        rc, out = self.watch(4)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.g()))
+
     def calls_of(self, what):
         try:
             return open(os.path.join(self.d, "run", "rebind.log")).read()

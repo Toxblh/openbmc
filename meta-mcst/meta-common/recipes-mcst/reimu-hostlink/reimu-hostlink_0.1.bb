@@ -1,7 +1,7 @@
 SUMMARY = "REIMU host link: the BMC's end of the host agent"
 DESCRIPTION = "reimu-hostlink: TLS link (IPv6 link-local first) with the host agent reimu-hostd: the host's inventory and health on D-Bus (xyz.openbmc_project.Reimu.HostLink, Sensor.Value objects for the GPU and disks), events, the GPU fan policy and an allow-list of requests to the host"
 SECTION = "base"
-PR = "r3"
+PR = "r4"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
