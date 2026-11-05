@@ -18,7 +18,8 @@ Tests (all by default, one boot):
 
   service   active, Type=notify, listening on [::]:5564 (TCP, UDP) bound to
             eth0, IPv6 link-local inside the VM reaches it, the discovery
-            answer; D-Bus service, sensors objects, REST
+            answer; usb0 (reimu-usbnet) in IFACE too; UsbNet, UsbNetSet on
+            D-Bus; D-Bus service, sensors objects, REST
   pair      Pair over REST (the web button): the pairing string pins the
             certificate the forward shows; reimu-hostd.py pair with it
   agent     the agent runs: connected (REST Json), inventory, metrics; the
@@ -42,7 +43,7 @@ Tests (all by default, one boot):
             ../e2e/host.qemu.mjs of the page (copied there; CHROME: chromium)
   memory    RSS of reimu-hostlink, its fds steady
 """
-import base64, hashlib, json, os, signal, socket, ssl, struct, subprocess, sys, threading, time
+import base64, hashlib, json, os, re, signal, socket, ssl, struct, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_ab_qemu as ab  # noqa: E402  (takes WORKDIR from sys.argv[1])
@@ -197,6 +198,15 @@ def t_service(b):
           "discovery answer over link-local, the fingerprint's prefix: %r" % r.stdout.strip())
     r = b.ssh(probe % "10.0.2.15")
     check(r.stdout.strip() == "", "no discovery answer to a non-link-local peer")
+    # the USB network with the host (reimu-usbnet's usb0) is in IFACE too: listened
+    # on, or waited for while it isn't there
+    check(re.search(r"(listening on TCP\+UDP \[::\]:5564|not listening) on usb0", j) is not None,
+          "usb0 in IFACE: listened on or waited for (journal)")
+    r = b.ssh("busctl call %s %s %s UsbNet" % (SVC, OBJ, SVC))
+    check(r.returncode == 0 and r.stdout.startswith('s "{') and ("enabled" in r.stdout or "error" in r.stdout),
+          "D-Bus UsbNet: reimu-usbnet's status as JSON (%s)" % r.stdout.strip()[:160])
+    r = b.ssh("busctl call %s %s %s UsbNetSet sb reboot true" % (SVC, OBJ, SVC))
+    check(r.returncode != 0 and "unknown setting" in r.stderr, "UsbNetSet: only internet / enabled (%s)" % r.stderr.strip())
     check(prop(b, OBJ, SVC, "Paired") == "b false", "D-Bus: Paired false")
     sens = b.out("busctl tree %s | grep -o '/xyz/openbmc_project/sensors/[^ ]*Host_[A-Za-z_]*'" % SVC).split()
     check(len(sens) == 7 and "/xyz/openbmc_project/sensors/temperature/Host_GPU_Junction" in sens, "7 sensor objects: %s" % sens)

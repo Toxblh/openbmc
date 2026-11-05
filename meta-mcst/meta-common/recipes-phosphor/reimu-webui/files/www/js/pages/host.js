@@ -1,11 +1,15 @@
 // The host as its agent (reimu-hostd) reports it to reimu-hostlink (D-Bus
-// xyz.openbmc_project.Reimu.HostLink): agent status and pairing, OS and
-// inventory, the video card with its fan modes, ECC, PCIe, disks, events.
+// xyz.openbmc_project.Reimu.HostLink): agent status and pairing, the USB
+// network with the host (reimu-usbnet), OS and inventory, the video card with
+// its fan modes, ECC, PCIe, disks, events.
 import { api, h, toast, fmtBytes } from "../api.js";
 import { buildInstaller } from "../lib/agent-pack.js";
 
 const PATH = "/xyz/openbmc_project/reimu/hostlink";
-let root, timer, ticker, pairInfo = null;
+let root, timer, ticker, usbTimer, pairInfo = null;
+// reimu-usbnet's status (UsbNet: a shell script on the BMC): at the page's
+// start, after a change and every 30 s, not with every refresh
+let usb = null;
 const ceHistory = []; // [time ms, ce_total] of this page's visit: the ECC trend
 
 const num = (v, d = 0) => (v === undefined || v === null ? "—" : Number(v).toFixed(d));
@@ -13,7 +17,8 @@ const num = (v, d = 0) => (v === undefined || v === null ? "—" : Number(v).toF
 // header then isn't sticky: it stays on its table)
 const scroll = (table) => h("div", { class: "tbl-wrap" }, table);
 const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
-const TRANSPORT = { "ipv6-ll": "IPv6 link-local (внутренняя сеть платы)", ipv4: "IPv4", ipv6: "IPv6" };
+const TRANSPORT = { "ipv6-ll": "IPv6 link-local", ipv4: "IPv4", ipv6: "IPv6" };
+const VIA = { usb: "USB-сеть BMC ↔ хост", lan: "локальная сеть" };
 const HB = { ok: ["ok", "на связи"], late: ["warn", "нет данных"], lost: ["err", "потерян"], never: ["", "не подключался"] };
 const SEV = { critical: "err", error: "err", warning: "warn", notice: "", info: "" };
 const MODES = { auto: "Авто (драйвер)", manual: "Ручной", turbo: "Турбо" };
@@ -49,15 +54,26 @@ async function call(method, args, ok) {
 export async function mount(el) {
   root = el;
   el.append(h("div", { class: "row section" }, h("h2", { class: "m-hide" }, "Хост"), h("span", { class: "spacer" })), h("div", { id: "host-body" }, h("div", { class: "card" }, "Загрузка…")));
+  await loadUsb();
   await refresh();
   timer = setInterval(refresh, 5000);
   ticker = setInterval(tickPair, 1000);
+  usbTimer = setInterval(() => loadUsb().then(refresh), 30000);
 }
 
 export function unmount() {
   clearInterval(timer);
   clearInterval(ticker);
+  clearInterval(usbTimer);
   root = null;
+}
+
+async function loadUsb() {
+  try {
+    usb = JSON.parse((await api.post(`${PATH}/action/UsbNet`, { data: [] })).data);
+  } catch (e) {
+    usb = { error: e.message || String(e) };
+  }
 }
 
 async function refresh() {
@@ -79,7 +95,7 @@ async function refresh() {
     ceHistory.push([Date.now(), m.edac.ce_total]);
     while (ceHistory.length > 720) ceHistory.shift();
   }
-  body.replaceChildren(agentCard(st), h("div", { class: "grid shrink section" }, osCard(st), gpuCard(st), eccCard(st)), pciCard(st), h("div", { class: "grid wide shrink section" }, diskCard(st), nicCard(st)), eventsCard(st));
+  body.replaceChildren(agentCard(st), usbNetCard(st), h("div", { class: "grid shrink section" }, osCard(st), gpuCard(st), eccCard(st)), pciCard(st), h("div", { class: "grid wide shrink section" }, diskCard(st), nicCard(st)), eventsCard(st));
 }
 
 // The host's sensors (reimu-hostlink publishes them on D-Bus for Redfish and
@@ -135,7 +151,7 @@ function agentCard(st) {
     kv([
       ["Хост", ag.host],
       ["Версия агента", ag.version],
-      ["Связь", ag.transport ? `${TRANSPORT[ag.transport] || ag.transport}, ${ag.peer}` : undefined],
+      ["Связь", ag.transport ? `${ag.via ? `${VIA[ag.via] || ag.via}, ` : ""}${TRANSPORT[ag.transport] || ag.transport}, ${ag.peer}` : undefined],
       ["Подключён", ag.connected && ag.since ? new Date(ag.since * 1000).toLocaleString("ru-RU") : undefined],
       ["Последние данные", ag.last_seen ? `${new Date(ag.last_seen * 1000).toLocaleString("ru-RU")} (${ago(st.heartbeat.age)})` : undefined],
       ["Пульс", txt],
@@ -144,6 +160,65 @@ function agentCard(st) {
       ["Порт BMC", `${st.port} (TLS, ${st.iface || "все интерфейсы"})`],
       ["Сертификат", st.fingerprint ? h("span", { class: "mono small" }, `SHA-256 ${st.fingerprint.slice(0, 32)}…`) : undefined],
     ]),
+  );
+}
+
+// ------------------------------------------------------------------ USB network
+// The BMC's USB network device for the host (reimu-usbnet: CDC-NCM on a port of
+// its virtual hub, usb0 on the BMC): the agent's link without the host's LAN
+// cable, and, when asked, the host's internet through the BMC's port
+const USB_SET = {
+  internet: ["Интернет для хоста включён (через порт BMC)", "Интернет для хоста выключен"],
+  enabled: ["USB-сеть с хостом включена", "USB-сеть с хостом выключена"],
+};
+async function usbSet(st, what, box) {
+  const on = box.checked;
+  box.blur(); // the page's refresh waits while an input has the focus
+  if (what === "enabled" && !on && st.agent.connected && st.agent.via === "usb" &&
+      !confirm("Выключить USB-сеть с хостом? Агент хоста сейчас подключён по ней: связь с ним прервётся, пока он не переподключится по локальной сети (если у хоста подключён кабель).")) {
+    box.checked = !on;
+    return;
+  }
+  box.disabled = true;
+  try {
+    usb = JSON.parse((await api.post(`${PATH}/action/UsbNetSet`, { data: [what, on] })).data);
+    toast(USB_SET[what][on ? 0 : 1], "ok");
+  } catch (e) {
+    box.checked = !on;
+    toast(`USB-сеть: ${e.message || e}`, "err");
+  }
+  box.disabled = false;
+  refresh();
+}
+
+function usbNetCard(st) {
+  const u = usb || {};
+  const title = (badge) => h("h3", {}, "USB-сеть с хостом", badge);
+  if (usb && usb.enabled === undefined)
+    return h("div", { class: "card section" }, title(h("span", { class: "badge err" }, "недоступна")), h("div", { class: "note warn" }, `USB-сеть недоступна: ${u.error || "нет ответа"}`));
+  if (!usb) return h("div", { class: "card section" }, title(null), h("div", { class: "empty" }, "Загрузка…"));
+  const [cls, txt, why] = !u.enabled ? ["", "выключена"] : !u.port ? ["warn", "не на USB-хабе BMC", "нет свободного порта на виртуальном хабе BMC"]
+    : u.state === "configured" ? ["ok", "хост подключён"] : ["warn", "хост не подключил", "хост выключен, или в его ОС нет драйвера cdc_ncm"];
+  const ag = st.agent || {};
+  const box = (what, label, attrs) => {
+    const i = h("input", { type: "checkbox", checked: !!u[what], ...attrs });
+    i.addEventListener("change", () => usbSet(st, what, i));
+    return h("label", { class: "inline" }, i, label);
+  };
+  return h(
+    "div",
+    { class: "card section" },
+    title(h("span", { class: `badge ${cls}`, title: why || "" }, txt)),
+    kv([
+      ["Порт хаба BMC", u.port ? `${u.port.replace(/.*:/, "")} (${u.ifname || "usb0"} на BMC)` : undefined],
+      ["Состояние", why],
+      ["Адрес BMC", u.enabled ? `${u.address}${u.mac ? `, IPv6 link-local по MAC ${u.mac}` : ""}` : undefined],
+      ["Адрес хоста", u.enabled ? u.host_ipv4 || "не получен (DHCP от BMC)" : undefined],
+      ["Агент", ag.connected ? (ag.via === "usb" ? "подключён по USB-сети" : "подключён по локальной сети") : "не подключён"],
+      ["Ошибка", u.error || undefined],
+    ]),
+    h("div", { class: "row section" }, box("enabled", "USB-сеть"), box("internet", "Интернет для хоста через порт BMC", { disabled: !u.enabled })),
+    h("div", { class: "muted small" }, "Хост видит BMC как сетевую карту USB и получает от него адрес по DHCP: агенту не нужен кабель локальной сети. С интернетом BMC раздаёт хосту и шлюз: трафик идёт через сетевой порт BMC — до 100 Мбит/с, нагружает процессор BMC. Если у хоста подключён свой кабель, трафик идёт по нему."),
   );
 }
 
@@ -231,7 +306,7 @@ function pairBox(st) {
     rows.push(h("div", { class: "note warn" }, "Ключ HTTPS BMC не прочитан (нет /etc/ssl/certs/https/server.pem): безопасной команды нет. Используйте «USB-диск с установщиком» или «Скачать установщик»."));
   } else {
     rows.push(h("div", { class: "small section" }, "На хосте, в терминале (нужны curl и python3; sudo спросит пароль):"));
-    if (p.link_local) rows.push(cmdRow(`по внутренней сети платы — IPv6 link-local ${p.link_local}, работает без кабеля и DHCP (интерфейс найдётся сам):`, cmdLL(p)));
+    if (p.link_local) rows.push(cmdRow(`по IPv6 link-local ${p.link_local} — через USB-сеть BMC или кабель локальной сети, без DHCP (интерфейс найдётся сам):`, cmdLL(p)));
     if (p.ipv4) rows.push(cmdRow(`по IPv4 ${p.ipv4}:`, cmdV4(p)));
   }
   return h(

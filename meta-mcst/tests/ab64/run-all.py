@@ -33,10 +33,12 @@ CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab
                     "test_usbhid_writes": ["python3", AB + "/test_usbhid_writes.py"], "test_reimu_flash": ["sh", "-c", FLASH_TEST],
                     # the host's tools (tools/host/tests)
                     "test_reimu_h264": ["python3", AB + "/../../tools/host/tests/test_reimu_h264.py"],
-                    "test_reimu_hostd": ["python3", AB + "/../../tools/host/tests/test_reimu_hostd.py"]}
+                    "test_reimu_hostd": ["python3", AB + "/../../tools/host/tests/test_reimu_hostd.py"],
+                    # the USB network to the host (reimu-usbnet against a fake configfs)
+                    "test_reimu_usbnet": ["python3", AB + "/../../meta-common/recipes-mcst/reimu-usbnet/files/tests/test_usbnet.py"]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
-               "kvm_hid", "logs", "overheatd", "pns", "regressions"]
+               "kvm_hid", "logs", "overheatd", "pns", "regressions", "usbnet"]
 # bug-for-bug: stock + new need both images, the group list below is the new one's
 PASS = re.compile(r"^\s*PASS\b", re.M)
 FAIL = re.compile(r"^ {0,2}FAIL\b", re.M)     # deeper: a tool's output a test quotes
@@ -184,6 +186,8 @@ def main():
                                    "node", os.path.join(e2e, "login.stub.mjs")]))
     jobs.append(Job("kvm_h264", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                  "node", os.path.join(e2e, "kvm-h264.stub.mjs")]))
+    jobs.append(Job("host_usbnet", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                    "node", os.path.join(e2e, "host-usbnet.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

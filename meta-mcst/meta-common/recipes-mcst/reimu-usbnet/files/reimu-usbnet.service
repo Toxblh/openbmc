@@ -1,0 +1,14 @@
+[Unit]
+Description=REIMU USB network to the host (CDC NCM on the virtual hub)
+# the network file before networkd meets usb0; reimu-hostlink listens on it
+After=systemd-networkd.service
+Before=reimu-hostlink.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/reimu-usbnet start
+ExecStop=/usr/libexec/reimu-usbnet stop
+
+[Install]
+WantedBy=multi-user.target

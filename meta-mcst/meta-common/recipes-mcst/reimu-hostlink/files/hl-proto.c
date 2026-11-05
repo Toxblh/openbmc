@@ -176,7 +176,7 @@ void hl_config_defaults(struct hl_config *c)
 {
     memset(c, 0, sizeof(*c));
     c->port = HL_PORT;
-    snprintf(c->iface, sizeof(c->iface), "eth0");
+    snprintf(c->iface, sizeof(c->iface), "eth0 usb0");
     c->allow_ipv4 = 1;
     c->ping_ms = 10000;
     c->lost_ms = 60000;
@@ -191,6 +191,23 @@ void hl_config_defaults(struct hl_config *c)
     snprintf(c->https_cert, sizeof(c->https_cert), "/etc/ssl/certs/https/server.pem");
     snprintf(c->disk_helper, sizeof(c->disk_helper), "/usr/libexec/reimu-agent-disk");
     c->kvm_port = 8443;
+    snprintf(c->usbnet_helper, sizeof(c->usbnet_helper), "/usr/libexec/reimu-usbnet");
+}
+
+int hl_iface_list(const char *list, char out[][16], int max)
+{
+    int n = 0;
+    for (const char *p = list ? list : ""; *p;)
+    {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        size_t l = strcspn(p, " \t");
+        if (l > 15 || n >= max || memchr(p, '/', l) || (l <= 2 && p[0] == '.')) return -1;
+        memcpy(out[n], p, l);
+        out[n++][l] = 0;
+        p += l;
+    }
+    return n;
 }
 
 int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int maxerr)
@@ -198,7 +215,7 @@ int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int 
     static const struct { const char *k; int kind; size_t off; double lo, hi; } keys[] = {
 #define O(f) offsetof(struct hl_config, f)
         { "PORT", 'i', O(port), 1, 65535 },
-        { "IFACE", 's', O(iface), 0, 0 },
+        { "IFACE", 'l', O(iface), 0, 0 },
         { "ALLOW_IPV4", 'b', O(allow_ipv4), 0, 0 },
         { "PING_SEC", 'm', O(ping_ms), 2, 300 },
         { "LOST_SEC", 'm', O(lost_ms), 10, 3600 },
@@ -216,6 +233,7 @@ int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int 
         { "HTTPS_CERT", 'p', O(https_cert), 0, 0 },
         { "DISK_HELPER", 'p', O(disk_helper), 0, 0 },
         { "KVM_PORT", 'i', O(kvm_port), 0, 65535 },
+        { "USBNET_HELPER", 'p', O(usbnet_helper), 0, 0 },
 #undef O
     };
     int nerr = 0;
@@ -246,7 +264,13 @@ int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int 
             if (strcmp(k, keys[i].k)) continue;
             char *ptr = (char *)c + keys[i].off, *end;
             int bad = 0;
+            char l[HL_MAX_IFACES][16];
             if (keys[i].kind == 's') snprintf(ptr, 16, "%s", v);
+            else if (keys[i].kind == 'l')
+            {
+                if (strlen(v) >= sizeof(c->iface) || hl_iface_list(v, l, HL_MAX_IFACES) < 0) bad = 1;
+                else snprintf(ptr, sizeof(c->iface), "%s", v);
+            }
             else if (keys[i].kind == 'p') snprintf(ptr, 128, "%s", v);
             else if (keys[i].kind == 'b')
             {
@@ -529,6 +553,7 @@ static void do_auth(struct hl *h, struct hl_conn *c, const char *s, const struct
     snprintf(h->agent_ver, sizeof(h->agent_ver), "%s", ver);
     snprintf(h->agent_host, sizeof(h->agent_host), "%s", host);
     snprintf(h->agent_peer, sizeof(h->agent_peer), "%s", c->peer);
+    snprintf(h->agent_iface, sizeof(h->agent_iface), "%s", c->iface);
     h->agent_transport = c->transport;
     h->agent_since_wall = h->last_seen_wall = wall();
     h->last_seen = h->now;
@@ -1173,6 +1198,9 @@ void hl_json(struct hl *h, struct buf *b)
     buf_json_str(b, h->agent_ver);
     buf_printf(b, ",\"transport\":\"%s\",\"peer\":", h->ever ? tn[h->agent_transport] : "");
     buf_json_str(b, h->agent_peer);
+    buf_printf(b, ",\"iface\":");
+    buf_json_str(b, h->ever ? h->agent_iface : "");
+    buf_printf(b, ",\"via\":\"%s\"", hl_agent_via(h));
     buf_printf(b, ",\"since\":%lld,\"last_seen\":%lld},", (long long)h->agent_since_wall, (long long)h->last_seen_wall);
     buf_printf(b, "\"heartbeat\":{\"state\":\"%s\",\"age\":%lld},", hl_heartbeat(h),
                h->ever ? (long long)((h->now - h->last_seen) / 1000) : -1LL);
@@ -1211,6 +1239,51 @@ void hl_json(struct hl *h, struct buf *b)
         buf_printf(b, "}");
     }
     buf_printf(b, "]}");
+}
+
+/* ------------------------------------------------------------------ the USB network */
+const char *hl_agent_via(const struct hl *h)
+{
+    if (!h->ever) return "";
+    /* the interface of the socket that accepted it; on an any-interface
+     * socket the link-local peer's scope */
+    const char *i = h->agent_iface;
+    if (!*i)
+    {
+        const char *pct = strchr(h->agent_peer, '%');
+        i = pct ? pct + 1 : "";
+    }
+    return !strncmp(i, "usb", 3) ? "usb" : "lan";
+}
+
+int hl_usbnet_check(const char *what, char *err, size_t n)
+{
+    if (what && (!strcmp(what, "internet") || !strcmp(what, "enabled"))) return 0;
+    snprintf(err, n, "unknown setting (internet or enabled)");
+    return -1;
+}
+
+void hl_usbnet_answer(const char *text, int rc, const char *err, struct buf *out)
+{
+    const char *why = err && *err ? err : "reimu-usbnet failed";
+    if (rc == 0)
+    {
+        size_t l = text ? strlen(text) : 0;
+        while (l && (text[l - 1] == '\n' || text[l - 1] == '\r' || text[l - 1] == ' ')) l--;
+        struct jtok *t = malloc(sizeof(struct jtok) * 512);
+        int k = t && l ? json_parse(text, l, t, 512) : -1;
+        int obj = k > 0 && t[0].type == J_OBJ;
+        free(t);
+        if (obj)
+        {
+            buf_add(out, text, l);
+            return;
+        }
+        why = l ? "reimu-usbnet: not a JSON object" : "reimu-usbnet: no answer";
+    }
+    buf_printf(out, "{\"error\":");
+    buf_json_str(out, why);
+    buf_printf(out, "}");
 }
 
 /* ------------------------------------------------------------------ the KVM hint */

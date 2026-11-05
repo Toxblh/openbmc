@@ -1963,8 +1963,271 @@ class TestTransport(Base):
         self.assertIsNone(hd.parse_discovery(b"REIMU-HOSTLINK 2 5564 ab"))
 
 
-# ------------------------------------------------------------------ the picture services (KVM)
 import unittest.mock
+
+
+# ------------------------------------------------------------------ the BMC's USB network (CDC-NCM)
+USBNET = "enx9aa7b0060f7e"
+USBNET_DEV = "/sys/devices/platform/ehci/usb4/4-4/4-4.5"
+
+
+def bmc_usb_net(t, name=USBNET, state="up", product="REIMU BMC network", driver="cdc_ncm", up=True):
+    """the BMC's USB network gadget as the host sees it: a USB device behind
+    the BMC's hub (product string), its interface bound to cdc_ncm, the netdev"""
+    t.put(USBNET_DEV + "/idVendor", "1d6b")
+    t.put(USBNET_DEV + "/idProduct", "0104")
+    t.put(USBNET_DEV + "/manufacturer", "OpenBMC")
+    t.put(USBNET_DEV + "/product", product)
+    intf = USBNET_DEV + "/4-4.5:1.0"
+    t.put(intf + "/bInterfaceClass", "02")
+    t.put("/sys/bus/usb/drivers/%s/uevent" % driver, "")
+    t.link(intf + "/driver", "/sys/bus/usb/drivers/" + driver)
+    n = intf + "/net/" + name
+    t.put(n + "/address", "9a:a7:b0:06:0f:7e")
+    t.put(n + "/operstate", state)
+    t.put(n + "/carrier", "1" if state == "up" else "0")
+    t.put(n + "/flags", "0x1003" if up else "0x1002")
+    t.put(n + "/speed", "-1")
+    t.put(n + "/mtu", "1500")
+    t.put(n + "/type", "1")
+    t.link(n + "/device", intf)
+    t.link("/sys/class/net/" + name, n)
+    return n
+
+
+ROUTE_HDR = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+
+
+def routes(t, *rows):
+    """/proc/net/route: (iface, gateway dotted, metric) default routes"""
+    import socket as _s, struct as _st
+    txt = ROUTE_HDR
+    for i, gw, metric in rows:
+        g = "%08X" % _st.unpack("<I", _s.inet_aton(gw))[0]
+        txt += "%s\t00000000\t%s\t0003\t0\t0\t%d\t00000000\t0\t0\t0\n" % (i, g, metric)
+    t.put("/proc/net/route", txt)
+
+
+class TestUsbNet(Base):
+    """reimu-usbnet on the BMC: an NCM network gadget on its USB hub, a link
+    to the host that doesn't go out through the switch"""
+
+    def test_the_bmcs_usb_interface_recognised(self):
+        bmc_usb_net(self.t)
+        self.assertEqual(hd.bmc_usb_ifaces(self.fs), [USBNET])
+        self.assertTrue(hd.is_bmc_usb_iface(self.fs, USBNET))
+        self.assertFalse(hd.is_bmc_usb_iface(self.fs, "enp1s1f1"))
+
+    def test_another_usb_network_dongle_is_not_the_bmc(self):
+        bmc_usb_net(self.t, name="enx001122334455", product="AX88179 Gigabit Ethernet", driver="cdc_ether")
+        self.assertEqual(hd.bmc_usb_ifaces(self.fs), [])
+
+    def test_ecm_driver_also_counts(self):
+        bmc_usb_net(self.t, driver="cdc_ether")
+        self.assertEqual(hd.bmc_usb_ifaces(self.fs), [USBNET])
+
+    def test_candidates_usb_first(self):
+        """the switch's LAN sorts first by name (enp < enx): USB must come first anyway"""
+        bmc_usb_net(self.t)
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        c = hd.candidates(cfg, self.fs, [])
+        self.assertEqual([(x["scope"], x["transport"], x.get("usb")) for x in c],
+                         [(USBNET, "ipv6-ll", True), ("enp1s1f1", "ipv6-ll", False), (None, "ipv4", False)])
+
+    def test_candidates_usb_first_even_after_a_lan_session(self):
+        bmc_usb_net(self.t)
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        last = {"addr": "fe80::9aa7:b0ff:fe06:f7e", "scope": "enp1s1f1", "transport": "ipv6-ll"}
+        c = hd.candidates(cfg, self.fs, [], last=last)
+        self.assertEqual([x["scope"] for x in c], [USBNET, "enp1s1f1", None])
+
+    def test_discovered_on_usb_first(self):
+        bmc_usb_net(self.t)
+        cfg = hd.parse_config("BMC_IPV4=192.168.10.79")
+        disc = [{"addr": "fe80::1", "scope": "enp1s1f1"}, {"addr": "fe80::1", "scope": USBNET}]
+        c = hd.candidates(cfg, self.fs, disc)
+        self.assertEqual([(x["scope"], x["usb"]) for x in c], [(USBNET, True), ("enp1s1f1", False), (None, False)])
+
+    def test_usb_down_not_a_candidate(self):
+        bmc_usb_net(self.t, state="down")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e")
+        self.assertEqual([x["scope"] for x in hd.candidates(cfg, self.fs, [])], ["enp1s1f1"])
+
+    def test_allow_has_usb_net_by_default(self):
+        self.assertIn("usb_net", hd.parse_config("")["ALLOW"])
+        self.assertNotIn("usb_net", hd.parse_config("ALLOW=gpu_fan")["ALLOW"])
+
+    # -- connected over the switch while the USB link is there: moved over
+    def agent(self, conf="BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79"):
+        ag = hd.Agent(hd.parse_config(conf), {"KEY": "aa" * 32, "FINGERPRINT": "bb" * 32}, self.fs, self.run)
+        ag.discover = lambda ifaces: []
+        return ag
+
+    LAN = {"addr": "fe80::9aa7:b0ff:fe06:f7e", "scope": "enp1s1f1", "port": 5564, "transport": "ipv6-ll", "usb": False}
+
+    def test_upgrade_to_usb_every_60_s(self):
+        bmc_usb_net(self.t)
+        ag = self.agent()
+        tried = []
+
+        def conn(c):
+            tried.append(c["scope"])
+            if len(tried) == 1:
+                raise OSError("no answer")
+            return "usb-sock"
+        ag.try_connect = conn
+        self.assertIsNone(ag.usb_upgrade(self.LAN, 100.0), "the first look a minute after the session began")
+        self.assertIsNone(ag.usb_upgrade(self.LAN, 159.0))
+        self.assertIsNone(ag.usb_upgrade(self.LAN, 160.0))
+        self.assertEqual(tried, [USBNET])
+        self.assertIsNone(ag.usb_upgrade(self.LAN, 200.0), "not again within a minute")
+        sock, cand = ag.usb_upgrade(self.LAN, 220.0)
+        self.assertEqual((sock, cand["scope"], cand["usb"]), ("usb-sock", USBNET, True))
+
+    def test_no_upgrade_when_on_usb_or_without_it(self):
+        ag = self.agent()
+        ag.try_connect = lambda c: self.fail("no USB interface: nothing to try")
+        ag.usb_upgrade(self.LAN, 0.0)
+        self.assertIsNone(ag.usb_upgrade(self.LAN, 1000.0))
+        bmc_usb_net(self.t)
+        usb = dict(self.LAN, scope=USBNET, usb=True)
+        ag.usb_upgrade(usb, 0.0)
+        self.assertIsNone(ag.usb_upgrade(usb, 1000.0))
+
+    def test_no_upgrade_with_a_fixed_address(self):
+        bmc_usb_net(self.t)
+        ag = self.agent("BMC=192.168.10.79:5564")
+        ag.try_connect = lambda c: self.fail("BMC= set: the address is the user's")
+        ip = {"addr": "192.168.10.79", "scope": None, "port": 5564, "transport": "ipv4", "usb": False}
+        ag.usb_upgrade(ip, 0.0)
+        self.assertIsNone(ag.usb_upgrade(ip, 1000.0))
+
+    def test_switch_closes_the_lan_link_and_goes_on_over_usb_at_once(self):
+        bmc_usb_net(self.t)
+        ag = self.agent()
+        usb = dict(self.LAN, scope=USBNET, usb=True)
+        ag.connect = unittest.mock.Mock(return_value=("lan-sock", self.LAN))
+        sessions, closed = [], []
+
+        class FakeLink:
+            def __init__(self, s):
+                self.s = s
+
+            def close(self):
+                closed.append(self.s)
+
+        def session(link, cand):
+            sessions.append((link.s, cand["scope"]))
+            if len(sessions) == 1:
+                raise hd.SwitchLink("usb-sock", usb)
+            ag.stop = True
+        ag.session = session
+        ag.local_tick = lambda now, ok: self.fail("no back-off wait before the USB session")
+        with unittest.mock.patch.object(hd, "Link", FakeLink):
+            ag.run_forever()
+        self.assertEqual(sessions, [("lan-sock", "enp1s1f1"), ("usb-sock", USBNET)])
+        self.assertEqual(closed, ["lan-sock", "usb-sock"])
+        self.assertEqual(ag.connect.call_count, 1)
+
+    def test_metrics_say_which_link(self):
+        ag = self.agent()
+        ag.col.metrics = lambda now: {}
+        self.assertEqual(ag.metrics(0, self.LAN)["agent"]["via"], "lan")
+        self.assertEqual(ag.metrics(0, dict(self.LAN, usb=True))["agent"]["via"], "usb")
+
+    # -- internet through the BMC: its default route never above the LAN's
+    def nm(self, uuid="5d2f6c1e-0000-4000-8000-000000000001"):
+        def nmcli(argv):
+            if argv[1:3] == ["-g", "GENERAL.CON-UUID"]:
+                return 0, uuid + "\n"
+            return 0, ""
+        self.run.table["nmcli"] = nmcli
+
+    def test_route_metric_raised_with_networkmanager(self):
+        bmc_usb_net(self.t)
+        routes(self.t, ("enp1s1f1", "192.168.10.1", 100), (USBNET, "172.31.83.1", 101))
+        self.nm()
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config(""))
+        ev = u.tick(0.0)
+        self.assertIn(["nmcli", "connection", "modify", "5d2f6c1e-0000-4000-8000-000000000001",
+                       "ipv4.route-metric", "700", "ipv6.route-metric", "700"], self.run.calls)
+        self.assertIn(["nmcli", "device", "reapply", USBNET], self.run.calls)
+        self.assertEqual([e["kind"] for e in ev], ["bmc_usb_net_metric"])
+        routes(self.t, ("enp1s1f1", "192.168.10.1", 100), (USBNET, "172.31.83.1", 700))
+        n = len(self.run.calls)
+        self.assertEqual(u.tick(70.0), [])
+        self.assertEqual(len(self.run.calls), n, "right already: nothing run")
+
+    def test_route_metric_without_networkmanager(self):
+        bmc_usb_net(self.t)
+        routes(self.t, (USBNET, "172.31.83.1", 0))
+        self.run.table["ip"] = (0, "")
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config(""))
+        u.tick(0.0)
+        self.assertIn(["ip", "route", "replace", "default", "via", "172.31.83.1", "dev", USBNET, "metric", "700"], self.run.calls)
+        self.assertIn(["ip", "route", "del", "default", "via", "172.31.83.1", "dev", USBNET, "metric", "0"], self.run.calls)
+
+    def test_route_fix_not_retried_within_a_minute(self):
+        bmc_usb_net(self.t)
+        routes(self.t, (USBNET, "172.31.83.1", 0))
+        self.run.table["ip"] = (2, "RTNETLINK answers: Operation not permitted")
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config(""))
+        u.tick(0.0)
+        n = len(self.run.calls)
+        u.tick(30.0)
+        self.assertEqual(len(self.run.calls), n)
+        u.tick(61.0)
+        self.assertGreater(len(self.run.calls), n)
+
+    def test_other_routes_untouched(self):
+        routes(self.t, ("enp1s1f1", "192.168.10.1", 100))
+        self.nm()
+        hd.UsbNet(self.fs, self.run, hd.parse_config("")).tick(0.0)
+        self.assertEqual(self.run.calls, [])
+
+    def test_down_interface_brought_up_after_a_grace(self):
+        """no NetworkManager on the host: nothing brings the new interface up,
+        and without it up there is no link-local address to reach the BMC by"""
+        bmc_usb_net(self.t, state="down", up=False)
+        self.run.table["ip"] = (0, "")
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config(""))
+        u.tick(0.0)
+        u.tick(9.0)
+        self.assertNotIn(["ip", "link", "set", USBNET, "up"], self.run.calls, "a network manager's chance first")
+        ev = u.tick(10.0)
+        self.assertIn(["ip", "link", "set", USBNET, "up"], self.run.calls)
+        self.assertEqual([e["kind"] for e in ev], ["bmc_usb_net_up"])
+
+    def test_up_without_carrier_left_alone(self):
+        bmc_usb_net(self.t, state="down", up=True)
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config(""))
+        u.tick(0.0)
+        u.tick(100.0)
+        self.assertEqual(self.run.calls, [])
+
+    def test_not_in_allow(self):
+        bmc_usb_net(self.t, state="down", up=False)
+        routes(self.t, (USBNET, "172.31.83.1", 0))
+        self.nm()
+        u = hd.UsbNet(self.fs, self.run, hd.parse_config("ALLOW=gpu_fan usb_hub"))
+        u.tick(0.0)
+        u.tick(100.0)
+        self.assertEqual(self.run.calls, [])
+
+    def test_not_a_bmc_command(self):
+        r = hd.Controller(hd.parse_config(""), hd.GpuFan(self.fs), self.run).handle({"t": "control", "id": 1, "op": "usb_net"}, 0)
+        self.assertFalse(r["ok"])
+
+    def test_state_in_metrics(self):
+        bmc_usb_net(self.t)
+        routes(self.t, (USBNET, "172.31.83.1", 700))
+        s = hd.bmc_usb_net_state(self.fs)
+        self.assertEqual(s, {"present": True, "iface": USBNET, "state": "up", "default_route": True, "metric": 700})
+        self.t.rm("/sys/class/net/" + USBNET)
+        self.assertEqual(hd.bmc_usb_net_state(self.fs)["present"], False)
+
+
+# ------------------------------------------------------------------ the picture services (KVM)
 
 
 def mock_env(**kw):
@@ -2326,7 +2589,7 @@ class TestProtocol(unittest.TestCase):
     def test_config_defaults(self):
         c = hd.parse_config("# nothing\nUNKNOWN_KEY=1\n")
         self.assertEqual((c["INTERVAL"], c["GPU_FAN_FLOOR"], c["LINK_LOST_SEC"], c["BMC_PORT"]), (10, 30, 60, 5564))
-        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load", "diag", "usb_hub", "bmc_owns_i2c"})
+        self.assertEqual(c["ALLOW"], {"gpu_fan", "gpu_turbo", "os_power", "edac_load", "diag", "usb_hub", "bmc_owns_i2c", "usb_net"})
         self.assertEqual(hd.parse_config("INTERVAL=0")["INTERVAL"], 2)
 
 

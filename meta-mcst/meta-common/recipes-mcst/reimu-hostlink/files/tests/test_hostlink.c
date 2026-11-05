@@ -229,7 +229,7 @@ static void t_config(void)
 {
     struct hl_config c;
     hl_config_defaults(&c);
-    CHECK(c.port == 5564 && !strcmp(c.iface, "eth0") && c.allow_ipv4 && c.lost_ms == 60000, "defaults");
+    CHECK(c.port == 5564 && !strcmp(c.iface, "eth0 usb0") && c.allow_ipv4 && c.lost_ms == 60000, "defaults");
     char err[8][128];
     int n = hl_config_parse(&c, "# x\nPORT=6000\nIFACE=\"eth1\"\nALLOW_IPV4=no\nGPU_JUNCTION_WARN=90\nLOST_SEC=abc\nPORT=99999\nNEW_THING=1\n",
                             err, 8);
@@ -237,6 +237,102 @@ static void t_config(void)
     CHECK(n == 2 && c.lost_ms == 60000, "2 errors (%d), bad values keep the default", n);
     hl_config_parse(&c, "IFACE=\n", err, 8);
     CHECK(c.iface[0] == 0, "IFACE= : any interface");
+}
+
+/* IFACE: a list (the board's LAN and the USB network with the host, usb0 of
+ * reimu-usbnet); a socket pair per interface. Before: one name, eth0, and the
+ * agent cut off with the host's LAN cable */
+static void t_ifaces(void)
+{
+    struct hl_config c;
+    char err[8][128], l[HL_MAX_IFACES][16];
+    hl_config_defaults(&c);
+    CHECK(!strcmp(c.iface, "eth0 usb0"), "IFACE default \"eth0 usb0\" (%s)", c.iface);
+    CHECK(!strcmp(c.usbnet_helper, "/usr/libexec/reimu-usbnet"), "USBNET_HELPER default (%s)", c.usbnet_helper);
+    int n = hl_iface_list(c.iface, l, HL_MAX_IFACES);
+    CHECK(n == 2 && !strcmp(l[0], "eth0") && !strcmp(l[1], "usb0"), "the default as a list (%d)", n);
+    CHECK(hl_iface_list("", l, HL_MAX_IFACES) == 0, "empty: none (any interface)");
+    n = hl_iface_list("  eth0\tusb0  eth1 ", l, HL_MAX_IFACES);
+    CHECK(n == 3 && !strcmp(l[2], "eth1"), "spaces and tabs (%d)", n);
+    CHECK(hl_iface_list("eth0 eth0123456789012", l, HL_MAX_IFACES) < 0, "a name over 15 bytes refused");
+    CHECK(hl_iface_list("a b c d e", l, HL_MAX_IFACES) < 0, "more than %d refused", HL_MAX_IFACES);
+    CHECK(hl_iface_list("eth0 us/b0", l, HL_MAX_IFACES) < 0 && hl_iface_list("eth0 ../x", l, HL_MAX_IFACES) < 0, "a name with / refused");
+    n = hl_config_parse(&c, "IFACE=\"eth1 usb0\"\nUSBNET_HELPER=/tmp/x\n", err, 8);
+    CHECK(n == 0 && !strcmp(c.iface, "eth1 usb0") && !strcmp(c.usbnet_helper, "/tmp/x"), "a list and the helper set (%d %s)", n, c.iface);
+    n = hl_config_parse(&c, "IFACE=eth0 eth0123456789012\n", err, 8);
+    CHECK(n == 1 && !strcmp(c.iface, "eth1 usb0"), "a bad list: an error, the old value kept (%d %s)", n, c.iface);
+}
+
+/* how the agent is connected: over the USB network (the socket of usb0
+ * accepted it, or its link-local scope is usb*) or the LAN */
+static void t_via(void)
+{
+    fresh(NULL);
+    write_key(KEY);
+    struct buf b = { 0 };
+    hl_json(&H, &b);
+    CHECK(!strcmp(field(b.s, "agent.via"), ""), "no agent: via \"\" (%s)", field(b.s, "agent.via"));
+    buf_free(&b);
+    struct hl_conn *a = calloc(1, sizeof(*a));
+    hl_conn_open(&H, a, "::ffff:172.31.83.2", T);
+    snprintf(a->iface, sizeof(a->iface), "usb0");
+    char l[1024];
+    auth_line(l, sizeof(l), KEY, a->nonce, CN, "host-1");
+    send_line(a, "%s", l);
+    memset(&b, 0, sizeof(b));
+    hl_json(&H, &b);
+    CHECK(!strcmp(field(b.s, "agent.via"), "usb"), "accepted on usb0: usb (%s)", field(b.s, "agent.via"));
+    CHECK(!strcmp(field(b.s, "agent.iface"), "usb0"), "its interface usb0 (%s)", field(b.s, "agent.iface"));
+    buf_free(&b);
+    drop(a);
+    a = agent("fe80::1%eth0");
+    memset(&b, 0, sizeof(b));
+    hl_json(&H, &b);
+    CHECK(!strcmp(field(b.s, "agent.via"), "lan"), "fe80::1%%eth0 (any socket): lan (%s)", field(b.s, "agent.via"));
+    buf_free(&b);
+    drop(a);
+    a = agent("fe80::1%usb0");
+    memset(&b, 0, sizeof(b));
+    hl_json(&H, &b);
+    CHECK(!strcmp(field(b.s, "agent.via"), "usb"), "fe80::1%%usb0: usb (%s)", field(b.s, "agent.via"));
+    buf_free(&b);
+    drop(a);
+    a = agent("::ffff:192.168.10.50");
+    memset(&b, 0, sizeof(b));
+    hl_json(&H, &b);
+    CHECK(!strcmp(field(b.s, "agent.via"), "lan"), "IPv4 on an any-interface socket: lan (%s)", field(b.s, "agent.via"));
+    buf_free(&b);
+    drop(a);
+}
+
+/* reimu-usbnet's answers as D-Bus gives them: its status JSON object, or
+ * {"error":...} (no helper, a bad answer); what UsbNetSet takes */
+static void t_usbnet(void)
+{
+    struct buf b = { 0 };
+    hl_usbnet_answer("{\"enabled\":true,\"internet\":false}\n", 0, "", &b);
+    CHECK(b.s && !strcmp(b.s, "{\"enabled\":true,\"internet\":false}"), "the helper's JSON as it is (%s)", b.s);
+    buf_free(&b);
+    memset(&b, 0, sizeof(b));
+    hl_usbnet_answer("", -1, "/usr/libexec/reimu-usbnet: No such file or directory", &b);
+    CHECK(b.s && !strcmp(field(b.s, "error"), "/usr/libexec/reimu-usbnet: No such file or directory"), "no helper: its error (%s)", b.s);
+    buf_free(&b);
+    memset(&b, 0, sizeof(b));
+    hl_usbnet_answer("not json", 0, "", &b);
+    CHECK(b.s && *field(b.s, "error"), "not JSON: an error (%s)", b.s);
+    buf_free(&b);
+    memset(&b, 0, sizeof(b));
+    hl_usbnet_answer("[1,2]", 0, "", &b);
+    CHECK(b.s && *field(b.s, "error"), "not an object: an error (%s)", b.s);
+    buf_free(&b);
+    memset(&b, 0, sizeof(b));
+    hl_usbnet_answer("{\"enabled\":false,\"error\":\"no vhub\"}", 1, "set failed", &b);
+    CHECK(b.s && !strcmp(field(b.s, "error"), "set failed"), "a failed helper: its message (%s)", b.s);
+    buf_free(&b);
+    char err[160];
+    CHECK(hl_usbnet_check("internet", err, sizeof(err)) == 0 && hl_usbnet_check("enabled", err, sizeof(err)) == 0, "internet, enabled");
+    CHECK(hl_usbnet_check("x; reboot", err, sizeof(err)) < 0 && hl_usbnet_check("", err, sizeof(err)) < 0 && hl_usbnet_check(NULL, err, sizeof(err)) < 0,
+          "anything else refused (%s)", err);
 }
 
 static void t_hmac(void)
@@ -965,6 +1061,7 @@ int main(void)
         { "gpu_temp_events", t_gpu_temp_events }, { "lost_back", t_lost_back }, { "ping", t_ping },
         { "replace", t_replace }, { "policy", t_policy }, { "turbo", t_turbo }, { "control", t_control },
         { "events_ring", t_events_ring }, { "kvm_hint", t_kvm_hint },
+        { "ifaces", t_ifaces }, { "via", t_via }, { "usbnet", t_usbnet },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {

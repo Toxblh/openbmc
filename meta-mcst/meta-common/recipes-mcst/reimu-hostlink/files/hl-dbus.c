@@ -141,6 +141,29 @@ static int m_disk_off(sd_bus_message *m, void *ud, sd_bus_error *err)
     return sd_bus_reply_method_return(m, "s", "off");
 }
 
+static int m_usbnet(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    char e[160];
+    struct buf b = { 0 };
+    daemon_usbnet(H, NULL, 0, &b, e, sizeof(e));
+    int r = sd_bus_reply_method_return(m, "s", b.s && !b.oom ? b.s : "{}");
+    buf_free(&b);
+    return r;
+}
+
+static int m_usbnet_set(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    const char *what;
+    int on;
+    char e[160];
+    struct buf b = { 0 };
+    int r = sd_bus_message_read(m, "sb", &what, &on);
+    if (r < 0) return r;
+    r = reply(m, err, daemon_usbnet(H, what, on, &b, e, sizeof(e)), e, b.s && !b.oom ? b.s : "{}");
+    buf_free(&b);
+    return r;
+}
+
 static int m_unpair(sd_bus_message *m, void *ud, sd_bus_error *err)
 {
     hl_unpair(H);
@@ -162,6 +185,8 @@ static const sd_bus_vtable root_vtable[] = {
     SD_BUS_METHOD("Unpair", "", "s", m_unpair, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("AgentDisk", "", "s", m_disk, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("AgentDiskOff", "", "s", m_disk_off, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("UsbNet", "", "s", m_usbnet, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("UsbNetSet", "sb", "s", m_usbnet_set, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END
 };
 

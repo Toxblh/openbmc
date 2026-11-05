@@ -1,7 +1,11 @@
 /* reimu-hostlink: TLS (OpenSSL, the image has it for bmcweb) on TCP [::]:PORT
  * (dual stack: IPv6 link-local first, IPv4 too unless ALLOW_IPV4=no), bound
- * to IFACE (SO_BINDTODEVICE: only the board's LAN, eth0; eth1 never), and
- * the discovery answer on UDP [::]:PORT to link-local peers only.
+ * to each interface of IFACE (SO_BINDTODEVICE: the board's LAN eth0 and the
+ * USB network with the host usb0; eth1 never), a socket pair each, and the
+ * discovery answer on UDP [::]:PORT to link-local peers only. An interface
+ * that isn't there (usb0 before reimu-usbnet made it), or came back as a new
+ * one (a new ifindex: the socket would hear nothing), is listened on again at
+ * the next retry.
  *
  * The certificate is the daemon's own (EC P-256, self-signed, made on the
  * first start in the state directory): the agent pins its SHA-256 at
@@ -46,16 +50,24 @@ struct client
     struct hl_conn c;
 };
 
+/* the sockets of one interface of IFACE ("" = any) */
+struct lsock
+{
+    char name[16];
+    unsigned ifindex;  /* when the sockets were made */
+    int lfd, ufd;
+    int logged;        /* 1 "not listening" said, 2 "listening" said */
+};
+
 struct hl_net
 {
     struct hl *h;
     SSL_CTX *ctx;
-    int lfd, ufd;
-    char iface[16];
+    struct lsock ls[HL_MAX_IFACES];
+    int nls;
     int port;
     int64_t last_retry, udp_window;
     int udp_count;
-    int logged_bind;
     struct client cl[MAX_CLIENTS];
 };
 
@@ -130,12 +142,14 @@ out:
 }
 
 /* ------------------------------------------------------------------ sockets */
+/* the pairing string's MAC and IPv4: the first interface's */
 static void iface_info(struct hl_net *nt)
 {
     struct hl *h = nt->h;
-    if (!nt->iface[0]) return;
+    const char *first = nt->ls[0].name;
+    if (!first[0]) return;
     char p[80], mac[32] = "";
-    snprintf(p, sizeof(p), "/sys/class/net/%s/address", nt->iface);
+    snprintf(p, sizeof(p), "/sys/class/net/%s/address", first);
     FILE *f = fopen(p, "r");
     if (f)
     {
@@ -146,14 +160,14 @@ static void iface_info(struct hl_net *nt)
     int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", nt->iface);
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", first);
     h->ipv4[0] = 0;
     if (s >= 0 && ioctl(s, SIOCGIFADDR, &ifr) == 0)
         inet_ntop(AF_INET, &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr, h->ipv4, sizeof(h->ipv4));
     if (s >= 0) close(s);
 }
 
-static int open_sock(struct hl_net *nt, int type, char *err, size_t n)
+static int open_sock(struct hl_net *nt, const char *iface, int type, char *err, size_t n)
 {
     int fd = socket(AF_INET6, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -164,9 +178,9 @@ static int open_sock(struct hl_net *nt, int type, char *err, size_t n)
     int off = 0, on = 1;
     setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    if (nt->iface[0] && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, nt->iface, strlen(nt->iface) + 1))
+    if (iface[0] && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface) + 1))
     {
-        snprintf(err, n, "%s: %s", nt->iface, strerror(errno));
+        snprintf(err, n, "%s: %s", iface, strerror(errno));
         close(fd);
         return -1;
     }
@@ -184,29 +198,56 @@ static int open_sock(struct hl_net *nt, int type, char *err, size_t n)
     return fd;
 }
 
+static void ls_close(struct lsock *l)
+{
+    if (l->lfd >= 0) close(l->lfd);
+    if (l->ufd >= 0) close(l->ufd);
+    l->lfd = l->ufd = -1;
+}
+
 void net_retry(struct hl_net *nt, int64_t now)
 {
     nt->last_retry = now;
     iface_info(nt);
-    char err[160] = "";
-    if (nt->lfd < 0) nt->lfd = open_sock(nt, SOCK_STREAM, err, sizeof(err));
-    if (nt->ufd < 0 && nt->lfd >= 0) nt->ufd = open_sock(nt, SOCK_DGRAM, err, sizeof(err));
-    if (nt->lfd < 0 && !nt->logged_bind)
+    for (int i = 0; i < nt->nls; i++)
     {
-        hl_log(4, "not listening yet (%s): trying every %d s", err, RETRY_MS / 1000);
-        nt->logged_bind = 1;
-    }
-    else if (nt->lfd >= 0 && nt->logged_bind != 2)
-    {
-        hl_log(5, "listening on TCP+UDP [::]:%d%s%s (TLS, certificate %.16s…)", nt->port, nt->iface[0] ? " on " : "",
-               nt->iface, nt->h->fingerprint);
-        nt->logged_bind = 2;
+        struct lsock *l = &nt->ls[i];
+        unsigned idx = l->name[0] ? if_nametoindex(l->name) : 0;
+        if (l->lfd >= 0 && l->name[0] && idx != l->ifindex)
+        {
+            /* gone, or a new interface of that name: the old sockets hear nothing */
+            hl_log(5, "%s %s: listening on it again", l->name, idx ? "came back" : "is gone");
+            ls_close(l);
+            l->logged = 0;
+        }
+        char err[160] = "";
+        if (l->lfd < 0 && (!l->name[0] || idx))
+        {
+            l->lfd = open_sock(nt, l->name, SOCK_STREAM, err, sizeof(err));
+            l->ifindex = idx;
+        }
+        else if (l->lfd < 0) snprintf(err, sizeof(err), "%s: no such interface", l->name);
+        if (l->ufd < 0 && l->lfd >= 0) l->ufd = open_sock(nt, l->name, SOCK_DGRAM, err, sizeof(err));
+        if (l->lfd < 0 && l->logged != 1)
+        {
+            hl_log(l->logged ? 4 : 5, "not listening%s%s yet (%s): trying every %d s", l->name[0] ? " on " : "", l->name, err,
+                   RETRY_MS / 1000);
+            l->logged = 1;
+        }
+        else if (l->lfd >= 0 && l->logged != 2)
+        {
+            hl_log(5, "listening on TCP+UDP [::]:%d%s%s (TLS, certificate %.16s…)", nt->port, l->name[0] ? " on " : "", l->name,
+                   nt->h->fingerprint);
+            l->logged = 2;
+        }
     }
 }
 
 int net_listening(struct hl_net *nt)
 {
-    return nt->lfd >= 0;
+    for (int i = 0; i < nt->nls; i++)
+        if (nt->ls[i].lfd >= 0) return 1;
+    return 0;
 }
 
 struct hl_net *net_new(struct hl *h, const char *certfile, char *err, size_t n)
@@ -221,9 +262,15 @@ struct hl_net *net_new(struct hl *h, const char *certfile, char *err, size_t n)
     struct hl_net *nt = calloc(1, sizeof(*nt));
     if (!nt) return NULL;
     nt->h = h;
-    nt->lfd = nt->ufd = -1;
     nt->port = h->c.port;
-    snprintf(nt->iface, sizeof(nt->iface), "%s", h->c.iface);
+    char names[HL_MAX_IFACES][16];
+    nt->nls = hl_iface_list(h->c.iface, names, HL_MAX_IFACES);
+    if (nt->nls <= 0) nt->nls = 1, names[0][0] = 0; /* any interface */
+    for (int i = 0; i < nt->nls; i++)
+    {
+        snprintf(nt->ls[i].name, sizeof(nt->ls[i].name), "%s", names[i]);
+        nt->ls[i].lfd = nt->ls[i].ufd = -1;
+    }
     for (int i = 0; i < MAX_CLIENTS; i++) nt->cl[i].fd = -1;
     nt->ctx = SSL_CTX_new(TLS_server_method());
     if (!nt->ctx) goto fail;
@@ -323,13 +370,13 @@ static void peer_name(const struct sockaddr_in6 *a, char *out, size_t n)
     else snprintf(out, n, "%s", ip);
 }
 
-static void on_accept(struct hl_net *nt, int64_t now)
+static void on_accept(struct hl_net *nt, struct lsock *l, int64_t now)
 {
     for (int k = 0; k < 8; k++)
     {
         struct sockaddr_in6 a;
         socklen_t al = sizeof(a);
-        int fd = accept4(nt->lfd, (struct sockaddr *)&a, &al, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = accept4(l->lfd, (struct sockaddr *)&a, &al, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) return;
         int pending = 0;
         struct client *free_cl = NULL;
@@ -366,21 +413,22 @@ static void on_accept(struct hl_net *nt, int64_t now)
         char peer[64];
         peer_name(&a, peer, sizeof(peer));
         hl_conn_open(nt->h, &cl->c, peer, now);
-        hl_log(7, "connection %d from %s", cl->c.id, peer);
+        snprintf(cl->c.iface, sizeof(cl->c.iface), "%s", l->name);
+        hl_log(7, "connection %d from %s%s%s", cl->c.id, peer, l->name[0] ? " on " : "", l->name);
         if (!cl->c.close_why[0]) client_io(nt, cl, now);
     }
 }
 
 /* the discovery answer: "REIMU-HOSTLINK? 1" from a link-local peer ->
  * "REIMU-HOSTLINK 1 PORT FINGERPRINT-PREFIX" (rate limited: no amplifier) */
-static void on_udp(struct hl_net *nt, int64_t now)
+static void on_udp(struct hl_net *nt, struct lsock *l, int64_t now)
 {
     for (int k = 0; k < 16; k++)
     {
         char b[64];
         struct sockaddr_in6 a;
         socklen_t al = sizeof(a);
-        ssize_t n = recvfrom(nt->ufd, b, sizeof(b) - 1, 0, (struct sockaddr *)&a, &al);
+        ssize_t n = recvfrom(l->ufd, b, sizeof(b) - 1, 0, (struct sockaddr *)&a, &al);
         if (n < 0) return;
         b[n] = 0;
         while (n && (b[n - 1] == '\n' || b[n - 1] == '\r' || b[n - 1] == ' ')) b[--n] = 0;
@@ -388,16 +436,19 @@ static void on_udp(struct hl_net *nt, int64_t now)
         if (now - nt->udp_window >= 1000) nt->udp_window = now, nt->udp_count = 0;
         if (++nt->udp_count > 10) continue;
         char r[96];
-        int l = snprintf(r, sizeof(r), "REIMU-HOSTLINK 1 %d %.16s", nt->port, nt->h->fingerprint);
-        sendto(nt->ufd, r, l, 0, (struct sockaddr *)&a, al);
+        int rl = snprintf(r, sizeof(r), "REIMU-HOSTLINK 1 %d %.16s", nt->port, nt->h->fingerprint);
+        sendto(l->ufd, r, rl, 0, (struct sockaddr *)&a, al);
     }
 }
 
 int net_pollfds(struct hl_net *nt, struct pollfd *p, int max)
 {
     int n = 0;
-    if (nt->lfd >= 0 && n < max) p[n++] = (struct pollfd){ nt->lfd, POLLIN, 0 };
-    if (nt->ufd >= 0 && n < max) p[n++] = (struct pollfd){ nt->ufd, POLLIN, 0 };
+    for (int i = 0; i < nt->nls; i++)
+    {
+        if (nt->ls[i].lfd >= 0 && n < max) p[n++] = (struct pollfd){ nt->ls[i].lfd, POLLIN, 0 };
+        if (nt->ls[i].ufd >= 0 && n < max) p[n++] = (struct pollfd){ nt->ls[i].ufd, POLLIN, 0 };
+    }
     for (int i = 0; i < MAX_CLIENTS && n < max; i++)
     {
         struct client *cl = &nt->cl[i];
@@ -415,8 +466,13 @@ void net_handle(struct hl_net *nt, struct pollfd *p, int n, int64_t now)
     for (int k = 0; k < n; k++)
     {
         if (!p[k].revents) continue;
-        if (p[k].fd == nt->lfd) on_accept(nt, now);
-        else if (p[k].fd == nt->ufd) on_udp(nt, now);
+        struct lsock *l = NULL;
+        int udp = 0;
+        for (int i = 0; i < nt->nls && !l; i++)
+            if (p[k].fd == nt->ls[i].lfd) l = &nt->ls[i];
+            else if (p[k].fd == nt->ls[i].ufd) l = &nt->ls[i], udp = 1;
+        if (l && udp) on_udp(nt, l, now);
+        else if (l) on_accept(nt, l, now);
         else
             for (int i = 0; i < MAX_CLIENTS; i++)
                 if (nt->cl[i].fd == p[k].fd)
@@ -439,8 +495,8 @@ void net_handle(struct hl_net *nt, struct pollfd *p, int n, int64_t now)
         client_write(cl);
         if (cl->c.close_why[0] && (!cl->c.out.len || !cl->hs_done || cl->shut++ > 20)) client_close(nt, cl, now);
     }
-    if (nt->lfd < 0 && now - nt->last_retry >= RETRY_MS) net_retry(nt, now);
-    else if (now - nt->last_retry >= 60000) net_retry(nt, now); /* the IPv4 address for Pair() */
+    /* an interface not listened on yet, or gone and back; the IPv4 address for Pair() */
+    if (now - nt->last_retry >= RETRY_MS) net_retry(nt, now);
 }
 
 void net_free(struct hl_net *nt)
@@ -448,8 +504,7 @@ void net_free(struct hl_net *nt)
     if (!nt) return;
     for (int i = 0; i < MAX_CLIENTS; i++)
         if (nt->cl[i].fd >= 0) client_close(nt, &nt->cl[i], 0);
-    if (nt->lfd >= 0) close(nt->lfd);
-    if (nt->ufd >= 0) close(nt->ufd);
+    for (int i = 0; i < nt->nls; i++) ls_close(&nt->ls[i]);
     SSL_CTX_free(nt->ctx);
     free(nt);
 }

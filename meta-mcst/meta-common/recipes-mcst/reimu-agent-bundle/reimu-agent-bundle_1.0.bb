@@ -1,7 +1,7 @@
 SUMMARY = "REIMU host agent bundle: the installer the BMC hands its host"
 DESCRIPTION = "The host agent reimu-hostd (meta-mcst/tools/host) as the BMC serves it: /usr/share/www/agent/ over bmcweb's HTTPS (install.sh with the SHA-256 of the agent's files written in, the files and the picture services it sets up (reimu-h264.py, reimu-host.sh, reimu-fbmirror.c), SHA256SUMS, README.txt), and a FAT image «REIMU-AGENT» with the same files that reimu-agent-disk shows the host as a read-only USB disk with the pairing string on it (reimu-hostlink's AgentDisk)"
 SECTION = "base"
-PR = "r3"
+PR = "r4"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0;md5=801f80980d171dd6425610833a22dbe6"
 

@@ -50,6 +50,9 @@ IMAGE_FEATURES_remove = "obmc-fan-control"
 # the host agent's link (reimu-hostd on the host, meta-mcst/tools/host):
 # inventory, health, GPU sensors and fan policy, events
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-hostlink"
+# the USB network to the host (the agent and the picture with no LAN cable;
+# the host's internet through the BMC when switched on)
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-usbnet"
 
 # ---------------------------------------------------------------- A/B image
 # The partitions (bytes) of reimu-ab64.dtsi; the build fails when a part

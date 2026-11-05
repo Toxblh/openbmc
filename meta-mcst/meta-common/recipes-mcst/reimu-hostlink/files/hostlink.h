@@ -28,6 +28,7 @@
 #define HL_MAX_RESULTS 8
 #define HL_MAX_DIMMS  32
 #define HL_KEY_LEN    32
+#define HL_MAX_IFACES 4           /* IFACE: interfaces listened on */
 
 /* ------------------------------------------------------------------ buffers */
 struct buf
@@ -68,7 +69,8 @@ int json_bool(const struct jtok *t, int i, int *v);
 struct hl_config
 {
     int port;
-    char iface[16];       /* SO_BINDTODEVICE; "" = any */
+    char iface[72];       /* SO_BINDTODEVICE, a list ("eth0 usb0"): a socket pair
+                           * each; the pairing string from the first; "" = any */
     int allow_ipv4;       /* IPv4 (v4-mapped) peers accepted */
     int ping_ms;          /* to the agent */
     int lost_ms;          /* no agent this long: "lost" */
@@ -81,10 +83,14 @@ struct hl_config
     char https_cert[128]; /* bmcweb's: the pin of its key for the install command */
     char disk_helper[128]; /* reimu-agent-disk: the installer's USB disk */
     int kvm_port;          /* reimu-kvm's UDP port on loopback for hl_kvm_hint, 0 = none */
+    char usbnet_helper[128]; /* reimu-usbnet: the USB network with the host */
 };
 void hl_config_defaults(struct hl_config *c);
 /* KEY=VALUE text over c: the number of errors (in err[], defaults kept) */
 int hl_config_parse(struct hl_config *c, const char *text, char err[][128], int maxerr);
+/* IFACE's names into out: how many (0: any interface), -1 a bad list (a name
+ * over 15 bytes or with '/', more than max) */
+int hl_iface_list(const char *list, char out[][16], int max);
 
 /* ------------------------------------------------------------------ sensors */
 enum { S_GPU_EDGE, S_GPU_JUNCTION, S_GPU_MEM, S_GPU_FAN, S_GPU_PWM, S_GPU_POWER, S_DISK_MAX, NSENS };
@@ -106,6 +112,7 @@ struct hl_conn
     int id;              /* for the logs */
     char nonce[33];
     char peer[64];
+    char iface[16];      /* the listening socket's interface (set by the net layer); "" any */
     int transport;
     struct buf in, out;
     int64_t opened, last_rx;
@@ -148,6 +155,7 @@ struct hl
     char agent_id[65], agent_host[65], agent_ver[17];
     int agent_transport;
     char agent_peer[64];
+    char agent_iface[16];
     int64_t agent_since_wall, last_seen_wall, last_seen, gone_at;
     int ever, lost_reported;
     int64_t last_ping;
@@ -224,6 +232,18 @@ void hl_disk_end(struct hl *h);
  * DISK_HELPER stop; 0 ok, -1 with err */
 int daemon_disk_start(struct hl *h, struct buf *out, char *err, size_t n);
 int daemon_disk_stop(struct hl *h, const char *why, char *err, size_t n);
+/* the USB network with the host (USBNET_HELPER, reimu-usbnet): what = NULL its
+ * status, else "internet" / "enabled" set on or off (USBNET_HELPER set WHAT
+ * on|off); out: the helper's status JSON object, or {"error":...}; -1 with err
+ * when a set failed or what is refused (the status: always 0) */
+int daemon_usbnet(struct hl *h, const char *what, int on, struct buf *out, char *err, size_t n);
+/* what UsbNetSet may set: 0 ok, -1 + err */
+int hl_usbnet_check(const char *what, char *err, size_t n);
+/* the helper's output (rc: its exit, 0 ok; err: its message) as the answer
+ * into out: the JSON object it printed, or {"error":...} */
+void hl_usbnet_answer(const char *text, int rc, const char *err, struct buf *out);
+/* how the agent is connected: "usb" (the USB network), "lan", "" none */
+const char *hl_agent_via(const struct hl *h);
 
 void hl_json(struct hl *h, struct buf *b);
 /* "ok", "late", "lost", "never" */

@@ -4,14 +4,14 @@ REIMU host agent (reimu-hostd) / Агент хоста REIMU
 The agent tells the BMC what the host is and how it is doing (CPU, memory and
 ECC, PCIe, disks, network, the video card and its fan) and lets the BMC set
 the GPU fan policy and ask for a clean shutdown/reboot. It talks to the BMC
-over the board's internal LAN (IPv6 link-local: no cable, no DHCP needed),
-TLS with the BMC's certificate pinned.
+over the BMC's USB network (its USB gadget, no cable needed) or the LAN
+(IPv6 link-local: no DHCP needed), TLS with the BMC's certificate pinned.
 
 Агент сообщает BMC состав и состояние хоста (процессор, память и ECC, PCIe,
 диски, сеть, видеокарта и её вентилятор), BMC может задать режим вентилятора
 видеокарты и попросить корректно выключить/перезагрузить ОС. Связь — по
-внутренней сети платы (IPv6 link-local: без кабеля и DHCP), TLS с
-закреплённым сертификатом BMC.
+USB-сети BMC (его USB-устройство, кабель не нужен) или по локальной сети
+(IPv6 link-local: DHCP не нужен), TLS с закреплённым сертификатом BMC.
 
 Once paired the BMC is the only master of the I2C buses it shares with the
 host: pwmd is disabled and the host's fan drivers kept out. With the BMC down

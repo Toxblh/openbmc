@@ -46,8 +46,8 @@ On the BMC's web page **Хост** (needs python3 on the host; the one-time
 pairing string is valid 15 min, «Новый ключ» makes another):
 
 * **«Подключить агент хоста»** shows commands for the host's terminal, over
-  the board's LAN (IPv6 link-local, every interface tried: no cable, no DHCP)
-  or over IPv4:
+  the BMC's USB network or the LAN (IPv6 link-local, every interface tried:
+  no DHCP needed) or over IPv4:
 
   ```
   s=$(curl -fsS --pinnedpubkey 'sha256//<bmcweb key>' -k https://192.168.10.79/agent/install.sh) && printf '%s\n' "$s" | sudo sh -s -- --pair 'reimu1:…'
@@ -112,8 +112,24 @@ Remove: `sudo sh install.sh --uninstall [--purge]` (or `sudo ./reimu-hostd.py un
   answered the multicast probe (`REIMU-HOSTLINK? 1` to `ff02::1` port 5564,
   only answers carrying the pinned certificate's fingerprint prefix count:
   the MAC may change with the FRU's `set_mac`); then `BMC_IPV4`. The last
-  link-local address that worked goes first. Without the cable there is no
-  DHCP and no IPv4: link-local still works (measured 0.3 ms on the board).
+  link-local address that worked goes first. Without DHCP there is no IPv4:
+  link-local still works (measured 0.3 ms on the board). The board has no
+  internal LAN between the host and the BMC: eth0 and the host's NIC meet in
+  the external switch, so a host interface down or a cable out cuts that way.
+* The BMC's USB network (reimu-usbnet on the BMC: a CDC-NCM gadget on its
+  USB hub, product "REIMU BMC network", the BMC's end with the eth0 MAC, so
+  the same EUI-64 link-local address) needs no cable or switch. Its interface
+  (driver `cdc_ncm`, found by the USB device's product string) is tried
+  first; a session over the LAN looks for it every `USB_UPGRADE_SEC` (60 s)
+  and moves over when the BMC answers there. `usb_net` in `ALLOW` (default on;
+  host-local) also: brings the interface up after 10 s when nothing else did
+  (no NetworkManager: `ip link set up`), and, with "internet through the BMC"
+  on there (the BMC's DHCP gives a router), sets its default route's metric to
+  700 (NetworkManager: `ipv4.route-metric`/`ipv6.route-metric` of its
+  connection and `device reapply`; else `ip route replace`): with a LAN cable
+  in the host goes out through it, the BMC's 100 Mbit/s port is the fallback.
+  The metrics say `agent.via` ("usb"/"lan") and `bmc_usb_net` (interface,
+  state, default route metric); `reimu-hostd.py status` prints it.
 * Reconnect: back-off 1, 2, 4 … 60 s; the BMC rebooting or switching A/B
   slots, the host rebooting, the cable or IPv4 coming and going are all just
   a reconnect. TCP keepalive (30 s + 3×10 s) and a ping every 10 s find

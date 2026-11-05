@@ -1,0 +1,313 @@
+#!/bin/sh
+# reimu-usbnet start|stop|status|set internet|enabled on|off: the USB network
+# between the BMC and its host. The host's LAN cable and the BMC's go to the
+# same switch: without it, a host with its network down (or its cable out)
+# has no way to the BMC but the serial console. Here the BMC is also a USB
+# network card on its virtual hub (CDC NCM, the host's cdc_ncm driver), so the
+# host agent (reimu-hostd) and the KVM's picture from the host reach the BMC
+# with no cable at all, and the picture doesn't share the BMC's 100 Mbit/s
+# port with the browser.
+#
+#   start   (reimu-usbnet.service) the configfs gadget reimu_net (ncm.usb0)
+#           on a port of the virtual hub, usb0's network for systemd-networkd
+#           (/run/systemd/network/00-reimu-usb0.network), the NAT when the
+#           internet is on; ENABLED=no: nothing
+#   stop    all of it gone (the gadget, the network file, the NAT); always 0
+#   status  one line of JSON: enabled, internet, ifname, port, state (the
+#           port's UDC state: "configured" = the host has it), address,
+#           mac, host_mac, host_ipv4 (the host's lease, from the neighbours),
+#           error ("" when fine)
+#   set internet on|off  the host's internet through the BMC's port: the
+#           lease gives the host a router and DNS, the BMC forwards and
+#           masquerades usb0's subnet out of eth0. 100 Mbit/s at most and the
+#           BMC's CPU: the agent makes this route the last choice, a host
+#           with its own cable keeps using it
+#   set enabled on|off   the USB network itself
+#   (set: kept in /etc/reimu-usbnet.conf, applied at once, prints status)
+#
+# Addresses: the BMC's end has eth0's MAC, so its IPv6 link-local address on
+# usb0 is the one the agent already has from the pairing (BMC_MAC); the
+# host's end has the same MAC with the locally administered bit flipped. IPv4:
+# NET (the BMC's address and prefix) with a DHCP server for the host; no
+# router or DNS in the lease unless the internet is on, so the host's routes
+# don't change. phosphor-networkd leaves usb0 alone (IGNORED_INTERFACES).
+#
+# The port: p2, else p3. Never p1 (the KVM's keyboard and mouse, obmc_hid, kept
+# there for the host's PNS) nor p4, p5 (virtual media, jsnbd's
+# reimu_state_hook); the agent installer's disk takes p3 then p2. Endpoints:
+# the vhub has 15: HID 3, each disk 2, this 3. Without the virtual hub (a test
+# VM) any free controller.
+#
+# REIMU_CONFIGFS, REIMU_UDC_CLASS, REIMU_NET_CLASS, REIMU_USBNET_CONF,
+# REIMU_NETWORK_DIR, REIMU_RESOLV, REIMU_USBNET_RUN, REIMU_IPTABLES,
+# REIMU_SYSCTL, REIMU_IP, REIMU_NETWORKD_RELOAD: other paths and commands
+# (tests).
+
+CFS=${REIMU_CONFIGFS:-/sys/kernel/config}
+UDCS=${REIMU_UDC_CLASS:-/sys/class/udc}
+NETS=${REIMU_NET_CLASS:-/sys/class/net}
+CONF=${REIMU_USBNET_CONF:-/etc/reimu-usbnet.conf}
+NDIR=${REIMU_NETWORK_DIR:-/run/systemd/network}
+RESOLV=${REIMU_RESOLV:-/run/systemd/resolve/resolv.conf}
+RUN=${REIMU_USBNET_RUN:-/run/reimu-usbnet}
+IPT=${REIMU_IPTABLES:-iptables}
+SYSCTL=${REIMU_SYSCTL:-sysctl}
+IPCMD=${REIMU_IP:-ip}
+RELOAD=${REIMU_NETWORKD_RELOAD:-networkd_reload}
+G=$CFS/usb_gadget/reimu_net
+F=functions/ncm.usb0
+VHUB=1e6a0000.usb-vhub
+NFILE=$NDIR/00-reimu-usb0.network
+UPLINK=eth0
+
+err() { echo "reimu-usbnet: $*" >&2; }
+
+networkd_reload() {
+    busctl call org.freedesktop.network1 /org/freedesktop/network1 org.freedesktop.network1.Manager Reload \
+        >/dev/null 2>&1 || networkctl reload >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ settings
+ENABLED=yes INTERNET=no NET=172.31.83.1/29
+load() {
+    ENABLED=yes INTERNET=no NET=172.31.83.1/29
+    [ -r "$CONF" ] || return 0
+    while IFS='=' read -r k v; do
+        v=$(printf '%s' "$v" | tr -d '"'"'"' \r')
+        case $k in
+            ENABLED) ENABLED=$v ;;
+            INTERNET) INTERNET=$v ;;
+            NET) NET=$v ;;
+        esac
+    done < "$CONF"
+}
+
+# NET -> ADDR PREFIX SUBNET (a.b.c.d/p, the network address); 1 if not one
+parse_net() {
+    ADDR=${NET%/*} PREFIX=${NET#*/}
+    case $NET in */*) ;; *) return 1 ;; esac
+    case $PREFIX in ''|*[!0-9]*) return 1 ;; esac
+    [ "$PREFIX" -ge 8 ] && [ "$PREFIX" -le 30 ] || return 1
+    o=$(printf '%s' "$ADDR" | tr '.' ' ')
+    set -- $o
+    [ $# = 4 ] || return 1
+    n=0
+    for x; do
+        case $x in ''|*[!0-9]*) return 1 ;; esac
+        [ "$x" -le 255 ] || return 1
+        n=$(( (n << 8) | x ))
+    done
+    m=$(( (0xffffffff << (32 - PREFIX)) & 0xffffffff ))
+    s=$(( n & m ))
+    SUBNET=$(( (s >> 24) & 255 )).$(( (s >> 16) & 255 )).$(( (s >> 8) & 255 )).$(( s & 255 ))/$PREFIX
+    [ $n != $s ] && [ $(( n | (~m & 0xffffffff) )) != $n ] || return 1   # not the network nor broadcast
+    POOL=$(( (1 << (32 - PREFIX)) - 2 - 1 ))                               # but the BMC's own
+}
+
+# set KEY VALUE in the config file, the rest of it kept
+save() {
+    mkdir -p "$(dirname "$CONF")"
+    if [ -f "$CONF" ] && grep -q "^$1=" "$CONF"; then
+        sed "s|^$1=.*|$1=$2|" "$CONF" > "$CONF.new"
+    else
+        { [ -f "$CONF" ] && cat "$CONF"; echo "$1=$2"; } > "$CONF.new"
+    fi && mv "$CONF.new" "$CONF"
+}
+
+macs() {
+    MAC=$(cat "$NETS/$UPLINK/address" 2>/dev/null)
+    case $MAC in ??:??:??:??:??:??) ;; *) return 1 ;; esac
+    b0=$(( 0x${MAC%%:*} ^ 2 ))
+    HOST_MAC=$(printf '%02x' $b0):${MAC#*:}
+}
+
+# ------------------------------------------------------------------ the gadget
+port_of() { cat "$G/UDC" 2>/dev/null; }
+
+find_udc() {
+    used=" $(cat "$CFS"/usb_gadget/*/UDC 2>/dev/null | tr '\n' ' ') "
+    for u in $VHUB:p2 $VHUB:p3 $(ls "$UDCS" 2>/dev/null); do
+        case $u in $VHUB:*) case $u in $VHUB:p2|$VHUB:p3) ;; *) continue ;; esac ;; esac
+        [ -e "$UDCS/$u" ] || continue
+        case $used in *" $u "*) continue ;; esac
+        echo "$u"
+        return 0
+    done
+    return 1
+}
+
+gadget_down() {
+    [ -d "$G" ] || return 0
+    echo "" > "$G/UDC" 2>/dev/null
+    rm -f "$G/configs/c.1/ncm.usb0"
+    rmdir "$G/$F" "$G/configs/c.1/strings/0x409" "$G/configs/c.1" "$G/strings/0x409" "$G" 2>/dev/null
+    [ -d "$G" ] && rm -rf "$G" 2>/dev/null   # (a fake configfs in the tests)
+    return 0
+}
+
+gadget_up() {
+    if [ ! -d "$G" ]; then
+        mkdir -p "$G/strings/0x409" "$G/$F" "$G/configs/c.1/strings/0x409" || { err "mkdir $G"; return 1; }
+        echo 0x1d6b > "$G/idVendor"
+        echo 0x0104 > "$G/idProduct"		# Multifunction Composite Gadget, as obmc_hid
+        echo 0x0100 > "$G/bcdDevice"
+        echo 0x0200 > "$G/bcdUSB"
+        echo OpenBMC > "$G/strings/0x409/manufacturer"
+        echo "REIMU BMC network" > "$G/strings/0x409/product"	# the agent knows the card by it
+        echo REIMU-NET > "$G/strings/0x409/serialnumber"
+        echo "$MAC" > "$G/$F/dev_addr" || { err "dev_addr"; gadget_down; return 1; }
+        echo "$HOST_MAC" > "$G/$F/host_addr" || { err "host_addr"; gadget_down; return 1; }
+        echo "NCM" > "$G/configs/c.1/strings/0x409/configuration"
+        echo 0x80 > "$G/configs/c.1/bmAttributes"
+        echo 100 > "$G/configs/c.1/MaxPower"
+        ln -s "$G/$F" "$G/configs/c.1/ncm.usb0" || { err "link"; gadget_down; return 1; }
+    fi
+    [ -n "$(port_of)" ] && return 0      # bound: left alone (the host would see the card go)
+    u=$(find_udc) || { echo "no free port of the virtual hub (p2, p3)" > "$RUN/error"; return 0; }
+    echo "$u" > "$G/UDC" 2>/dev/null || { echo "binding to $u failed" > "$RUN/error"; return 0; }
+    rm -f "$RUN/error"
+}
+
+ifname() {
+    n=$(cat "$G/$F/ifname" 2>/dev/null)
+    case $n in ''|*%*) n=usb0 ;; esac
+    echo "$n"
+}
+
+# ------------------------------------------------------------------ the network
+dns_servers() {
+    [ -r "$RESOLV" ] || return 0
+    sed -n 's/^nameserver[ \t]*\([0-9][0-9.]*\)[ \t]*$/\1/p' "$RESOLV" | grep -v '^127\.' | head -n 3 | tr '\n' ' '
+}
+
+write_network() {
+    mkdir -p "$NDIR"
+    dns=
+    [ "$INTERNET" = yes ] && dns=$(dns_servers)
+    {
+        echo "# reimu-usbnet: the USB network to the host (made at each start, $CONF)"
+        echo "[Match]"
+        echo "Name=$(ifname)"
+        echo "[Link]"
+        echo "RequiredForOnline=no"
+        echo "[Network]"
+        echo "Address=$NET"
+        echo "LinkLocalAddressing=ipv6"
+        echo "IPv6AcceptRA=no"
+        echo "ConfigureWithoutCarrier=yes"
+        echo "DHCPServer=yes"
+        [ "$INTERNET" = yes ] && echo "IPForward=ipv4"
+        echo "[DHCPServer]"
+        echo "PoolOffset=1"
+        echo "PoolSize=$POOL"
+        echo "DefaultLeaseTimeSec=600"
+        if [ "$INTERNET" = yes ]; then
+            echo "EmitRouter=yes"
+            if [ -n "$dns" ]; then echo "EmitDNS=yes"; echo "DNS=$dns"; else echo "EmitDNS=no"; fi
+        else
+            echo "EmitRouter=no"
+            echo "EmitDNS=no"
+        fi
+    } > "$NFILE.new" && mv "$NFILE.new" "$NFILE"
+    $RELOAD
+}
+
+nat_off() {
+    $IPT -w -t nat -F REIMU-USBNET 2>/dev/null
+    $IPT -w -F REIMU-USBNET-FWD 2>/dev/null
+    $SYSCTL -w net.ipv4.ip_forward=0 >/dev/null 2>&1
+    return 0
+}
+
+nat_on() {
+    i=$(ifname)
+    $IPT -w -t nat -N REIMU-USBNET 2>/dev/null
+    $IPT -w -N REIMU-USBNET-FWD 2>/dev/null
+    $IPT -w -t nat -C POSTROUTING -j REIMU-USBNET 2>/dev/null || $IPT -w -t nat -A POSTROUTING -j REIMU-USBNET || return 1
+    $IPT -w -C FORWARD -j REIMU-USBNET-FWD 2>/dev/null || $IPT -w -I FORWARD -j REIMU-USBNET-FWD || return 1
+    $IPT -w -t nat -F REIMU-USBNET
+    $IPT -w -F REIMU-USBNET-FWD
+    # the host's subnet out of the uplink; back only what it asked for; the
+    # rest that would cross usb0 (the LAN into the host, the host elsewhere) dropped
+    $IPT -w -t nat -A REIMU-USBNET -s "$SUBNET" -o $UPLINK -j MASQUERADE &&
+    $IPT -w -A REIMU-USBNET-FWD -i "$i" -o $UPLINK -s "$SUBNET" -j ACCEPT &&
+    $IPT -w -A REIMU-USBNET-FWD -i $UPLINK -o "$i" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &&
+    $IPT -w -A REIMU-USBNET-FWD -i "$i" -j DROP &&
+    $IPT -w -A REIMU-USBNET-FWD -o "$i" -j DROP || return 1
+    $SYSCTL -w net.ipv4.ip_forward=1 >/dev/null
+}
+
+# ------------------------------------------------------------------ actions
+do_start() {
+    load
+    parse_net || { err "NET=$NET in $CONF is not an address/prefix (8..30) of a host"; return 1; }
+    mkdir -p "$RUN"
+    if [ "$ENABLED" != yes ]; then
+        do_stop
+        return 0
+    fi
+    macs || { err "no MAC address of $UPLINK ($NETS/$UPLINK/address)"; return 1; }
+    gadget_up || return 1
+    write_network
+    if [ "$INTERNET" = yes ]; then
+        nat_on || { err "the NAT (iptables) failed: the host's internet through the BMC is off"; nat_off; }
+    else
+        nat_off
+    fi
+    return 0
+}
+
+do_stop() {
+    load
+    nat_off
+    rm -f "$NFILE"
+    $RELOAD
+    gadget_down
+    rm -f "$RUN/error"
+    return 0
+}
+
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+json_bool() { [ "$1" = yes ] && printf true || printf false; }
+
+do_status() {
+    load
+    macs || MAC= HOST_MAC=
+    port=$(port_of)
+    state=
+    [ -n "$port" ] && state=$(cat "$UDCS/$port/state" 2>/dev/null)
+    i=
+    [ -d "$G" ] && i=$(ifname)
+    host=
+    if [ -n "$i" ] && [ -n "$HOST_MAC" ]; then
+        host=$($IPCMD -4 neigh show dev "$i" 2>/dev/null | grep -i "lladdr $HOST_MAC" | head -n 1 | cut -d' ' -f1)
+    fi
+    e=
+    if [ "$ENABLED" = yes ]; then
+        if ! parse_net; then e="NET=$NET is not an address/prefix"
+        elif [ -z "$MAC" ]; then e="no MAC address of $UPLINK"
+        elif [ ! -d "$G" ]; then e="not started"
+        elif [ -z "$port" ]; then e=$(cat "$RUN/error" 2>/dev/null); [ -n "$e" ] || e="not bound to a port"
+        fi
+    fi
+    printf '{"enabled":%s,"internet":%s,"ifname":%s,"port":%s,"state":%s,"address":%s,"mac":%s,"host_mac":%s,"host_ipv4":%s,"error":%s}\n' \
+        "$(json_bool "$ENABLED")" "$(json_bool "$INTERNET")" "$(json_str "$i")" "$(json_str "$port")" \
+        "$(json_str "$state")" "$(json_str "$NET")" "$(json_str "$MAC")" "$(json_str "$HOST_MAC")" \
+        "$(json_str "$host")" "$(json_str "$e")"
+}
+
+do_set() {
+    case $1 in internet) k=INTERNET ;; enabled) k=ENABLED ;; *) err "set internet|enabled on|off"; return 2 ;; esac
+    case $2 in on) v=yes ;; off) v=no ;; *) err "set $1 on|off"; return 2 ;; esac
+    save $k $v || { err "cannot write $CONF"; return 1; }
+    if [ $k = ENABLED ] && [ $v = no ]; then do_stop; else do_start || return 1; fi
+    do_status
+}
+
+case ${1:-} in
+    start) do_start ;;
+    stop) do_stop ;;
+    status) do_status ;;
+    set) [ $# = 3 ] || { err "set internet|enabled on|off"; exit 2; }; do_set "$2" "$3" ;;
+    *) err "usage: reimu-usbnet start|stop|status|set internet|enabled on|off"; exit 2 ;;
+esac

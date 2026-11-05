@@ -1,0 +1,57 @@
+diff --git a/util.cpp b/util.cpp
+index 0c5dbff2..1919fa64 100644
+--- a/util.cpp
++++ b/util.cpp
+@@ -315,6 +315,38 @@ IntfAddrMap getInterfaceAddrs()
+     return intfMap;
+ }
+ 
++static bool isIgnored(const char* name)
++{
++    const char* env = std::getenv("IGNORED_INTERFACES");
++    if (env == nullptr)
++    {
++        return false;
++    }
++    std::string list(env);
++    for (auto& c : list)
++    {
++        if (c == ',')
++        {
++            c = ' ';
++        }
++    }
++    size_t pos = 0;
++    while (pos < list.size())
++    {
++        auto end = list.find(' ', pos);
++        if (end == std::string::npos)
++        {
++            end = list.size();
++        }
++        if (end > pos && list.compare(pos, end - pos, name) == 0)
++        {
++            return true;
++        }
++        pos = end + 1;
++    }
++    return false;
++}
++
+ InterfaceList getInterfaces()
+ {
+     InterfaceList interfaces{};
+@@ -340,6 +372,13 @@ InterfaceList getInterfaces()
+         {
+             continue;
+         }
++        // REIMU: the interfaces named in IGNORED_INTERFACES (space or comma
++        // separated, the service's environment) are someone else's: no
++        // D-Bus object, no network file (the USB network to the host)
++        if (isIgnored(ifa->ifa_name))
++        {
++            continue;
++        }
+         interfaces.emplace(ifa->ifa_name);
+     }
+     return interfaces;

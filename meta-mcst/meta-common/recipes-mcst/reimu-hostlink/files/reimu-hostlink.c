@@ -22,6 +22,11 @@
  *                                 the pairing string on it; taken away when the
  *                                 agent paired and connected, or in 15 min
  *     method   AgentDiskOff() -> s
+ *     method   UsbNet() -> s      the USB network with the host (USBNET_HELPER,
+ *                                 reimu-usbnet status): its JSON, or {"error":..}
+ *     method   UsbNetSet(s what, b on) -> s   "internet" (the host's internet
+ *                                 through the BMC's port) or "enabled" (the
+ *                                 USB network itself) on/off: the new status
  *   sensors   /xyz/openbmc_project/sensors/{temperature,fan_tach,fan_pwm,power}/Host_*
  *             (Sensor.Value, Availability, OperationalStatus, thresholds,
  *             the chassis association: Redfish, IPMI SDR)
@@ -38,6 +43,7 @@
  *   reimu-hostlink --check-config [FILE]
  *   reimu-hostlink --ctl 'state' | 'fan manual 40' | 'turbo 5' | 'power reboot'
  *                  | 'edac' | 'inventory' | 'pair' | 'unpair' | 'disk' | 'diskoff'
+ *                  | 'usbnet' | 'usbnet internet|enabled on|off'
  *                  | 'diag' (the agent's report into RUN/host-diag.b64, for reimu-diag)
  * REIMU_HOSTLINK_CONF, REIMU_HOSTLINK_DIR, REIMU_HOSTLINK_RUN: other paths
  * (tests). Built without HL_DBUS (the native tests) it has no D-Bus, writes
@@ -135,12 +141,14 @@ static void on_diag(struct hl *h, const char *b64)
 }
 
 /* ------------------------------------------------------------------ the installer's USB disk */
-/* DISK_HELPER ACTION, INPUT on its stdin, at most 15 s; 0 = it exited 0, else
- * its last line on stderr in err. The main loop waits meanwhile (a disk's start
- * can be three of these in a row, WatchdogSec=30): this keeps the watchdog fed */
-static int run_helper(const char *helper, const char *action, const char *input, char *err, size_t n)
+/* HELPER ARGV..., INPUT on its stdin, at most 15 s; 0 = it exited 0, else
+ * its last line on stderr in err; its stdout into out (NULL: /dev/null, at most
+ * 16 KiB). The main loop waits meanwhile (a disk's start can be three of these
+ * in a row, WatchdogSec=30): this keeps the watchdog fed */
+static int run_cmd(const char *const argv[], const char *input, struct buf *out, char *err, size_t n)
 {
-    int in[2], er[2];
+    int in[2], er[2], so[2] = { -1, -1 };
+    const char *helper = argv[0], *action = argv[1] ? argv[1] : "";
     err[0] = 0;
     if (pipe2(in, O_CLOEXEC)) return snprintf(err, n, "pipe: %s", strerror(errno)), -1;
     if (pipe2(er, O_CLOEXEC))
@@ -148,10 +156,16 @@ static int run_helper(const char *helper, const char *action, const char *input,
         close(in[0]), close(in[1]);
         return snprintf(err, n, "pipe: %s", strerror(errno)), -1;
     }
+    if (out && pipe2(so, O_CLOEXEC))
+    {
+        close(in[0]), close(in[1]), close(er[0]), close(er[1]);
+        return snprintf(err, n, "pipe: %s", strerror(errno)), -1;
+    }
     pid_t pid = fork();
     if (pid < 0)
     {
         close(in[0]), close(in[1]), close(er[0]), close(er[1]);
+        if (out) close(so[0]), close(so[1]);
         return snprintf(err, n, "fork: %s", strerror(errno)), -1;
     }
     if (pid == 0)
@@ -162,35 +176,56 @@ static int run_helper(const char *helper, const char *action, const char *input,
         signal(SIGPIPE, SIG_DFL);
         dup2(in[0], 0);
         dup2(er[1], 2);
-        int nul = open("/dev/null", O_WRONLY);
-        if (nul >= 0) dup2(nul, 1);
+        if (out) dup2(so[1], 1);
+        else
+        {
+            int nul = open("/dev/null", O_WRONLY);
+            if (nul >= 0) dup2(nul, 1);
+        }
         for (int fd = 3; fd < 1024; fd++) close(fd);
-        execl(helper, helper, action, (char *)NULL);
+        execv(helper, (char *const *)argv);
         fprintf(stderr, "%s: %s\n", helper, strerror(errno));
         _exit(127);
     }
     close(in[0]);
     close(er[1]);
+    if (out) close(so[1]);
     if (input && *input && write(in[1], input, strlen(input)) < 0) { /* it went: its status says why */ }
     close(in[1]);
     char b[1024];
     size_t got = 0;
     int64_t end = now_ms() + 15000;
-    for (;;)
+    int efd = er[0], ofd = out ? so[0] : -1;
+    while (efd >= 0 || ofd >= 0)
     {
         int64_t left = end - now_ms();
         if (left <= 0) break;
-        struct pollfd p = { er[0], POLLIN, 0 };
-        int pr = poll(&p, 1, left < 1000 ? (int)left : 1000);
+        struct pollfd p[2] = { { efd, POLLIN, 0 }, { ofd, POLLIN, 0 } };
+        int pr = poll(p, 2, left < 1000 ? (int)left : 1000);
         dbus_notify("WATCHDOG=1");
         if (pr < 0) break;
         if (pr == 0) continue;
-        ssize_t r = read(er[0], b + got, sizeof(b) - 1 - got);
-        if (r <= 0) break;
-        got += r;
-        if (got >= sizeof(b) - 1) memmove(b, b + got / 2, got - got / 2), got -= got / 2;
+        if (p[1].revents)
+        {
+            char ob[1024];
+            ssize_t r = read(ofd, ob, sizeof(ob));
+            if (r <= 0) close(ofd), ofd = -1;
+            else if (out->len + r <= 16384) buf_add(out, ob, r);
+        }
+        if (p[0].revents)
+        {
+            ssize_t r = read(efd, b + got, sizeof(b) - 1 - got);
+            if (r <= 0)
+            {
+                close(efd), efd = -1;
+                continue;
+            }
+            got += r;
+            if (got >= sizeof(b) - 1) memmove(b, b + got / 2, got - got / 2), got -= got / 2;
+        }
     }
-    close(er[0]);
+    if (efd >= 0) close(efd);
+    if (ofd >= 0) close(ofd);
     int st = 0;
     /* its stderr closed is not its end */
     pid_t w;
@@ -212,6 +247,12 @@ static int run_helper(const char *helper, const char *action, const char *input,
     if (!err[0]) snprintf(err, n, "%s %s: %s %d", helper, action, WIFEXITED(st) ? "exit" : "signal",
                           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
     return -1;
+}
+
+static int run_helper(const char *helper, const char *action, const char *input, char *err, size_t n)
+{
+    const char *argv[] = { helper, action, NULL };
+    return run_cmd(argv, input, NULL, err, n);
 }
 
 int daemon_disk_stop(struct hl *h, const char *why, char *err, size_t n)
@@ -249,6 +290,30 @@ int daemon_disk_start(struct hl *h, struct buf *out, char *err, size_t n)
     return 0;
 }
 
+/* ------------------------------------------------------------------ the USB network */
+int daemon_usbnet(struct hl *h, const char *what, int on, struct buf *out, char *err, size_t n)
+{
+    char e[160];
+    struct buf o = { 0 };
+    err[0] = 0;
+    if (what && hl_usbnet_check(what, err, n)) return -1;
+    const char *st[] = { h->c.usbnet_helper, "status", NULL };
+    const char *set[] = { h->c.usbnet_helper, "set", what, on ? "on" : "off", NULL };
+    int r = run_cmd(what ? set : st, NULL, &o, e, sizeof(e));
+    hl_usbnet_answer(o.s, r, e, out);
+    buf_free(&o);
+    if (!what) return 0;
+    if (r)
+    {
+        snprintf(err, n, "%s", e[0] ? e : "reimu-usbnet failed");
+        hl_log(4, "USB network: %s %s: %s", what, on ? "on" : "off", err);
+        return -1;
+    }
+    if (!strcmp(what, "internet")) hl_event(h, 5, "usbnet", "USB network: internet for the host %s (through the BMC's port)", on ? "on" : "off");
+    else hl_event(h, 5, "usbnet", "USB network with the host %s", on ? "on" : "off");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ ctl */
 static void ctl_reply(int fd, int ok, const char *err, const char *data)
 {
@@ -279,6 +344,14 @@ static void ctl_command(int fd, char *cmd)
     else if (!strcmp(cmd, "unpair")) hl_unpair(&H);
     else if (!strcmp(cmd, "disk")) r = daemon_disk_start(&H, &out, err, sizeof(err));
     else if (!strcmp(cmd, "diskoff")) daemon_disk_stop(&H, "asked", err, sizeof(err)), err[0] = 0;
+    else if (!strcmp(cmd, "usbnet")) daemon_usbnet(&H, NULL, 0, &out, err, sizeof(err));
+    else if (IS("usbnet"))
+    {
+        char w[16], o[8], extra[2];
+        if (sscanf(cmd + 7, "%15s %7s %1s", w, o, extra) != 2 || (strcmp(o, "on") && strcmp(o, "off")))
+            r = -1, snprintf(err, sizeof(err), "usbnet internet|enabled on|off");
+        else r = daemon_usbnet(&H, w, !strcmp(o, "on"), &out, err, sizeof(err));
+    }
 #ifndef HL_DBUS
     else if (IS("fandturbo") && sscanf(cmd + 10, "%lf", &d) == 1) hl_fand_turbo(&H, (int)d);
 #endif
@@ -461,7 +534,7 @@ static int run(void)
                     struct hl_config nc;
                     load_config(&nc, s_conf, 0);
                     int port = H.c.port;
-                    char iface[16];
+                    char iface[sizeof(H.c.iface)];
                     memcpy(iface, H.c.iface, sizeof(iface));
                     H.c = nc;
                     H.c.port = port; /* the sockets stay (a restart for those) */
@@ -520,6 +593,7 @@ int main(int argc, char **argv)
                c.logging ? "yes" : "no");
         printf("GPU warn/crit °C: edge %g/%g junction %g/%g memory %g/%g\n", c.warn[0], c.crit[0], c.warn[1], c.crit[1], c.warn[2],
                c.crit[2]);
+        printf("USBNET_HELPER=%s DISK_HELPER=%s\n", c.usbnet_helper, c.disk_helper);
         return n ? 1 : 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--ctl")) return ctl_client(argv[2]);

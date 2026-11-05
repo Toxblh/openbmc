@@ -21,6 +21,12 @@ may ask it for a few things.
     BMC reboot or kexec the KVM input would never come back. The udev rule
     (hub-rule install, by install.sh and reimu-host.sh) and a check every 2 s
     (power/control "auto" -> "on"); its state in the inventory and metrics
+  * the BMC's USB network (usb_net in ALLOW, default on): the BMC's CDC-NCM
+    gadget on its hub (product "REIMU BMC network") is a link to the BMC that
+    doesn't go out through the switch. Tried first, and a session over the
+    LAN moves over to it (a look every USB_UPGRADE_SEC); brought up when
+    nothing else does (no NetworkManager); with "internet through the BMC" on
+    there, its default route gets metric USB_NET_METRIC, so a LAN cable wins
   * on its own too (bmc_owns_i2c in ALLOW, default on; the BMC can't command
     it): the BMC is the only master of the platform I2C buses the host shares
     (host i2c-0 = BMC i2c-6, host i2c-1 = BMC i2c-2): both sides polling put
@@ -42,9 +48,10 @@ fan goes back to the driver's automatic control.
 The link: TLS to the BMC's TCP BMC_PORT (5564), the BMC's certificate pinned
 (its SHA-256, from the pairing), the agent proven by HMAC-SHA256 of the BMC's
 challenge with the key it got at pairing. Tried in this order: the BMC's IPv6
-link-local address (from BMC_MAC, on every interface that is up: the board's
-internal LAN works without a cable and without DHCP), BMC link-local addresses
-found by a multicast probe (UDP ff02::1 port BMC_PORT), then BMC_IPV4. One
+link-local address (from BMC_MAC) on the BMC's USB network first (no cable,
+no DHCP needed), then on every other interface that is up (the LAN, through
+the external switch), BMC link-local addresses found by a multicast probe (UDP
+ff02::1 port BMC_PORT), then BMC_IPV4. One
 JSON object per line, {"v": 1, "t": TYPE, ...}; unknown types and fields are
 ignored. See README.md next to this file.
 
@@ -92,7 +99,11 @@ OPS = ("gpu_fan", "gpu_turbo", "os_power", "edac_load", "diag")
 DIAG_MAX_B64 = 96 * 1024
 DIAG_LOG_TAIL = 256 * 1024
 # done by the agent itself, never asked for by the BMC (ALLOW can turn it off)
-LOCAL_OPS = ("usb_hub", "bmc_owns_i2c")
+LOCAL_OPS = ("usb_hub", "bmc_owns_i2c", "usb_net")
+# the BMC's USB network (reimu-usbnet): a session over the LAN tries it this often
+USB_UPGRADE_SEC = 60
+# its default route (internet through the BMC) above any LAN's: a cable wins
+USB_NET_METRIC = 700
 
 # ------------------------------------------------------------------ logging
 _logger = None
@@ -771,7 +782,8 @@ class Collector:
                 "mem": {"total_kib": mi.get("MemTotal"), "avail_kib": mi.get("MemAvailable"),
                         "swap_total_kib": mi.get("SwapTotal"), "swap_free_kib": mi.get("SwapFree")},
                 "temps": self.temps(), "edac": self.edac(), "gpu": self.gpu(), "disks": self.disk_health(now),
-                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "i2c_owner": bus_owner_state(self.fs, self.cfg)}
+                "bmc_usb_hub": bmc_usb_hub_state(self.fs), "i2c_owner": bus_owner_state(self.fs, self.cfg),
+                "bmc_usb_net": bmc_usb_net_state(self.fs)}
 
     def temps(self):
         out = []
@@ -940,6 +952,114 @@ class UsbHub:
             log(text)
             events.append({"kind": "bmc_usb_hub_on", "text": text})
         return events
+
+
+# ------------------------------------------------------------------ the BMC's USB network
+BMC_USB_NET_PRODUCT = "REIMU BMC network"
+BMC_USB_NET_DRIVERS = ("cdc_ncm", "cdc_ether")
+
+
+def is_bmc_usb_iface(fs, name):
+    """the BMC's NCM gadget (reimu-usbnet): its USB device's product string"""
+    n = "/sys/class/net/" + name
+    return (fs.link_name(n + "/device/driver") in BMC_USB_NET_DRIVERS and
+            fs.read(n + "/device/../product") == BMC_USB_NET_PRODUCT)
+
+
+def bmc_usb_ifaces(fs):
+    return [os.path.basename(n) for n in fs.glob("/sys/class/net/*") if is_bmc_usb_iface(fs, os.path.basename(n))]
+
+
+def default_routes(fs):
+    """(interface, gateway, metric) of the IPv4 default routes"""
+    out = []
+    for line in (fs.read("/proc/net/route") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) < 8 or f[1] != "00000000" or f[7] != "00000000":
+            continue
+        try:
+            out.append((f[0], socket.inet_ntoa(struct.pack("<I", int(f[2], 16))), int(f[6])))
+        except (ValueError, struct.error):
+            continue
+    return out
+
+
+def bmc_usb_net_state(fs):
+    for i in bmc_usb_ifaces(fs):
+        r = [m for n, _, m in default_routes(fs) if n == i]
+        return {"present": True, "iface": i, "state": fs.read("/sys/class/net/%s/operstate" % i),
+                "default_route": bool(r), "metric": min(r) if r else None}
+    return {"present": False, "iface": None, "state": None, "default_route": False, "metric": None}
+
+
+class UsbNet:
+    """the host's end of the BMC's USB network: brought up when nothing else
+    does (no NetworkManager: then no link-local address to reach the BMC by),
+    its default route kept below the LAN's (internet through the BMC is the
+    fallback, not the way out while a cable is in)"""
+    UP_GRACE = 10       # s a network manager has to bring it up itself
+    RETRY = 60          # s between tries of the same fix
+
+    def __init__(self, fs, run, cfg):
+        self.fs, self.run, self.cfg = fs, run, cfg
+        self.down_since, self.next_try = {}, {}
+
+    def _due(self, what, now):
+        if now < self.next_try.get(what, 0):
+            return False
+        self.next_try[what] = now + self.RETRY
+        return True
+
+    def tick(self, now):
+        events = []
+        if "usb_net" not in self.cfg["ALLOW"]:
+            return events
+        ifs = bmc_usb_ifaces(self.fs)
+        for i in ifs:
+            flags = self.fs.int("/sys/class/net/%s/flags" % i, base=16)
+            if flags is None or flags & 1:
+                self.down_since.pop(i, None)
+                continue
+            since = self.down_since.setdefault(i, now)
+            if now - since < self.UP_GRACE or not self._due(("up", i), now):
+                continue
+            rc, out = self.run(["ip", "link", "set", i, "up"], timeout=10)
+            if rc != 0:
+                log("the BMC's USB network %s: not brought up: %s" % (i, out.strip()[:200]))
+                continue
+            text = "the BMC's USB network %s brought up (nothing else did)" % i
+            log(text)
+            events.append({"kind": "bmc_usb_net_up", "text": text})
+        for i, gw, metric in default_routes(self.fs):
+            if i not in ifs or metric >= USB_NET_METRIC or not self._due(("metric", i), now):
+                continue
+            if self._metric_nm(i) or self._metric_ip(i, gw, metric):
+                text = ("the BMC's USB network %s: its default route's metric %d -> %d (a LAN cable wins)"
+                        % (i, metric, USB_NET_METRIC))
+                log(text)
+                events.append({"kind": "bmc_usb_net_metric", "text": text})
+        return events
+
+    def _metric_nm(self, i):
+        rc, out = self.run(["nmcli", "-g", "GENERAL.CON-UUID", "device", "show", i], timeout=10)
+        uuid = out.strip() if rc == 0 else ""
+        if not re.match(r"^[0-9a-fA-F-]{8,64}$", uuid):
+            return False
+        m = str(USB_NET_METRIC)
+        rc, out = self.run(["nmcli", "connection", "modify", uuid, "ipv4.route-metric", m, "ipv6.route-metric", m], timeout=20)
+        if rc == 0:
+            rc, out = self.run(["nmcli", "device", "reapply", i], timeout=20)
+        if rc != 0:
+            log("the BMC's USB network %s: NetworkManager: %s" % (i, out.strip()[:200]))
+        return rc == 0
+
+    def _metric_ip(self, i, gw, metric):
+        rc, out = self.run(["ip", "route", "replace", "default", "via", gw, "dev", i, "metric", str(USB_NET_METRIC)], timeout=10)
+        if rc != 0:
+            log("the BMC's USB network %s: its default route: %s" % (i, out.strip()[:200]))
+            return False
+        self.run(["ip", "route", "del", "default", "via", gw, "dev", i, "metric", str(metric)], timeout=10)
+        return True
 
 
 def hub_rule(fs, run, action):
@@ -1886,7 +2006,8 @@ def up_ifaces(fs, only=""):
 
 def candidates(cfg, fs, discovered, last=None):
     """where to look for the BMC, best first: its link-local address on each
-    interface that is up, link-local ones found by the probe, its IPv4 address"""
+    interface that is up, link-local ones found by the probe (the BMC's USB
+    network before the others, then the last good one), its IPv4 address"""
     port = cfg["BMC_PORT"]
     if cfg["BMC"]:
         h, _, p = cfg["BMC"].rpartition(":") if cfg["BMC"].count(":") == 1 or "]" in cfg["BMC"] else (cfg["BMC"], "", "")
@@ -1894,21 +2015,23 @@ def candidates(cfg, fs, discovered, last=None):
         scope = None
         if "%" in h:
             h, scope = h.split("%", 1)
-        return [{"addr": h, "scope": scope, "port": int(p) if p else port,
+        return [{"addr": h, "scope": scope, "port": int(p) if p else port, "usb": False,
                  "transport": "ipv6-ll" if h.startswith("fe80:") else ("ipv6" if ":" in h else "ipv4")}]
     out = []
     ll = ll_from_mac(cfg["BMC_MAC"]) if cfg["BMC_MAC"] else None
     ifs = up_ifaces(fs, cfg["IFACES"])
+    usb = set(i for i in ifs if is_bmc_usb_iface(fs, i)) | set(d["scope"] for d in discovered if is_bmc_usb_iface(fs, d["scope"]))
     if ll:
-        out += [{"addr": ll, "scope": i, "port": port, "transport": "ipv6-ll"} for i in ifs]
+        out += [{"addr": ll, "scope": i, "port": port, "transport": "ipv6-ll", "usb": i in usb} for i in ifs]
     for d in discovered:
-        c = {"addr": d["addr"], "scope": d["scope"], "port": d.get("port", port), "transport": "ipv6-ll"}
+        c = {"addr": d["addr"], "scope": d["scope"], "port": d.get("port", port), "transport": "ipv6-ll", "usb": d["scope"] in usb}
         if not any(x["addr"] == c["addr"] and x["scope"] == c["scope"] for x in out):
             out.append(c)
-    if last and last.get("transport") == "ipv6-ll":
-        out.sort(key=lambda x: not (x["addr"] == last["addr"] and x["scope"] == last["scope"]))
+    is_last = (lambda x: bool(last) and last.get("transport") == "ipv6-ll" and
+               x["addr"] == last["addr"] and x["scope"] == last["scope"])
+    out.sort(key=lambda x: (not x["usb"], not is_last(x)))
     if cfg["BMC_IPV4"]:
-        out.append({"addr": cfg["BMC_IPV4"], "scope": None, "port": port, "transport": "ipv4"})
+        out.append({"addr": cfg["BMC_IPV4"], "scope": None, "port": port, "transport": "ipv4", "usb": False})
     return out
 
 
@@ -1937,6 +2060,14 @@ class Backoff:
 
     def reset(self):
         self.cur = None
+
+
+class SwitchLink(Exception):
+    """the session over the LAN ends: the BMC answered on its USB network"""
+
+    def __init__(self, sock, cand):
+        super().__init__("moving to %s" % fmt_cand(cand))
+        self.sock, self.cand = sock, cand
 
 
 DISCOVERY_Q = b"REIMU-HOSTLINK? 1"
@@ -2076,6 +2207,9 @@ class Agent:
         # not allowed: the BMC's word is ignored, so is what it once said
         self.fan = GpuFan(fs, floor=cfg["GPU_FAN_FLOOR"], link_lost_duty=cfg["GPU_FAN_LINK_LOST"], load="gpu_fan" in cfg["ALLOW"])
         self.hub = UsbHub(fs, cfg)
+        self.usbnet = UsbNet(fs, run, cfg)
+        self.usb_next = None      # when a session over the LAN looks for the USB network
+        self.usb_said = False
         self.bus = BusOwner(fs, run, cfg)
         self.ctl = Controller(cfg, self.fan, run, self.col)
         self.backoff = Backoff(1, 60)
@@ -2122,8 +2256,8 @@ class Agent:
         raise ValueError("no %s from the BMC" % "/".join(types))
 
     def local_tick(self, now, link_ok):
-        """every 2 s, linked or not: the GPU fan policy, the BMC's USB hub, its I2C buses"""
-        return self.fan.tick(now, link_ok) + self.hub.tick() + self.bus.tick()
+        """every 2 s, linked or not: the GPU fan policy, the BMC's USB hub, its I2C buses, its USB network"""
+        return self.fan.tick(now, link_ok) + self.hub.tick() + self.bus.tick() + self.usbnet.tick(now)
 
     def credentials_changed(self):
         """a pairing (pair --pair, install.sh) wrote a new key or address"""
@@ -2143,21 +2277,50 @@ class Agent:
         self.backoff.reset()
         log("paired again: the new key and BMC address in use")
 
+    def discover(self, ifaces):
+        if not self.cfg["DISCOVERY"] or self.cfg["BMC"]:
+            return []
+        return discover(ifaces, self.cfg["BMC_PORT"], self.secret["FINGERPRINT"])
+
+    def try_connect(self, c):
+        return tls_connect(c, self.secret["FINGERPRINT"])
+
     def connect(self):
-        fp = self.secret["FINGERPRINT"]
-        disc = []
-        if self.cfg["DISCOVERY"] and not self.cfg["BMC"]:
-            disc = discover(up_ifaces(self.fs, self.cfg["IFACES"]), self.cfg["BMC_PORT"], fp)
+        disc = self.discover(up_ifaces(self.fs, self.cfg["IFACES"]))
         cands = candidates(self.cfg, self.fs, disc, self.last_cand)
         if not cands:
             log("no BMC address: BMC_MAC/BMC_IPV4 in %s (pair again)" % CONF)
             return None, None
-        return connect_first(cands, lambda c: tls_connect(c, fp))
+        return connect_first(cands, self.try_connect)
+
+    def usb_upgrade(self, cand, now):
+        """a session not over the BMC's USB network: every USB_UPGRADE_SEC,
+        if one is up, a connection over it; (socket, candidate) when it answers"""
+        if cand.get("usb") or self.cfg["BMC"] or "usb_net" not in self.cfg["ALLOW"]:
+            return None
+        if self.usb_next is None:
+            self.usb_next = now + USB_UPGRADE_SEC
+            return None
+        if now < self.usb_next:
+            return None
+        self.usb_next = now + USB_UPGRADE_SEC
+        ifs = [i for i in up_ifaces(self.fs, self.cfg["IFACES"]) if is_bmc_usb_iface(self.fs, i)]
+        if not ifs:
+            return None
+        for c in [c for c in candidates(self.cfg, self.fs, self.discover(ifs)) if c["usb"]]:
+            try:
+                return self.try_connect(c), c
+            except (OSError, ssl.SSLError, ValueError) as e:
+                if not self.usb_said:
+                    log("the BMC's USB network: no answer at %s (%s): staying on %s" % (fmt_cand(c), e, fmt_cand(cand)))
+                    self.usb_said = True
+        return None
 
     def session(self, link, cand):
         w = self.handshake(link, cand)
-        log("connected to the BMC at %s (%s)" % (fmt_cand(cand), cand["transport"]))
+        log("connected to the BMC at %s (%s%s)" % (fmt_cand(cand), cand["transport"], ", USB" if cand.get("usb") else ""))
         self.last_cand = cand
+        self.usb_next, self.usb_said = None, False
         self.backoff.reset()
         self.last_rx = time.monotonic()
         if isinstance(w.get("policy"), dict):
@@ -2184,6 +2347,9 @@ class Agent:
                 self.send_inventory(link)
             if now - self.last_rx > self.cfg["LINK_LOST_SEC"]:
                 raise EOFError("no word from the BMC for %d s" % (now - self.last_rx))
+            sw = self.usb_upgrade(cand, now)
+            if sw:
+                raise SwitchLink(*sw)
             link.flush()
             wait = max(0.05, min(next_gpu, next_metrics) - time.monotonic())
             r, _, _ = ([link], [], []) if link.s.pending() else select.select([link], [link] if link.out else [], [], wait)
@@ -2196,7 +2362,8 @@ class Agent:
         m = self.col.metrics(now)
         if m.get("gpu") is not None:
             m["gpu"]["policy"] = self.fan.state(now)
-        m["agent"] = {"version": VERSION, "interval": self.cfg["INTERVAL"], "transport": cand["transport"]}
+        m["agent"] = {"version": VERSION, "interval": self.cfg["INTERVAL"], "transport": cand["transport"],
+                      "via": "usb" if cand.get("usb") else "lan"}
         try:
             m["kvm"] = kvm_status(self.fs, self.run)
         except (OSError, ValueError) as e:
@@ -2240,15 +2407,22 @@ class Agent:
 
     def run_forever(self):
         edac_autoload(self.fs, self.run, self.cfg)
+        pending = None      # the USB network's connection a LAN session ended for
         while not self.stop:
             link = None
             if self.credentials_changed():
                 self.refresh_credentials()
             try:
-                sock, cand = self.connect()
+                if pending:
+                    (sock, cand), pending = pending, None
+                else:
+                    sock, cand = self.connect()
                 if sock:
                     link = Link(sock)
                     self.session(link, cand)
+            except SwitchLink as e:
+                log("the BMC answers on its USB network: %s" % e)
+                pending = (e.sock, e.cand)
             except VersionError as e:
                 log("BMC: %s: update the agent" % e)
             except (OSError, EOFError, ValueError, ssl.SSLError) as e:
@@ -2257,7 +2431,11 @@ class Agent:
                 if link:
                     link.close()
             if self.stop:
+                if pending:
+                    Link(pending[0]).close()
                 break
+            if pending:
+                continue
             # off the link: the fan policy times out on its own clock
             delay = 300 if self.revoked else self.backoff.next()
             if self.revoked:
@@ -2467,6 +2645,9 @@ def main(argv):
         print("config %s: BMC_MAC=%s BMC_IPV4=%s BMC=%s port %d" % (conf, cfg["BMC_MAC"], cfg["BMC_IPV4"], cfg["BMC"], cfg["BMC_PORT"]))
         print("paired: %s" % ("yes, certificate %s…" % s["FINGERPRINT"][:16] if s.get("KEY") else "no"))
         print("link-local candidates: %s" % ", ".join(fmt_cand(c) for c in candidates(cfg, fs, [])))
+        u = bmc_usb_net_state(fs)
+        print("the BMC's USB network: %s" % ("%s, %s%s" % (u["iface"], u["state"], ", default route metric %d" % u["metric"]
+                                                          if u["default_route"] else "") if u["present"] else "none"))
         print(Init(fs, run).status("reimu-hostd")[1])
     elif cmd == "run":
         s = load_secret(secret)

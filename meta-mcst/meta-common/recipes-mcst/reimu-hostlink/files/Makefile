@@ -20,6 +20,7 @@ test: tests/test_hostlink tests/reimu-hostlink-native
 	./tests/test_hostlink
 	python3 tests/test_protocol.py ./tests/reimu-hostlink-native
 	python3 tests/test_disk.py ./tests/reimu-hostlink-native
+	python3 tests/test_usbnet.py ./tests/reimu-hostlink-native
 
 tests/test_hostlink: tests/test_hostlink.c hl-proto.c hl-json.c hostlink.h
 	$(HOSTCC) $(NCFLAGS) -o $@ tests/test_hostlink.c hl-proto.c hl-json.c $(NLIBS)

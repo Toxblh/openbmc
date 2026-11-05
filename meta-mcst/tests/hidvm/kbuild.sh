@@ -2,7 +2,7 @@
 # (in the arm64 build container) the HID test VM's kernel: the A/B image's
 # openbmc/linux 6.18 with meta-ab64's kernel patches (/hv/patches), as arm64
 # defconfig + dummy_hcd (the VM is the USB host of its own gadgets), configfs
-# f_hid and mass storage, usbhid, usb-storage, sr, sg, loop, 9p
+# f_hid, mass storage and NCM, usbhid, usb-storage, cdc_ncm, sr, sg, loop, 9p
 set -e
 cd /hv/linux
 for p in /hv/patches/*.patch; do
@@ -18,7 +18,8 @@ for y in USB USB_GADGET USB_DUMMY_HCD USB_LIBCOMPOSITE USB_CONFIGFS USB_CONFIGFS
          USB_CONFIGFS_MASS_STORAGE USB_F_HID USB_F_MASS_STORAGE USB_HID HID HID_GENERIC \
          USB_STORAGE BLK_DEV_SD BLK_DEV_SR CHR_DEV_SG SCSI INPUT_EVDEV DEBUG_FS \
          CONFIGFS_FS BLK_DEV_NBD BLK_DEV_LOOP NET_9P NET_9P_VIRTIO 9P_FS VIRTIO_BLK VIRTIO_NET \
-         VIRTIO_PCI IPV6 DEVTMPFS DEVTMPFS_MOUNT INPUT_UINPUT HIDRAW USB_HIDDEV USB_MON; do
+         VIRTIO_PCI IPV6 DEVTMPFS DEVTMPFS_MOUNT INPUT_UINPUT HIDRAW USB_HIDDEV USB_MON \
+         USB_CONFIGFS_NCM USB_F_NCM USB_U_ETHER USB_NET_DRIVERS USB_USBNET USB_NET_CDC_NCM NET_NS; do
     $S -e $y
 done
 $S -d USB_ETH -d USB_G_SERIAL
