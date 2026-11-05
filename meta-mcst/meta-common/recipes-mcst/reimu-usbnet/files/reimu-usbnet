@@ -15,13 +15,16 @@
 #   stop    all of it gone (the gadget, the network file, the NAT); always 0
 #   status  one line of JSON: enabled, internet, ifname, port, state (the
 #           port's UDC state: "configured" = the host has it), address,
-#           mac, host_mac, host_ipv4 (the host's lease, from the neighbours),
+#           mac, host_mac, host_ipv4 (the host's lease, from the ARP table),
 #           error ("" when fine)
 #   set internet on|off  the host's internet through the BMC's port: the
 #           lease gives the host a router and DNS, the BMC forwards and
 #           masquerades usb0's subnet out of eth0. 100 Mbit/s at most and the
 #           BMC's CPU: the agent makes this route the last choice, a host
-#           with its own cable keeps using it
+#           with its own cable keeps using it. A change takes the card off
+#           the host's bus and back (as a cable plugged in again): the host
+#           asks for a lease at once, with the router or without it (its
+#           renewal came up to 5 min later; the agent reconnects in seconds)
 #   set enabled on|off   the USB network itself
 #   (set: kept in /etc/reimu-usbnet.conf, applied at once, prints status)
 #
@@ -40,7 +43,7 @@
 #
 # REIMU_CONFIGFS, REIMU_UDC_CLASS, REIMU_NET_CLASS, REIMU_USBNET_CONF,
 # REIMU_NETWORK_DIR, REIMU_RESOLV, REIMU_USBNET_RUN, REIMU_IPTABLES,
-# REIMU_SYSCTL, REIMU_IP, REIMU_NETWORKD_RELOAD: other paths and commands
+# REIMU_SYSCTL, REIMU_ARP, REIMU_NETWORKD_RELOAD: other paths and commands
 # (tests).
 
 CFS=${REIMU_CONFIGFS:-/sys/kernel/config}
@@ -52,7 +55,7 @@ RESOLV=${REIMU_RESOLV:-/run/systemd/resolve/resolv.conf}
 RUN=${REIMU_USBNET_RUN:-/run/reimu-usbnet}
 IPT=${REIMU_IPTABLES:-iptables}
 SYSCTL=${REIMU_SYSCTL:-sysctl}
-IPCMD=${REIMU_IP:-ip}
+ARP=${REIMU_ARP:-/proc/net/arp}
 RELOAD=${REIMU_NETWORKD_RELOAD:-networkd_reload}
 G=$CFS/usb_gadget/reimu_net
 F=functions/ncm.usb0
@@ -72,12 +75,12 @@ ENABLED=yes INTERNET=no NET=172.31.83.1/29
 load() {
     ENABLED=yes INTERNET=no NET=172.31.83.1/29
     [ -r "$CONF" ] || return 0
-    while IFS='=' read -r k v; do
-        v=$(printf '%s' "$v" | tr -d '"'"'"' \r')
-        case $k in
-            ENABLED) ENABLED=$v ;;
-            INTERNET) INTERNET=$v ;;
-            NET) NET=$v ;;
+    while IFS='=' read -r ck cv; do
+        cv=$(printf '%s' "$cv" | tr -d '"'"'"' \r')
+        case $ck in
+            ENABLED) ENABLED=$cv ;;
+            INTERNET) INTERNET=$cv ;;
+            NET) NET=$cv ;;
         esac
     done < "$CONF"
 }
@@ -166,6 +169,16 @@ gadget_up() {
     u=$(find_udc) || { echo "no free port of the virtual hub (p2, p3)" > "$RUN/error"; return 0; }
     echo "$u" > "$G/UDC" 2>/dev/null || { echo "binding to $u failed" > "$RUN/error"; return 0; }
     rm -f "$RUN/error"
+}
+
+# the card off the host's bus and back: the host sees a cable plugged in again
+reconnect() {
+    p=$(port_of)
+    [ -n "$p" ] || return 0
+    echo "" > "$G/UDC" 2>/dev/null
+    sleep 1
+    echo "$p" > "$G/UDC" 2>/dev/null || { err "binding to $p again failed"; echo "binding to $p again failed" > "$RUN/error"; return 1; }
+    echo "rebind $p: $1" > "$RUN/rebind.log"
 }
 
 ifname() {
@@ -280,7 +293,8 @@ do_status() {
     [ -d "$G" ] && i=$(ifname)
     host=
     if [ -n "$i" ] && [ -n "$HOST_MAC" ]; then
-        host=$($IPCMD -4 neigh show dev "$i" 2>/dev/null | grep -i "lladdr $HOST_MAC" | head -n 1 | cut -d' ' -f1)
+        # (the board's busybox ip has no "neigh"): a complete entry (flags 0x2)
+        host=$(awk -v m="$HOST_MAC" -v i="$i" 'NR > 1 && tolower($4) == m && $6 == i && $3 == "0x2" { print $1; exit }' "$ARP" 2>/dev/null)
     fi
     e=
     if [ "$ENABLED" = yes ]; then
@@ -299,8 +313,14 @@ do_status() {
 do_set() {
     case $1 in internet) k=INTERNET ;; enabled) k=ENABLED ;; *) err "set internet|enabled on|off"; return 2 ;; esac
     case $2 in on) v=yes ;; off) v=no ;; *) err "set $1 on|off"; return 2 ;; esac
+    load
+    was=$INTERNET
     save $k $v || { err "cannot write $CONF"; return 1; }
     if [ $k = ENABLED ] && [ $v = no ]; then do_stop; else do_start || return 1; fi
+    # a new router (or none) reaches the host only with a new lease
+    if [ $k = INTERNET ] && [ "$was" != $v ] && [ "$ENABLED" = yes ]; then
+        reconnect "internet $2" || return 1
+    fi
     do_status
 }
 

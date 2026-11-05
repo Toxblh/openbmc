@@ -1,7 +1,7 @@
 SUMMARY = "REIMU USB network to the host"
 DESCRIPTION = "reimu-usbnet: the BMC as a USB network card (CDC NCM, configfs gadget reimu_net on the virtual hub) for its host, so the host agent and the KVM's picture reach the BMC with no LAN cable; IPv6 link-local with eth0's MAC, IPv4 with a DHCP server, and the host's internet through the BMC's port (NAT) when switched on"
 SECTION = "base"
-PR = "r0"
+PR = "r1"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0;md5=801f80980d171dd6425610833a22dbe6"
 

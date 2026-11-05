@@ -37,6 +37,7 @@ class T(unittest.TestCase):
         j = lambda *p: os.path.join(self.d, *p)
         self.cfs, self.udc, self.net, self.nd = j("config"), j("udc"), j("net"), j("network")
         self.conf, self.log, self.neigh, self.resolv = j("reimu-usbnet.conf"), j("calls.log"), j("neigh"), j("resolv.conf")
+        self.arp = j("arp")
         os.makedirs(os.path.join(self.cfs, "usb_gadget"))
         for p in range(1, 6):
             os.makedirs(os.path.join(self.udc, "%s:p%d" % (VHUB, p)))
@@ -51,8 +52,8 @@ class T(unittest.TestCase):
             os.chmod(p, 0o755)
         self.env = dict(os.environ, REIMU_CONFIGFS=self.cfs, REIMU_UDC_CLASS=self.udc, REIMU_NET_CLASS=self.net,
                         REIMU_USBNET_CONF=self.conf, REIMU_NETWORK_DIR=self.nd, REIMU_RESOLV=self.resolv,
-                        REIMU_IPTABLES=j("bin", "iptables"), REIMU_SYSCTL=j("bin", "sysctl"), REIMU_IP=j("bin", "ip"),
-                        REIMU_NETWORKD_RELOAD=j("bin", "reload"), REIMU_USBNET_RUN=j("run"))
+                        REIMU_IPTABLES=j("bin", "iptables"), REIMU_SYSCTL=j("bin", "sysctl"),
+                        REIMU_NETWORKD_RELOAD=j("bin", "reload"), REIMU_USBNET_RUN=j("run"), REIMU_ARP=self.arp)
 
     def tearDown(self):
         shutil.rmtree(self.d, ignore_errors=True)
@@ -214,9 +215,43 @@ class T(unittest.TestCase):
         self.assertIn("sysctl -w net.ipv4.ip_forward=0", c)
 
     def test_host_address(self):
+        """from the ARP table: the board's busybox ip has no "neigh" (it printed
+        its usage, the address stayed empty)"""
         self.assertEqual(self.run_("start")[0], 0)
-        open(self.neigh, "w").write("172.31.83.3 lladdr %s STALE\n10.0.0.9 lladdr 00:11:22:33:44:55 REACHABLE\n" % HOST_MAC)
-        self.assertEqual(self.status()["host_ipv4"], "172.31.83.3")
+        open(self.neigh, "w").write("172.31.83.3 lladdr %s STALE\n" % HOST_MAC)
+        open(self.arp, "w").write(
+            "IP address       HW type     Flags       HW address            Mask     Device\n"
+            "192.168.10.50    0x1         0x0         98:a7:b0:06:0f:61     *        eth0\n"
+            "172.31.83.4      0x1         0x0         %s     *        usb0\n"
+            "172.31.83.2      0x1         0x2         %s     *        usb0\n"
+            "192.168.10.1     0x1         0x2         50:ff:20:d4:72:67     *        eth0\n" % (HOST_MAC, HOST_MAC))
+        self.assertEqual(self.status()["host_ipv4"], "172.31.83.2", "the complete entry (flags 0x2) of the host's MAC on usb0")
+
+    def test_internet_switch_reconnects_the_card(self):
+        """the host learns the router only from a new lease: a lease renewal
+        came up to 5 min later (board, 2026-11-05: on at 18:38:24, the host's
+        route at 18:42:13). Switching the internet takes the card off the
+        host's bus and back (a cable plugged in again: DHCP at once)"""
+        self.assertEqual(self.run_("start")[0], 0)
+        os.utime(self.g("UDC"), (1, 1))
+        rc, out, err = self.run_("set", "internet", "on")
+        self.assertEqual(rc, 0, err)
+        self.assertNotEqual(os.stat(self.g("UDC")).st_mtime, 1, "UDC written again")
+        self.assertEqual(self.read("UDC"), VHUB + ":p2", "bound to its port again")
+        self.assertIn("rebind", self.calls_of("UDC"), "unbound, then bound")
+        os.utime(self.g("UDC"), (1, 1))
+        self.assertEqual(self.run_("set", "internet", "off")[0], 0)
+        self.assertNotEqual(os.stat(self.g("UDC")).st_mtime, 1, "and when switched off (the router goes)")
+        # the same value again: nothing to tell the host
+        os.utime(self.g("UDC"), (1, 1))
+        self.assertEqual(self.run_("set", "internet", "off")[0], 0)
+        self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "no change, no reconnect")
+
+    def calls_of(self, what):
+        try:
+            return open(os.path.join(self.d, "run", "rebind.log")).read()
+        except FileNotFoundError:
+            return ""
 
     def test_net_setting(self):
         open(self.conf, "w").write("NET=10.9.8.1/29\nINTERNET=yes\n")

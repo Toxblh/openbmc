@@ -67,6 +67,25 @@ def host_if(timeout=15):
     return None
 
 
+def attach_host(timeout=15):
+    """the host's end (just plugged, in the root namespace) into "host" as hnet"""
+    hi = host_if(timeout)
+    if hi is None:
+        return None
+    sh("ip netns add host 2>/dev/null")
+    r = sh("ip link set %s netns host && ip netns exec host ip link set %s name hnet && ip netns exec host ip link set hnet up && ip netns exec host ip link set lo up" % (hi, hi))
+    return hi if r.returncode == 0 else None
+
+
+def host_gone(timeout=10):
+    end = time.time() + timeout
+    while time.time() < end:
+        if "hnet" not in in_host("ip link").stdout:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def in_host(cmd):
     return sh("ip netns exec host " + cmd)
 
@@ -103,9 +122,7 @@ def main():
     bi = open(G + "/functions/ncm.usb0/ifname").read().strip()
     check(open("/sys/class/net/%s/address" % bi).read().strip() == MAC, "the BMC's end (%s) has eth0's MAC" % bi)
     # the host's end into its own namespace: from here the two ends talk over USB
-    sh("ip netns add host")
-    r = sh("ip link set %s netns host && ip netns exec host ip link set %s name hnet && ip netns exec host ip link set hnet up && ip netns exec host ip link set lo up" % (hi, hi))
-    check(r.returncode == 0, "the host's end in namespace host %s" % r.stderr.strip())
+    check(attach_host() is not None, "the host's end in namespace host")
     # the BMC's end: networkd with reimu-usbnet's file (the address, link-local, DHCP server)
     end = time.time() + 20
     while time.time() < end and "172.31.83.1/29" not in sh("ip -4 addr show dev %s" % bi).stdout:
@@ -146,14 +163,19 @@ def main():
     dt = time.time() - t0
     srv.close()
     check(got[0] == n, "64 MiB host -> BMC over USB: %d bytes, %.1f MB/s (dummy_hcd)" % (got[0], n / dt / 1e6))
-    # internet on: the lease names the BMC as the router and its DNS
+    # internet on: the card leaves the host's bus and comes back (a cable
+    # plugged in again: the host's DHCP at once, the router in the lease)
+    t0 = time.time()
     rc, out = usbnet("set", "internet", "on")
     check(rc == 0 and '"internet":true' in out, "set internet on: %s" % out.strip()[-120:])
-    time.sleep(2)
+    check(host_gone(1), "the card went off the host's bus")
+    check(attach_host() is not None, "and came back in %.1f s" % (time.time() - t0))
+    time.sleep(1)
     l = dhcp()
     check(l.get("router") == "172.31.83.1" and "10.0.2.3" in l.get("dns", ""), "internet on: router 172.31.83.1, DNS from the BMC's (%s)" % l)
     rc, out = usbnet("set", "internet", "off")
-    time.sleep(2)
+    check(host_gone(1) and attach_host() is not None, "internet off: the card plugged in again too")
+    time.sleep(1)
     l = dhcp()
     check(l.get("router") == "", "internet off again: no router (%s)" % l)
     # status: the host's address from the neighbours (the lease on the host's
