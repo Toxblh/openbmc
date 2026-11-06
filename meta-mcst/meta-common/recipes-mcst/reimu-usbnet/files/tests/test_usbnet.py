@@ -248,18 +248,30 @@ class T(unittest.TestCase):
         self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "no change, no reconnect")
 
     # ------------------------------------------------------------------ watch
-    def regs(self, eps):
-        """a fake vhub: {ep: (cfg, desc_status)}; the devmem stub answers from it"""
-        d = os.path.join(self.d, "regs")
-        os.makedirs(d, exist_ok=True)
-        for n, (cfg, st) in eps.items():
-            b = 0x1E6A0200 + n * 0x10
-            open(os.path.join(d, "%#x" % b), "w").write("%#010x\n" % cfg)
-            open(os.path.join(d, "%#x" % (b + 12)), "w").write("%#010x\n" % st)
+    def regs(self, eps, later=None, after=0):
+        """a fake vhub: {ep: (cfg, desc_status)}; the devmem stub answers from
+        it (from LATER once AFTER reads were made) and counts its calls"""
+        def put(d, eps):
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+            for n, (cfg, st) in eps.items():
+                b = 0x1E6A0200 + n * 0x10
+                open(os.path.join(d, "%#x" % b), "w").write("%#010x\n" % cfg)
+                open(os.path.join(d, "%#x" % (b + 12)), "w").write("%#010x\n" % st)
+        d, d2 = os.path.join(self.d, "regs"), os.path.join(self.d, "regs2")
+        put(d, eps)
+        put(d2, later if later is not None else eps)
+        self.devmem_log = os.path.join(self.d, "devmem.log")
+        open(self.devmem_log, "w").close()
         dm = os.path.join(self.d, "bin", "devmem")
-        open(dm, "w").write('#!/bin/sh\nf="%s/$(printf %%#x $(($1)))"\n[ -f "$f" ] && cat "$f" || echo 0x00000000\n' % d)
+        open(dm, "w").write('#!/bin/sh\necho "$1" >> %s\nd=%s\n[ $(wc -l < %s) -gt %d ] && d=%s\n'
+                            'f="$d/$(printf %%#x $(($1)))"\n[ -f "$f" ] && cat "$f" || echo 0x00000000\n'
+                            % (self.devmem_log, d, self.devmem_log, after, d2))
         os.chmod(dm, 0o755)
         self.env["REIMU_DEVMEM"] = dm
+
+    def devmem_calls(self):
+        return len(open(self.devmem_log).read().split())
 
     def watch(self, rounds):
         e = dict(self.env, REIMU_WATCH_ROUNDS=str(rounds), REIMU_WATCH_POLL="0", REIMU_WATCH_STUCK="3")
@@ -292,6 +304,33 @@ class T(unittest.TestCase):
         self.regs({4: (0x02000129, 0x00546869)})          # dev 4
         self.assertEqual(self.watch(5)[0], 0)
         self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "another port's endpoint: left alone")
+
+    def test_watch_cheap_poll(self):
+        """the board, beta6: the watch read all 15 endpoints' registers every
+        2 s (16 devmem runs a poll, ~32 processes, ~2 s of the BMC's CPU on a
+        busy BMC: load average ~2); the card's endpoint is found once, a poll
+        reads its two registers"""
+        self.assertEqual(self.run_("start")[0], 0)
+        os.utime(self.g("UDC"), (1, 1))
+        self.regs({1: (self.HID_IN, 0x80004242), 4: (self.NCM_IN, 0x80808282)})
+        self.assertEqual(self.watch(20)[0], 0)
+        self.assertEqual(os.stat(self.g("UDC")).st_mtime, 1, "idle: left alone")
+        self.assertLessEqual(self.devmem_calls(), 60, "devmem runs in 20 polls")
+
+    def test_watch_endpoint_moved(self):
+        """the card plugged in again (internet switched) may get another
+        endpoint: the one found before no longer the card's bulk IN (now the
+        keyboard's, its pointers apart) is not taken for a stall; the card's
+        new one is watched"""
+        self.assertEqual(self.run_("start")[0], 0)
+        os.utime(self.g("UDC"), (1, 1))
+        self.regs({4: (self.NCM_IN, 0x80808282)},
+                  later={4: (self.HID_IN, 0x00546869), 6: (self.NCM_IN, 0x00546869)}, after=20)
+        rc, out = self.watch(12)
+        self.assertEqual(rc, 0, out)
+        self.assertNotEqual(os.stat(self.g("UDC")).st_mtime, 1, "the new endpoint's stall seen: %s" % out)
+        self.assertIn("ep6", out)
+        self.assertNotIn("ep4", out)
 
     def test_watch_not_bound_nothing(self):
         self.assertEqual(self.run_("set", "enabled", "off")[0], 0)

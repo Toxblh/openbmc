@@ -48,6 +48,12 @@ starts from a fresh copy of ab.mtd. Tests (all by default):
               untouched until the window), each state booted: what comes up
   restorecut-a  slot B damaged: restore-stock writes slot B's region first,
               slot A boots with the stock firmware half written
+  ubdelay     U-Boot never waits on its console: bootdelay=-2 in the
+              image's environment and set by "reimu-ab boot" on a board
+              installed with bootdelay=2; bytes on the console all through
+              U-Boot: with bootdelay=2 it stops at its prompt (the board,
+              2026-11-05: WDT off, reimu_tries 0, no boot until a reset), with
+              -2 it boots
   stock       "reimu-ab ram", restore-stock from the dump, the stock
               firmware boots; then the first install from the stock firmware
               (kexec into the new image from RAM, write both slots, the A/B
@@ -740,6 +746,59 @@ def t_hang():
         b.stop()
 
 
+def spam_console(b, secs):
+    """bytes on the BMC's console (a stray character, line noise) from power-on
+    until U-Boot starts a kernel or SECS pass"""
+    s = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            s.connect("%s/%s.con" % (RQ, b.name))
+            break
+        except OSError:
+            time.sleep(0.1)
+    end = time.time() + secs
+    try:
+        while time.time() < end and "Starting kernel" not in b.console():
+            s.sendall(b"x")
+            time.sleep(0.05)
+    finally:
+        s.close()
+
+
+def t_ubdelay():
+    img = fresh("ubdelay")
+    check(env_of(img).get("bootdelay") == "-2", "the image's environment: bootdelay=-2 (%s)" % env_of(img).get("bootdelay"))
+    # the mechanism: U-Boot 2016.07 with bootdelay=2 takes any byte as "stop"
+    set_env(img, bootdelay="2")
+    b = Bmc("ubdelay-2", img).start()
+    try:
+        spam_console(b, 40)
+        time.sleep(10)
+        c = b.console()
+        check("Starting kernel" not in c and "ast#" in c,
+              "bootdelay=2, bytes on the console: U-Boot stops at its prompt, no boot")
+    finally:
+        b.stop()
+    set_env(img, bootdelay="-2")
+    b = Bmc("ubdelay-m2", img).start()
+    try:
+        spam_console(b, 60)
+        check(b.wait_console(r"reimu\.slot=a", 60) is not None, "bootdelay=-2, bytes on the console: U-Boot boots slot A")
+    finally:
+        b.stop()
+    # a board installed before: bootdelay=2 in its environment, set right by
+    # the first boot that U-Boot started
+    set_env(img, bootdelay="2")
+    b = Bmc("ubdelay-fix", img).start()
+    try:
+        check(b.wait_ssh(), "boots with bootdelay=2 (nothing on the console)")
+        e = wait_env(b, {"reimu_tries": "0", "bootdelay": "-2"})
+        check(e.get("bootdelay") == "-2", "reimu-ab boot set bootdelay=-2 (%s)" % e)
+    finally:
+        b.stop()
+    check(env_of(img).get("bootdelay") == "-2", "on the flash: bootdelay=-2")
+
+
 def t_stock():
     need = ["u-boot-env.bin", "kernel.bin", "rofs.bin", "rwfs.bin", "SHA256SUMS"]
     if not all(os.path.exists(os.path.join(STOCK, f)) for f in need):
@@ -1242,7 +1301,7 @@ def t_solcut():
 
 
 TESTS = [("boot", t_boot), ("memory", t_memory), ("regress", t_regress), ("update", t_update), ("ota", t_ota), ("settings", t_settings),
-         ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("fallback", t_fallback),
+         ("badkernel", t_badkernel), ("badrofs", t_badrofs), ("hang", t_hang), ("ubdelay", t_ubdelay), ("fallback", t_fallback),
          ("fallcut", t_fallcut), ("flashfail", t_flashfail), ("solcut", t_solcut), ("restorecut", t_restorecut),
          ("restorecut-a", t_restorecut_a), ("stock", t_stock)]
 

@@ -128,7 +128,7 @@ python do_generate_ab() {
     # the environment: the A/B script, test MACs, both redundant copies
     env = os.path.join(w, 'env.txt')
     with open(env, 'w') as f:
-        f.write('bootdelay 2\nbaudrate 115200\nverify yes\nspi_dma yes\n')
+        f.write('bootdelay -2\nbaudrate 115200\nverify yes\nspi_dma yes\n')
         f.write('ethaddr 98:a7:b0:00:00:01\neth1addr 98:a7:b0:00:00:02\n')
         f.write('bootargs console=ttyS4,115200n8 root=/dev/ram rw\n')
         for l in open(d.getVar('REIMU_AB_ENV')):

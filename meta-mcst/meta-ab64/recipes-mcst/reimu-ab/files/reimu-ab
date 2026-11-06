@@ -71,7 +71,7 @@ size_of() { cat /sys/class/mtd/${1#/dev/}/size; }
 env_get() { fw_printenv -n "$1" 2>/dev/null; }
 env_set() { # NAME VALUE: set (if it differs) and read back
     [ "$(env_get "$1")" = "${2:-}" ] && return 0
-    fw_setenv "$@" || die "fw_setenv $1 failed"
+    fw_setenv -- "$@" || die "fw_setenv $1 failed"  # --: a value like -2 is no option
     [ "$(env_get "$1")" = "${2:-}" ] || die "U-Boot environment: $1 did not take"
 }
 booted() { sed -n "s/.*$1=\([a-z]*\).*/\1/p" $STATE 2>/dev/null; }
@@ -282,6 +282,16 @@ healthy() {
     [ -z "$HEALTH_URL" ] || wget -q -O /dev/null --no-check-certificate "$HEALTH_URL" 2>/dev/null
 }
 
+# U-Boot boots at once and never stops on a byte on its console: with
+# bootdelay 2 a stray byte in those 2 s left it at its prompt, the watchdog
+# off, no boot and no reset (the board, 2026-11-05). Boards installed before
+# have 2 in their environment: set by the first boot U-Boot started.
+uboot_nodelay() {
+    [ "$(env_get bootdelay)" = -2 ] && return 0
+    log "U-Boot bootdelay $(env_get bootdelay) -> -2 (no stop on the console)"
+    env_set bootdelay -2
+}
+
 do_boot() {
     k=$(booted kernel) r=$(booted rofs) st=$(booted state)
     [ -n "$k" ] || { log "not booted by the A/B initramfs"; return 0; }
@@ -312,6 +322,7 @@ do_boot() {
             env_set reimu_slot $k
         fi
         env_set reimu_tries 0
+        uboot_nodelay
         return 0
     fi
     if [ "$(env_get reimu_pending)" = 1 ]; then
@@ -334,6 +345,7 @@ do_boot() {
     fi
     env_set reimu_slot $k
     env_set reimu_tries 0
+    uboot_nodelay
 }
 
 do_set_slot() {

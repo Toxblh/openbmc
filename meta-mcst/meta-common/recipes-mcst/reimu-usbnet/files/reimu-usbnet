@@ -337,33 +337,47 @@ do_set() {
 # the bulk IN endpoints of the card's port: "N STATUS" each (STATUS: the
 # descriptor ring's AST_VHUB_EP_DESC_STATUS: read pointer in bits 15:8, the
 # CPU's write pointer in 7:0)
+reg() { r=$($DEVMEM $1 2>/dev/null); r=$((${r:-0})); }   # register $1 -> $r
+# endpoint N's configuration: enabled, port DEV's device, bulk, IN
+ours() {
+    reg $((EPN + $1 * 16))
+    [ $((r & 1)) = 1 ] && [ $(((r >> 1) & 7)) = "$2" ] && [ $(((r >> 5) & 3)) = 1 ] && [ $((r & 16)) = 0 ]
+}
 in_eps() {
-    dev=${1##*:p}
     n=0
     while [ $n -lt 15 ]; do
-        b=$((EPN + n * 16))
-        c=$(( $($DEVMEM $b 2>/dev/null || echo 0) ))
-        # enabled, this port's device, bulk, IN
-        if [ $((c & 1)) = 1 ] && [ $(((c >> 1) & 7)) = "$dev" ] && [ $(((c >> 5) & 3)) = 1 ] && [ $((c & 16)) = 0 ]; then
-            echo "$n $(( $($DEVMEM $((b + 12)) 2>/dev/null || echo 0) ))"
-        fi
+        ours $n "$1" && printf '%s ' $n
         n=$((n + 1))
     done
 }
-
 do_watch() {
     rounds=${REIMU_WATCH_ROUNDS:-0} poll=${REIMU_WATCH_POLL:-2} stuck=${REIMU_WATCH_STUCK:-3}
     mkdir -p "$RUN"
-    i=0 seen= cnt=0
+    i=0 seen= cnt=0 epp= eps= scan=0
+    # the card's endpoints are found once (15 registers) and then only theirs
+    # read, 2 each a poll: a scan of all of them every 2 s took ~32 processes
+    # and ~2 s of the BMC's CPU (the board, beta6: load average ~2). Scanned
+    # again when the port changes, an endpoint is no longer the card's (the
+    # card plugged in again), or none was found (every 15 polls)
     while [ "$rounds" = 0 ] || [ $i -lt "$rounds" ]; do
         i=$((i + 1))
-        p=$(port_of)
+        p=
+        { read -r p < "$G/UDC"; } 2>/dev/null
         case $p in
             $VHUB:p*)
-                now=
-                for e in $(in_eps "$p" | tr ' ' ':'); do
-                    st=${e#*:}
-                    [ $(((st >> 8) & 255)) != $((st & 255)) ] && now="$now $e"
+                dev=${p##*:p} now=
+                if [ "$p" != "$epp" ]; then
+                    epp=$p eps= scan=0
+                elif [ -n "$eps" ]; then
+                    for n in $eps; do ours $n "$dev" || { eps= scan=0; break; }; done
+                fi
+                if [ -z "$eps" ]; then
+                    [ $scan -le 0 ] && { eps=$(in_eps "$dev"); scan=15; }
+                    scan=$((scan - 1))
+                fi
+                for n in $eps; do
+                    reg $((EPN + n * 16 + 12))
+                    [ $(((r >> 8) & 255)) != $((r & 255)) ] && now="$now $n:$r"
                 done
                 if [ -n "$now" ] && [ "$now" = "$seen" ]; then cnt=$((cnt + 1)); else cnt=0; fi
                 seen=$now
@@ -371,9 +385,9 @@ do_watch() {
                     e=${now# }; e=${e%% *}
                     echo "reimu-usbnet: the card's IN endpoint ep${e%%:*} stalled (descriptor status $(printf '%#x' ${e#*:}) for $stuck polls): plugged in again"
                     reconnect "ep${e%%:*} stalled" || true
-                    seen= cnt=0
+                    seen= cnt=0 epp=
                 fi ;;
-            *) seen= cnt=0 ;;
+            *) seen= cnt=0 epp= ;;
         esac
         [ "$poll" = 0 ] || sleep "$poll"
     done
