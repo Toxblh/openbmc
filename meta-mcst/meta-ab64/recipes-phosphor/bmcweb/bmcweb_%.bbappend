@@ -5,6 +5,8 @@ SRC_URI += " file://0001-NetworkProtocol-SSH-from-sshd.socket-ClearLog-without-r
 # Chassis Sensors/Thermal/Power: all of D-Bus's sensors (one board, its
 # sensors come and go with the platform power), not 404
 SRC_URI += " file://0002-Chassis-sensors-every-sensor-without-an-all_sensors-association.patch "
+# GET /reimu/metrics (Login): reimu-hwmon's Metrics for Prometheus, as text
+SRC_URI += " file://0003-reimu-metrics-for-Prometheus.patch "
 # OpenSSL 3: the RSA_/EC_KEY_ calls of its certificate code are deprecated
 # there, not gone; the build has -Werror (no behaviour change)
 CXXFLAGS_append = " -Wno-error=deprecated-declarations"

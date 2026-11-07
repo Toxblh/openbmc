@@ -1,0 +1,79 @@
+From: REIMU <reimu@localhost>
+Subject: [PATCH] /reimu/metrics: the BMC's metrics for Prometheus (reimu-hwmon)
+
+GET /reimu/metrics (Login): the Metrics property of reimu-hwmon as text/plain,
+the Prometheus text exposition format 0.0.4: what it read last, a request
+reads no chip.
+---
+--- a/include/reimu_metrics.hpp	1970-01-01 00:00:00.000000000 +0000
++++ b/include/reimu_metrics.hpp	2026-11-07 09:23:23.298114557 +0000
+@@ -0,0 +1,50 @@
++#pragma once
++#include <app.hpp>
++#include <boost/beast/http/status.hpp>
++#include <dbus_singleton.hpp>
++
++#include <string>
++#include <variant>
++
++namespace crow
++{
++namespace reimu_metrics
++{
++
++// The BMC's metrics for Prometheus (text exposition format 0.0.4): the
++// Metrics property of reimu-hwmon, what it read last (a request reads no
++// chip). Any logged-in user (Login), so a ReadOnly account can scrape it.
++inline void requestRoutes(App& app)
++{
++    BMCWEB_ROUTE(app, "/reimu/metrics")
++        .privileges({"Login"})
++        .methods(boost::beast::http::verb::get)(
++            [](const crow::Request&, crow::Response& res) {
++                crow::connections::systemBus->async_method_call(
++                    [&res](const boost::system::error_code ec,
++                           const std::variant<std::string>& v) {
++                        const std::string* s = std::get_if<std::string>(&v);
++                        if (ec || s == nullptr)
++                        {
++                            res.result(boost::beast::http::status::
++                                           service_unavailable);
++                            res.addHeader("Content-Type", "text/plain");
++                            res.body() = "reimu-hwmon is not answering\n";
++                            res.end();
++                            return;
++                        }
++                        res.addHeader("Content-Type",
++                                      "text/plain; version=0.0.4; "
++                                      "charset=utf-8");
++                        res.body() = *s;
++                        res.end();
++                    },
++                    "xyz.openbmc_project.Reimu.Hwmon",
++                    "/xyz/openbmc_project/reimu/hwmon",
++                    "org.freedesktop.DBus.Properties", "Get",
++                    "xyz.openbmc_project.Reimu.Hwmon", "Metrics");
++            });
++}
++
++} // namespace reimu_metrics
++} // namespace crow
+--- a/src/webserver_main.cpp	2026-11-07 09:23:23.745114306 +0000
++++ b/src/webserver_main.cpp	2026-11-07 09:23:23.227114597 +0000
+@@ -14,6 +14,7 @@
+ #include <openbmc_dbus_rest.hpp>
+ #include <redfish.hpp>
+ #include <redfish_v1.hpp>
++#include <reimu_metrics.hpp>
+ #include <reimu_serial.hpp>
+ #include <sdbusplus/asio/connection.hpp>
+ #include <sdbusplus/bus.hpp>
+@@ -111,6 +112,8 @@
+     }
+ 
+     crow::login_routes::requestRoutes(app);
++    // the BMC's metrics for Prometheus (reimu-hwmon)
++    crow::reimu_metrics::requestRoutes(app);
+ 
+     setupSocket(app);
+ 
