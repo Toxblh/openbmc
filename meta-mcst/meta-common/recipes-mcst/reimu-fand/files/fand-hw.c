@@ -1,12 +1,13 @@
 /* reimu-fand hardware access: SMBus transfers over i2c-dev, the fault LED.
  *
- * Every device is reached by its address with I2C_SLAVE_FORCE: the lm96163s
- * are bound to the lm63 driver (hwmon-instantiator), which reimu-pnsd reads;
- * single SMBus transfers are atomic on the adapter, so the driver, reimu-pnsd
- * and this daemon don't disturb each other. Writes go to the chips directly,
- * not through the lm63 sysfs files: that driver ignores I2C errors on writes
- * and caches the fan config register, so only a direct write and its read
- * back say whether the fan got its duty.
+ * Every device is reached by its address with I2C_SLAVE_FORCE (an image
+ * with hwmon-instantiator binds the lm96163s to the lm63 driver; the A/B
+ * image binds no driver to them: this daemon is their only reader, and hands
+ * what it read to reimu-hwmon); single SMBus transfers are atomic on the
+ * adapter. Writes go to the chips directly, never through the lm63 sysfs
+ * files: that driver ignores I2C errors on writes and caches the fan config
+ * register, so only a direct write and its read back say whether the fan got
+ * its duty.
  *
  * REIMU_FAND_FAKE=<dir> replaces the hardware by files, for the tests: see
  * fand.h.

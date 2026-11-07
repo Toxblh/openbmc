@@ -111,6 +111,7 @@ struct output
     int64_t last_ok;
     int failing;     /* reported */
     int raw;         /* register value written */
+    int64_t wr_at;   /* EMC2305: when all its drive registers were last written */
     double min_duty, max_duty; /* its useful range (config) */
     double duty;     /* fan duty written, % */
     unsigned repairs;       /* setup registers put right */
@@ -129,6 +130,12 @@ struct output
     int sn, sp;
     int64_t tach_since;    /* samples taken since then */
     int64_t tach_last_ok;
+    /* for the others (fand_readings), read every EXTRAS_MS: the LM96163's
+     * local temperature, the tachometers not read by the control */
+    double t_local;
+    int64_t t_local_at;
+    double fan[5];
+    int64_t fan_at[5];
 };
 
 struct zone
@@ -165,6 +172,7 @@ struct fand
     unsigned repairs, corruptions;
     int iohub_skip;      /* its chip's offset was just repaired: no reading this poll */
     int64_t turbo_until; /* ms, 0 = off (the daemon keeps it in /run) */
+    int64_t extras_next; /* read_extras() */
     int led;         /* LED state written, -1 = unknown */
     unsigned long ticks;
     unsigned gen;    /* bumped when something D-Bus shows as a property changes */
@@ -211,6 +219,20 @@ int zone_by_name(const char *s);
 double fan_duty_test(const struct output *o, double floor, double z);
 int group_by_name(const char *s);
 int mode_by_name(const char *s);
+
+/* What reimu-fand read, for the others (D-Bus Readings: reimu-hwmon publishes
+ * it), so that no one else reads its chips: each input of them, only while it
+ * controls them (PH_RUN) */
+#define FAND_MAX_READINGS 40
+struct fand_reading
+{
+    char dev[12];  /* "6-004c" */
+    char input[8]; /* as hwmon names them: temp1 (local), temp2 (remote), fan1..fan5 */
+    double value;  /* °C or rpm; NAN: none (not read yet, stale, no fan) */
+    double duty;   /* the fan's drive, %; NAN: not a fan */
+    int64_t at;    /* ms (hw_now_ms) of the reading, 0: never */
+};
+int fand_readings(const struct fand *f, struct fand_reading *r, int max);
 
 /* growable string for the JSON */
 struct buf

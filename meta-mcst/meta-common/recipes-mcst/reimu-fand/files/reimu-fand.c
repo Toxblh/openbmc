@@ -18,6 +18,14 @@
  *                                               = until off (12 h at most); kept
  *                                               in /run over a daemon restart
  *     property TurboLeft (u)    seconds, 0 = off
+ *     property Readings (a(ssddt)) what it read of its chips, for the others
+ *                              (reimu-hwmon publishes it: Redfish, IPMI, the
+ *                              web UI), so that no one else reads them: device
+ *                              "6-004c", input (hwmon's names: temp1, temp2,
+ *                              fan1..fan5), value (°C, rpm; NaN = none), the
+ *                              fan's duty (%, NaN = not a fan), when it was
+ *                              read (CLOCK_MONOTONIC us, 0 = never). Empty
+ *                              while it doesn't control (host off, settling)
  *     method   ClearAlarms()
  *     method   Reload() -> s                    re-reads the config file,
  *                                               returns its errors (JSON)
@@ -309,6 +317,16 @@ static int prop_root(sd_bus *bus, const char *path, const char *iface, const cha
         free(b.s);
         return r;
     }
+    if (!strcmp(prop, "Readings"))
+    {
+        struct fand_reading rd[FAND_MAX_READINGS];
+        int n = fand_readings(&F, rd, FAND_MAX_READINGS);
+        int r = sd_bus_message_open_container(reply, 'a', "(ssddt)");
+        for (int i = 0; r >= 0 && i < n; i++)
+            r = sd_bus_message_append(reply, "(ssddt)", rd[i].dev, rd[i].input, rd[i].value, rd[i].duty, (uint64_t)rd[i].at * 1000);
+        if (r >= 0) r = sd_bus_message_close_container(reply);
+        return r;
+    }
     if (!strcmp(prop, "Alarm")) return sd_bus_message_append(reply, "b", fand_alarm(&F));
     if (!strcmp(prop, "TurboLeft")) return sd_bus_message_append(reply, "u", (uint32_t)fand_turbo_left(&F));
     if (!strcmp(prop, "AlarmText"))
@@ -464,6 +482,8 @@ static const sd_bus_vtable root_vtable[] = {
     SD_BUS_PROPERTY("AlarmText", "s", prop_root, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
     SD_BUS_PROPERTY("Host", "s", prop_root, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
     SD_BUS_PROPERTY("TurboLeft", "u", prop_root, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    /* changes every poll: asked for, not signalled */
+    SD_BUS_PROPERTY("Readings", "a(ssddt)", prop_root, 0, 0),
     SD_BUS_METHOD("SetTurbo", "u", "", m_turbo, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("SetMode", "ss", "", m_set_mode, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("SetDuty", "sd", "", m_set_duty, SD_BUS_VTABLE_UNPRIVILEGED),

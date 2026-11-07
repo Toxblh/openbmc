@@ -1149,12 +1149,21 @@ static int write_lm96163(struct fand *f, struct output *o, double duty)
     return hw_rd_byte(b, a, 0x4c) == raw ? 0 : -1;
 }
 
+/* The same drive as last time, written less than EMC_KEEPALIVE_MS ago: only
+ * the first channel read back (a chip gone or a value changed behind our back
+ * shows there, the rest gets put right by the keep-alive). The watchdog
+ * (EMC_WATCHDOG, 4 s) is fed by the keep-alive write. Otherwise all five
+ * written and read back: 10 transfers a chip each poll was half the traffic
+ * of the bus the platform shares */
+#define EMC_KEEPALIVE_MS 2000
 static int write_emc2305(struct fand *f, struct output *o, double duty)
 {
     int b = o->a.bus, a = o->a.addr;
     if (chip_ident(o) != 1) return -1;
     int raw = duty >= 100 ? 0xff : (int)lround(duty * 255 / 100);
     if (raw < 1) raw = 1;
+    if (raw == o->raw && o->ok && o->wr_at && f->now - o->wr_at < EMC_KEEPALIVE_MS && hw_rd_byte(b, a, 0x30) == raw) return 0;
+    o->wr_at = f->now;
     int bad = 0;
     for (int n = 0; n < 5; n++)
     {
@@ -1331,6 +1340,108 @@ static void check_tach(struct fand *f, struct output *o)
     fand_log(5, "CPU fan %d-%04x: %s (its tachometer is trusted from %g%%): checking it at full speed", o->a.bus, o->a.addr,
              what, valid);
     f->gen++;
+}
+
+/* ---- the rest of the chips' inputs, for the others (fand_readings): every
+ * EXTRAS_MS, from chips known to be what they should be. LM96163: the local
+ * temperature (0x00, whole °C, as the lm63 driver's temp1) and, for a fan
+ * whose tachometer isn't checked, its tachometer; EMC2305: each fan's
+ * tachometer (+0x0e/+0x0f, 13 bits; RANGE in CONFIG1 bits 6:5), RPM =
+ * 3932160 * m / count as the Linux driver, the 13-bit maximum = no fan */
+#define EXTRAS_MS 5000
+static void read_extras(struct fand *f)
+{
+    if (f->now < f->extras_next) return;
+    f->extras_next = f->now + EXTRAS_MS;
+    for (int zi = 0; zi < NZONES; zi++)
+        for (int i = 0; i < f->z[zi].nout; i++)
+        {
+            struct output *o = &f->z[zi].out[i];
+            int b = o->a.bus, a = o->a.addr;
+            if (o->ident != 1) continue;
+            if (o->kind == OUT_LM96163)
+            {
+                int t = hw_rd_byte(b, a, 0x00);
+                if (t >= 0)
+                {
+                    o->t_local = (int8_t)t;
+                    o->t_local_at = f->now;
+                }
+                if (o->has_tach) continue; /* read_tach() every poll */
+                int lo = hw_rd_byte(b, a, 0x46), hi = lo >= 0 ? hw_rd_byte(b, a, 0x47) : -1;
+                if (hi < 0) continue;
+                int count = (hi << 8 | lo) & 0xfffc;
+                o->fan[0] = count == 0 || count == 0xfffc ? 0 : 5400000.0 / count;
+                o->fan_at[0] = f->now;
+                continue;
+            }
+            for (int n = 0; n < 5; n++)
+            {
+                int r = 0x30 + 0x10 * n;
+                int cfg = hw_rd_byte(b, a, r + 2), hi = cfg >= 0 ? hw_rd_byte(b, a, r + 0x0e) : -1,
+                    lo = hi >= 0 ? hw_rd_byte(b, a, r + 0x0f) : -1;
+                if (lo < 0) continue;
+                int count = (hi << 8 | lo) >> 3, m = 1 << ((cfg >> 5) & 3);
+                o->fan[n] = count == 0 || count >= 0x1ff8 ? NAN : 3932160.0 * m / count;
+                o->fan_at[n] = f->now;
+            }
+        }
+}
+
+static void add_reading(struct fand_reading *r, int *n, int max, int bus, int addr, const char *input, double v, int64_t at,
+                        int fresh, double duty)
+{
+    if (*n >= max) return;
+    struct fand_reading *x = &r[(*n)++];
+    snprintf(x->dev, sizeof(x->dev), "%d-%04x", bus, addr);
+    snprintf(x->input, sizeof(x->input), "%s", input);
+    x->value = fresh ? v : NAN;
+    x->duty = duty;
+    x->at = at;
+}
+
+int fand_readings(const struct fand *f, struct fand_reading *r, int max)
+{
+    int n = 0;
+    const struct config *c = &f->c;
+    if (f->phase != PH_RUN) return 0;
+    for (int g = 0; g < NGROUPS; g++)
+    {
+        if (g == G_GPU) continue; /* the host's (reimu-hostlink publishes it) */
+        int bus = g == G_PCS ? c->pcs_bus : g == G_VRM ? c->vrm_bus : c->iohub.bus;
+        for (int i = 0; i < f->g[g].n; i++)
+        {
+            const struct sensor *s = &f->g[g].s[i];
+            int fresh = s->last_ok && f->now - s->last_ok <= c->stale_ms;
+            add_reading(r, &n, max, bus, s->addr, g == G_IOHUB ? "temp2" : "temp1", s->v, s->last_ok, fresh, NAN);
+        }
+    }
+    for (int zi = 0; zi < NZONES; zi++)
+        for (int i = 0; i < f->z[zi].nout; i++)
+        {
+            const struct output *o = &f->z[zi].out[i];
+            int b = o->a.bus, a = o->a.addr;
+            if (o->kind == OUT_LM96163)
+            {
+                add_reading(r, &n, max, b, a, "temp1", o->t_local, o->t_local_at,
+                            o->t_local_at && f->now - o->t_local_at <= 3 * EXTRAS_MS, NAN);
+                if (o->has_tach)
+                    add_reading(r, &n, max, b, a, "fan1", o->rpm_last, o->tach_last_ok,
+                                o->tach_last_ok && f->now - o->tach_last_ok <= c->stale_ms, o->duty);
+                else
+                    add_reading(r, &n, max, b, a, "fan1", o->fan[0], o->fan_at[0],
+                                o->fan_at[0] && f->now - o->fan_at[0] <= 3 * EXTRAS_MS, o->duty);
+                continue;
+            }
+            for (int k = 0; k < 5; k++)
+            {
+                char in[8];
+                snprintf(in, sizeof(in), "fan%d", k + 1);
+                add_reading(r, &n, max, b, a, in, o->fan[k], o->fan_at[k], o->fan_at[k] && f->now - o->fan_at[k] <= 3 * EXTRAS_MS,
+                            o->duty);
+            }
+        }
+    return n;
 }
 
 /* ------------------------------------------------------------------ fail-safe */
@@ -1631,8 +1742,11 @@ static void enter_run(struct fand *f)
             o->rpm = o->rpm_last = NAN;
             o->tach_since = f->now;
             o->tach_last_ok = 0;
+            o->t_local_at = 0;
+            for (int k = 0; k < 5; k++) o->fan_at[k] = 0;
         }
     }
+    f->extras_next = 0;
     fand_log(5, "host on for %lld s: fan control takes over, 100%% for %d s", (long long)((f->now - f->on_since) / 1000),
              f->c.start_full_ms / 1000);
     f->gen++;
@@ -1719,6 +1833,7 @@ void fand_step(struct fand *f, int64_t now, int host)
     }
     if (out_alarm != f->out_alarm) f->gen++;
     f->out_alarm = out_alarm;
+    read_extras(f);
 
     int fault = f->tach_alarm || f->out_alarm;
     for (int zi = 0; zi < NZONES; zi++) fault |= f->z[zi].failsafe;

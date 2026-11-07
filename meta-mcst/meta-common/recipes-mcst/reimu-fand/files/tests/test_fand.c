@@ -31,6 +31,10 @@ static struct fault {
 } I;
 static int64_t s_hw_ms;
 int64_t __wrap_hw_now_ms(void) { return s_hw_ms; }
+/* what went over each bus, and the EMC2305 drive writes (the watchdog's food) */
+static unsigned long s_bus_xfers[16], s_emc_drive_wr, s_emc_tach_rd;
+static int64_t s_emc_last_wr[2], s_emc_max_gap;
+static int64_t T; /* simulated ms */
 static void no_faults(void)
 {
     memset(&I, 0, sizeof(I));
@@ -40,6 +44,8 @@ static void no_faults(void)
 int __wrap_hw_rd_byte(int bus, int addr, int reg)
 {
     s_hw_ms += 1;
+    s_bus_xfers[bus & 15]++;
+    if (bus == 2 && addr == 0x2c && reg == 0x3e) s_emc_tach_rd++;
     if (I.dead_bus == -2 || bus == I.dead_bus || (I.hang_rest && reg < 0xfd && reg != 0x4a))
     {
         s_hw_ms += 1500;
@@ -55,6 +61,14 @@ int __wrap_hw_rd_byte(int bus, int addr, int reg)
 int __wrap_hw_wr_byte(int bus, int addr, int reg, int val)
 {
     s_hw_ms += 1;
+    s_bus_xfers[bus & 15]++;
+    if (bus == 2 && (addr == 0x2c || addr == 0x2e) && reg >= 0x30 && reg <= 0x70 && !(reg & 0x0f))
+    {
+        int k = addr == 0x2e;
+        s_emc_drive_wr++;
+        if (s_emc_last_wr[k] && T - s_emc_last_wr[k] > s_emc_max_gap) s_emc_max_gap = T - s_emc_last_wr[k];
+        s_emc_last_wr[k] = T;
+    }
     if (I.dead_bus == -2 || bus == I.dead_bus || bus == I.dead_wr_bus || I.hang_rest)
     {
         s_hw_ms += 1500;
@@ -80,7 +94,6 @@ int __wrap_hw_wr_byte(int bus, int addr, int reg, int val)
 
 static int s_fail, s_pass;
 static char R[200]; /* the fake root */
-static int64_t T;   /* simulated ms */
 
 #define CHECK(c, ...)                                                   \
     do {                                                                \
@@ -1714,6 +1727,155 @@ static void t_json(void)
     }
 }
 
+/* The bus the platform shares (2: the IOHUB chip and both EMC2305): steady
+ * fans, so the EMC2305 drive isn't written again every poll (5 writes and 5
+ * reads per chip): when it changes, else every EMC_KEEPALIVE_MS (its
+ * watchdog fires at 4 s), one register read back in between */
+static void t_bus_cost(void)
+{
+    struct fand f;
+    struct config c = cfg_test();
+    start(&f, &c);
+    run(&f, 300, HOST_ON); /* steady */
+    unsigned long x0 = s_bus_xfers[2], w0 = s_emc_drive_wr;
+    s_emc_max_gap = 0;
+    s_emc_last_wr[0] = s_emc_last_wr[1] = 0;
+    run(&f, 20, HOST_ON);
+    unsigned long per_s = (s_bus_xfers[2] - x0) / 20, wr = s_emc_drive_wr - w0;
+    CHECK(per_s <= 41, "bus 2: %lu transfers a second (50 when every poll wrote the EMC2305: 43, and 7 of the readings for the others)", per_s);
+    CHECK(wr <= 2 * 5 * 10, "EMC2305 drive written %lu times in 20 s (keep-alive every 2 s: 100)", wr);
+    CHECK(s_emc_max_gap > 0 && s_emc_max_gap <= 2000, "the watchdog fed every %lld ms at most (fires at 4 s)", (long long)s_emc_max_gap);
+    CHECK(!fand_alarm(&f) && f.z[Z_BOARD].out[1].ok && f.z[Z_BOARD].out[2].ok, "no alarm, the EMC2305 driven");
+    /* a drive register changed behind our back: back within the keep-alive */
+    int want = reg(2, 0x2c, 0x40);
+    setreg(2, 0x2c, 0x40, 0x00);
+    run(&f, 2, HOST_ON);
+    CHECK(reg(2, 0x2c, 0x40) == want, "fan 1 of 2-002c put back (0x%02x, 0x%02x)", reg(2, 0x2c, 0x40), want);
+    /* the first channel read back every poll: a change there at once */
+    setreg(2, 0x2e, 0x30, 0x00);
+    run(&f, 1, HOST_ON);
+    CHECK(reg(2, 0x2e, 0x30) == want, "fan 0 of 2-002e put back in one poll (0x%02x)", reg(2, 0x2e, 0x30));
+    /* a duty change is written at once */
+    f.z[Z_BOARD].mode = MODE_FULL;
+    run(&f, 1, HOST_ON);
+    CHECK(reg(2, 0x2c, 0x70) == 0xff && reg(2, 0x2e, 0x70) == 0xff, "full: written in that poll");
+    /* a chip gone: alarmed as before (STALE_SEC, not sooner, not later) */
+    f.z[Z_BOARD].mode = MODE_AUTO;
+    run(&f, 300, HOST_ON);
+    hide(2, 0x2e, 1);
+    run(&f, 5, HOST_ON);
+    CHECK(!f.out_alarm, "gone 5 s: not yet");
+    run(&f, 2, HOST_ON);
+    CHECK(f.out_alarm, "gone 7 s: alarm");
+    hide(2, 0x2e, 0);
+    /* a long poll (3 s, the most with the watchdog): every poll writes */
+    struct config c3 = c;
+    c3.poll_ms = 3000;
+    fand_reconfig(&f, &c3);
+    run(&f, 30, HOST_ON);
+    w0 = s_emc_drive_wr;
+    run(&f, 30, HOST_ON);
+    CHECK(s_emc_drive_wr - w0 == 10 * 10, "POLL_MS 3000: written every poll (%lu in 10 polls)", s_emc_drive_wr - w0);
+}
+
+static const struct fand_reading *reading(const struct fand_reading *r, int n, const char *dev, const char *input)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(r[i].dev, dev) && !strcmp(r[i].input, input)) return &r[i];
+    return NULL;
+}
+
+/* EMC2305 fan n's tachometer for an rpm (RANGE m = 2, as the board sets it) */
+static void emc_rpm(int addr, int n, double rpm)
+{
+    int raw = rpm <= 0 ? 0xfff8 : ((int)lround(3932160.0 * 2 / rpm) << 3) & 0xfff8;
+    setreg(2, addr, 0x3e + 0x10 * n, raw >> 8);
+    setreg(2, addr, 0x3f + 0x10 * n, raw & 0xff);
+}
+
+/* What reimu-fand read, given to the others (D-Bus Readings: reimu-hwmon
+ * publishes it for Redfish, IPMI and the web UI), so no one else reads these
+ * chips: its control inputs as it has them, and the rest of its chips'
+ * inputs (local temperatures, every tachometer) every EXTRAS_MS */
+static void t_readings(void)
+{
+    struct fand f;
+    struct config c = cfg_test();
+    struct fand_reading r[FAND_MAX_READINGS];
+    board();
+    setreg(6, 0x4c, 0x00, 40);
+    setreg(2, 0x4c, 0x00, 45);
+    setreg(2, 0x4c, 0x46, 0x10);
+    setreg(2, 0x4c, 0x47, 0x0e); /* 0x0e10: 1500 rpm */
+    emc_rpm(0x2c, 0, 3000);
+    emc_rpm(0x2e, 4, 1200);
+    T = 1000000;
+    fand_init(&f, &c, T);
+    CHECK(fand_readings(&f, r, FAND_MAX_READINGS) == 0, "not controlling: no readings");
+    f.on_since_hint = T - 100000;
+    run(&f, c.start_full_ms / 1000.0 + 6, HOST_ON);
+    int n = fand_readings(&f, r, FAND_MAX_READINGS);
+    const struct fand_reading *x;
+    for (int a = 0x20; a <= 0x26; a++)
+    {
+        char d[12];
+        snprintf(d, sizeof(d), "5-%04x", a);
+        x = reading(r, n, d, "temp1");
+        CHECK(x && NEAR(x->value, 50 + (a - 0x20), 0.01) && isnan(x->duty) && x->at == T, "PCS %s temp1 %.2f", d,
+              x ? x->value : -1);
+    }
+    x = reading(r, n, "6-0045", "temp1");
+    CHECK(x && NEAR(x->value, 65, 0.01), "VRM 6-0045 temp1 (%.2f)", x ? x->value : -1);
+    x = reading(r, n, "2-004c", "temp2");
+    CHECK(x && NEAR(x->value, 83, 0.01) && x->at == T, "IOHUB: 2-004c temp2 (%.2f)", x ? x->value : -1);
+    x = reading(r, n, "6-004c", "temp1");
+    CHECK(x && NEAR(x->value, 40, 0.01) && x->at > 0, "local: 6-004c temp1 (%.2f)", x ? x->value : -1);
+    x = reading(r, n, "2-004c", "temp1");
+    CHECK(x && NEAR(x->value, 45, 0.01), "local: 2-004c temp1 (%.2f)", x ? x->value : -1);
+    CHECK(!reading(r, n, "6-004c", "temp2"), "the CPU fan chip's remote diode: not connected, not given");
+    x = reading(r, n, "6-004c", "fan1");
+    CHECK(x && NEAR(x->value, 2000, 5) && NEAR(x->duty, f.z[Z_CPU].out[0].duty, 0.01) && x->at == T, "CPU fan: %.0f rpm at %.0f%%",
+          x ? x->value : -1, x ? x->duty : -1);
+    x = reading(r, n, "2-004c", "fan1");
+    CHECK(x && NEAR(x->value, 1500, 1) && NEAR(x->duty, f.z[Z_BOARD].out[0].duty, 0.01), "board fan: %.0f rpm", x ? x->value : -1);
+    x = reading(r, n, "2-002c", "fan1");
+    CHECK(x && NEAR(x->value, 3000, 2) && NEAR(x->duty, f.z[Z_BOARD].out[1].duty, 0.01), "case fan 2-002c fan1: %.0f rpm",
+          x ? x->value : -1);
+    x = reading(r, n, "2-002e", "fan5");
+    CHECK(x && NEAR(x->value, 1200, 2), "case fan 2-002e fan5: %.0f rpm", x ? x->value : -1);
+    x = reading(r, n, "2-002c", "fan2");
+    CHECK(x && isnan(x->value) && !isnan(x->duty), "no fan on 2-002c fan2: no rpm, still its drive");
+    CHECK(n == 7 + 3 + 1 + 2 + 2 + 10, "%d readings", n);
+
+    /* the extras: every 5 s, not every poll */
+    unsigned long x0 = s_emc_tach_rd;
+    run(&f, 10, HOST_ON);
+    CHECK(s_emc_tach_rd - x0 == 2, "the extras twice in 10 s (%lu)", s_emc_tach_rd - x0);
+    x = reading(r, fand_readings(&f, r, FAND_MAX_READINGS), "6-004c", "temp1");
+    CHECK(x && T - x->at <= 5000, "and fresh (%lld ms)", x ? (long long)(T - x->at) : -1LL);
+
+    /* a PCS sensor that stopped answering: no value once stale */
+    hide(5, 0x23, 1);
+    run(&f, 1, HOST_ON);
+    n = fand_readings(&f, r, FAND_MAX_READINGS);
+    x = reading(r, n, "5-0023", "temp1");
+    CHECK(x && !isnan(x->value) && x->at < T, "5-0023 not read: its last value while fresh");
+    run(&f, c.stale_ms / 1000.0 + 1, HOST_ON);
+    n = fand_readings(&f, r, FAND_MAX_READINGS);
+    x = reading(r, n, "5-0023", "temp1");
+    CHECK(x && isnan(x->value), "stale: no value (%.2f)", x ? x->value : -1);
+    hide(5, 0x23, 0);
+    /* a local temperature that stopped answering: none after 3 passes */
+    hide(6, 0x4c, 1);
+    run(&f, 16, HOST_ON);
+    n = fand_readings(&f, r, FAND_MAX_READINGS);
+    x = reading(r, n, "6-004c", "temp1");
+    CHECK(x && isnan(x->value), "6-004c gone: its local temperature none (%.2f)", x ? x->value : -1);
+    hide(6, 0x4c, 0);
+    run(&f, 2, HOST_OFF);
+    CHECK(fand_readings(&f, r, FAND_MAX_READINGS) == 0, "host off: none");
+}
+
 int main(void)
 {
     snprintf(R, sizeof(R), "%s/fand-test-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", getpid());
@@ -1725,7 +1887,7 @@ int main(void)
         { "failsafe_inputs", t_failsafe_inputs }, { "outputs", t_outputs }, { "tach", t_tach }, { "manual", t_manual },
         { "reload", t_reload }, { "json", t_json }, { "fan_model", t_fan_model }, { "fan_range", t_fan_range },
         { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu }, { "guard", t_guard },
-        { "on_since_hint", t_on_since_hint }, { "poll_watchdog", t_poll_watchdog }, { "failsafe_verify", t_failsafe_verify },
+        { "on_since_hint", t_on_since_hint }, { "poll_watchdog", t_poll_watchdog }, { "failsafe_verify", t_failsafe_verify }, { "bus_cost", t_bus_cost }, { "readings", t_readings },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {
