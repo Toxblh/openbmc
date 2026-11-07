@@ -1008,6 +1008,7 @@ def platform_run():
         b.qmp(("human-monitor-command", {"command-line": "hostfwd_add n0 udp:127.0.0.1:%d-10.0.2.15:623" % IPMI}))
         if not rec("platform.boot", b.wait_ssh(900), "up, platform off"):
             return
+        rec("platform.lm96163", b.load_lm(), "the lm96163 stand-ins loaded")
         wait_redfish()
         wait_ipmi()
 
@@ -1072,8 +1073,11 @@ def platform_run():
             rec("platform.%s.no_valueless_sensors" % tag, not nan, "D-Bus sensors without a value: %s" % (nan or "none"))
 
         def settled():
-            """sensors up and hwmon-instantiator done with them"""
-            return dbus_sensors() >= 4 and b.out("systemctl show -p ActiveState --value hwmon-instantiator").strip() != "activating"
+            """the sensors up (reimu-hwmon, what reimu-fand read)"""
+            return F.EXPECT_SENSORS <= set(b.sensors())
+
+        def dbus_temps():
+            return sum(1 for k, v in dbus_all().items() if k.startswith("temperature/") and v.lower() not in ("nan", "-nan", "?"))
 
         def fru():
             rc, o = ipmi("fru", "print", "0")
@@ -1094,7 +1098,7 @@ def platform_run():
         s, j = get("/redfish/v1/Chassis/motherboard")
         rec("platform.on.chassis_asset", s == 200 and j.get("Manufacturer") == "Пантес" and j.get("SerialNumber"),
             "%s %s %s SN %s PN %s" % (s, j.get("Manufacturer"), j.get("Model"), j.get("SerialNumber"), j.get("PartNumber")))
-        n = dbus_sensors()
+        n = dbus_temps()
         rs = rf_sensors()
         # (this bmcweb lists temperatures, fans under Thermal, voltages under
         # Power; Sensors only power, current, utilization)
@@ -1137,18 +1141,13 @@ def platform_run():
             rec("platform.cycle%d" % (i + 1), bool(on) and bool(off) and rs_on["Sensors"][0] == 200
                 and rs_on["Thermal"][0] == 200 and rs_on["Thermal"][1] > 0 and rs_off["Sensors"] == (200, 0) and rs_off["Thermal"] == (200, 0),
                 "on %s, off %s" % (rs_on, rs_off))
-        # off while hwmon-instantiator is still instantiating (the first
-        # sensors just up): everything must go all the same
+        # off just as the first sensors come: everything goes all the same
         b.transition("On")
         b.wait(lambda: dbus_sensors() >= 1, 300, 2)
-        busy = b.out("systemctl show -p ActiveState --value hwmon-instantiator").strip()
         b.transition("Off")
         b.wait(lambda: dbus_sensors() == 0, 90, 5)
         left = dbus_sensors()
-        # not prefixed platform.: hwmon-instantiator is another agent's (reported)
-        rec("issue.off_during_instantiation", left == 0, "off while hwmon-instantiator was %s: %d sensors left on D-Bus after 90 s" % (busy, left))
-        if left:
-            b.ssh("systemctl stop 'xyz.openbmc_project.Hwmon@*'")
+        rec("platform.off_as_they_come", left == 0, "%d sensors left on D-Bus after 90 s" % left)
         # a BMC reboot with the platform on: the states come up as On
         b.transition("On")
         b.wait(settled, 300, 5)

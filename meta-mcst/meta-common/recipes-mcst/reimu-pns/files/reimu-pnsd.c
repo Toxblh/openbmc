@@ -9,9 +9,11 @@
  *                         re-reads the flash partition table (host must be off)
  *   object    /xyz/openbmc_project/reimu/pns_flash   (reimu-pnsflash.c)
  *     backups, upload, check and write of the flash
- *   object    /xyz/openbmc_project/reimu/sensors
- *   interface xyz.openbmc_project.Reimu.Sensors
- *     property Json (s)  - platform sensors, see sensors_doc() and reimu-sensors.c
+ *   object    /xyz/openbmc_project/reimu/view/static (reimu-view.c)
+ *     the web UI's view, its static part
+ *
+ * The platform's sensors, the overheat protection's object and the view's
+ * live part are reimu-hwmon's, the BMC journal reimu-logd's.
  *
  * Data sources:
  *   /var/volatile/motherboard_info.xml   FRU ID, extracted at BMC boot by mcst-fruid
@@ -33,7 +35,6 @@
 #define _GNU_SOURCE
 #include <endian.h>
 #include <errno.h>
-#include <stdarg.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -48,10 +49,9 @@
 #include <systemd/sd-bus.h>
 #endif
 
-#include "reimu-sensors.h"
+#include "rbuf.h"
 #ifndef PARSER_ONLY
 #include "reimu-pnsflash.h"
-#include "reimu-overheat.h"
 #include "reimu-view.h"
 #endif
 
@@ -67,80 +67,6 @@
 #define DTB_DEFAULTADDR 0x00700000U
 #define DTB_DEFAULTSIZE 0x00100000U
 #define MAX_TEXT        (256 * 1024)
-
-/* ------------------------------------------------------------------ */
-/* small growable string (struct buf: reimu-sensors.h)                 */
-
-void buf_add(struct buf *b, const char *s, size_t n)
-{
-    if (b->len + n + 1 > b->cap)
-    {
-        size_t cap = b->cap ? b->cap : 4096;
-        while (cap < b->len + n + 1) cap *= 2;
-        char *ns = realloc(b->s, cap);
-        if (!ns) return;
-        b->s = ns;
-        b->cap = cap;
-    }
-    memcpy(b->s + b->len, s, n);
-    b->len += n;
-    b->s[b->len] = 0;
-}
-
-void buf_str(struct buf *b, const char *s)
-{
-    buf_add(b, s, strlen(s));
-}
-
-void buf_printf(struct buf *b, const char *fmt, ...)
-{
-    char tmp[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
-    va_end(ap);
-    if (n > 0) buf_add(b, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
-}
-
-/* JSON string literal; invalid UTF-8 bytes are replaced with U+FFFD */
-void buf_json(struct buf *b, const char *s, size_t n)
-{
-    buf_add(b, "\"", 1);
-    for (size_t i = 0; i < n; i++)
-    {
-        unsigned char c = s[i];
-        char esc[8];
-        if (c == '"' || c == '\\')
-        {
-            esc[0] = '\\';
-            esc[1] = c;
-            buf_add(b, esc, 2);
-        }
-        else if (c == '\n') buf_add(b, "\\n", 2);
-        else if (c == '\t') buf_add(b, "\\t", 2);
-        else if (c < 0x20 || c == 0x7f)
-        {
-            snprintf(esc, sizeof(esc), "\\u%04x", c);
-            buf_add(b, esc, 6);
-        }
-        else if (c < 0x80) buf_add(b, (char *)&c, 1);
-        else
-        {
-            /* validate a UTF-8 sequence */
-            int len = (c & 0xe0) == 0xc0 ? 2 : (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 0;
-            int ok = len && i + len <= n;
-            for (int k = 1; ok && k < len; k++)
-                if ((s[i + k] & 0xc0) != 0x80) ok = 0;
-            if (ok)
-            {
-                buf_add(b, s + i, len);
-                i += len - 1;
-            }
-            else buf_add(b, "\xef\xbf\xbd", 3);
-        }
-    }
-    buf_add(b, "\"", 1);
-}
 
 static char *read_file(const char *path, size_t max, size_t *len)
 {
@@ -649,55 +575,6 @@ static char *build_json(void)
 }
 
 #ifndef PARSER_ONLY
-/* platform sensors (reimu-sensors.c): read only once the platform has run
- * SENS_SETTLE_S seconds (its power-up must not see BMC traffic on the bus),
- * at most every SENS_CACHE_S seconds whatever the number of viewers */
-#define SENS_SETTLE_S 30
-#define SENS_CACHE_S  3
-char *sensors_doc(int force)
-{
-    static char *cached;
-    static time_t cached_at;
-    time_t now = time(NULL);
-    long up = force ? -2 : host_running_s();
-    const char *platform = up == -1 ? "off" : up >= 0 && up < SENS_SETTLE_S ? "starting" : "on";
-    if (!strcmp(platform, "on") && cached && now - cached_at < SENS_CACHE_S && !force) return strdup(cached);
-    struct buf b = { 0 };
-    buf_printf(&b, "{\"version\":1,\"now\":%lld,\"platform\":\"%s\",", (long long)now, platform);
-    /* the BMC's own load: there with the host off as well */
-    double la[3];
-    FILE *lf = fopen("/proc/loadavg", "r");
-    if (lf && fscanf(lf, "%lf %lf %lf", &la[0], &la[1], &la[2]) == 3)
-        buf_printf(&b, "\"bmc\":{\"load\":[%.2f,%.2f,%.2f]},", la[0], la[1], la[2]);
-    if (lf) fclose(lf);
-    if (!strcmp(platform, "on")) sensors_json(&b);
-    else buf_str(&b, "\"sensors\":[]");
-    buf_str(&b, "}");
-    if (!strcmp(platform, "on") && b.s)
-    {
-        free(cached);
-        cached = strdup(b.s);
-        cached_at = now;
-    }
-    return b.s;
-}
-
-static int prop_sensors(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
-                        void *ud, sd_bus_error *err)
-{
-    (void)bus; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
-    char *j = sensors_doc(0);
-    int r = sd_bus_message_append(reply, "s", j ? j : "{}");
-    free(j);
-    return r;
-}
-
-static const sd_bus_vtable sensors_vtable[] = {
-    SD_BUS_VTABLE_START(0),
-    SD_BUS_PROPERTY("Json", "s", prop_sensors, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
-    SD_BUS_VTABLE_END
-};
-
 static char *last_json;
 
 /* the ПНС document for the web UI's view */
@@ -759,26 +636,6 @@ static int method_rescan(sd_bus_message *m, void *ud, sd_bus_error *err)
     return r;
 }
 
-static int method_journal(sd_bus_message *m, void *ud, sd_bus_error *err)
-{
-    (void)ud; (void)err;
-    const char *cur;
-    int32_t count;
-    int r = sd_bus_message_read(m, "si", &cur, &count);
-    if (r < 0) return r;
-    struct buf b = { 0 };
-    journal_json(&b, cur, count);
-    r = sd_bus_reply_method_return(m, "s", b.s ? b.s : "{}");
-    free(b.s);
-    return r;
-}
-
-static const sd_bus_vtable journal_vtable[] = {
-    SD_BUS_VTABLE_START(0),
-    SD_BUS_METHOD("Read", "si", "s", method_journal, SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_VTABLE_END
-};
-
 static const sd_bus_vtable pns_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_PROPERTY("Json", "s", prop_json, 0, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -799,17 +656,9 @@ static int run_daemon(void)
     g_bus = bus;
     r = sd_bus_add_object_vtable(bus, &slot, "/xyz/openbmc_project/reimu/pns", "xyz.openbmc_project.Reimu.Pns",
                                  pns_vtable, NULL);
-    if (r >= 0)
-        r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/sensors", "xyz.openbmc_project.Reimu.Sensors",
-                                     sensors_vtable, NULL);
-    if (r >= 0)
-        r = sd_bus_add_object_vtable(bus, NULL, "/xyz/openbmc_project/reimu/journal", "xyz.openbmc_project.Reimu.Journal",
-                                     journal_vtable, NULL);
     /* backups, upload, check and write of the flash (reimu-pnsflash.c) */
     if (r >= 0) r = pnsflash_register(bus);
-    /* the switch of overheatd's power actions, the reason of an emergency (reimu-overheat.c) */
-    if (r >= 0) r = overheat_register(bus);
-    /* what the web UI's pages show, one answer each (reimu-view.c) */
+    /* what the web UI's pages show that changes at a boot or a flash write (reimu-view.c) */
     if (r >= 0) r = view_register(bus);
     if (r >= 0) r = sd_bus_add_object_manager(bus, NULL, "/xyz/openbmc_project/reimu");
     if (r >= 0) r = sd_bus_request_name(bus, "xyz.openbmc_project.Reimu.Pns", 0);
@@ -860,21 +709,6 @@ int main(int argc, char **argv)
         return 0;
     }
 #ifndef PARSER_ONLY
-    if (argc == 2 && !strcmp(argv[1], "--sensors"))
-    {
-        char *j = sensors_doc(1);
-        if (j) puts(j);
-        free(j);
-        return 0;
-    }
-    if (argc >= 2 && argc <= 4 && !strcmp(argv[1], "--journal"))
-    {
-        struct buf b = { 0 };
-        journal_json(&b, argc > 3 ? argv[3] : "", argc > 2 ? atoi(argv[2]) : -20);
-        if (b.s) puts(b.s);
-        free(b.s);
-        return 0;
-    }
     if (argc == 3 && !strcmp(argv[1], "--view"))
     {
         sd_bus *bus = NULL;
@@ -890,9 +724,7 @@ int main(int argc, char **argv)
                     "       %s --parse <flash>    print ПНС flash partition table as JSON\n"
                     "       %s --fru <eeprom>     print FRU ID EEPROM image as XML\n"
                     "       %s --json             print the D-Bus JSON document\n"
-                    "       %s --sensors          read the platform sensors now (no power check)\n"
-                    "       %s --journal [n [cursor]]  print BMC journal entries (n < 0: before cursor)\n"
-                    "       %s --view live|static  print a document of the web UI's view\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                    "       %s --view static      print the static document of the web UI's view\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }

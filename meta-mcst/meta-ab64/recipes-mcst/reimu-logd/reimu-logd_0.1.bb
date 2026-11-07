@@ -1,5 +1,5 @@
 SUMMARY = "REIMU: the BMC's logs: a week of journal, the persistent event log, the diagnostic archive"
-DESCRIPTION = "reimu-logd follows the journal (RAM) and appends warnings and worse, the fan/heat/host link/update daemons' lines and a boot record (why the BMC started) to a small rate-limited log on the rwfs; serves it and reimu-diag's archive over D-Bus (REST, Administrators). journald: a week in RAM, nothing to the flash. Quiets the per-minute SoL rotation and a flapping sensor."
+DESCRIPTION = "reimu-logd serves the web UI its window of the journal; follows the journal (RAM) and appends warnings and worse, the fan/heat/host link/update daemons' lines and a boot record (why the BMC started) to a small rate-limited log on the rwfs; serves it and reimu-diag's archive over D-Bus (REST, Administrators). journald: a week in RAM, nothing to the flash. Quiets the per-minute SoL rotation."
 SECTION = "base"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0;md5=801f80980d171dd6425610833a22dbe6"
@@ -8,9 +8,16 @@ inherit systemd
 DEPENDS = "systemd"
 SYSTEMD_SERVICE_${PN} = "reimu-logd.service"
 
+# rbuf.c: shared with reimu-pns, reimu-hwmon
+FILESEXTRAPATHS_prepend := "${THISDIR}/../../../meta-common/recipes-mcst/reimu-common/files:"
+
 SRC_URI = " \
             file://Makefile \
             file://reimu-logd.c \
+            file://reimu-journal.c \
+            file://reimu-journal.h \
+            file://rbuf.c \
+            file://rbuf.h \
             file://ev-core.c \
             file://ev-core.h \
             file://reimu-logd.service \
@@ -43,11 +50,5 @@ ExecStart=
 ExecStart=/bin/sh -c 'while :; do /libexec/logrotate-sol; sleep 60; done'
 LogLevelMax=warning
 END
-  # a sensor that fails and recovers over and over: its two lines each time,
-  # about 10 per half an hour at most (journald scales the burst by the free
-  # space: 2.5 times at this journal's size)
-  d=${D}${systemd_system_unitdir}/xyz.openbmc_project.Hwmon@.service.d
-  install -d $d
-  printf '[Service]\nLogRateLimitIntervalSec=30min\nLogRateLimitBurst=4\n' > $d/reimu-rate.conf
 }
 FILES_${PN} = "/usr/sbin /usr/libexec ${sysconfdir}/dbus-1/system.d ${systemd_unitdir}/journald.conf.d ${systemd_system_unitdir}"

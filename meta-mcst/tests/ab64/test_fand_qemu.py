@@ -327,6 +327,63 @@ def t_bare():
         b.stop()
 
 
+DTB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "meta-common", "recipes-mcst", "reimu-hwmon",
+                   "files", "tests", "devtree-1.0.dtb")
+
+
+def dbus_sensors(b):
+    """reimu-hwmon's Sensor.Value objects: {type/name: value}"""
+    o = b.out("busctl call xyz.openbmc_project.Reimu.Hwmon / org.freedesktop.DBus.ObjectManager GetManagedObjects --json=short")
+    try:
+        objs = json.loads(o)["data"][0]
+    except (ValueError, KeyError, IndexError):
+        return {}
+    return {p[len("/xyz/openbmc_project/sensors/"):]: ifs["xyz.openbmc_project.Sensor.Value"]["Value"]["data"]
+            for p, ifs in objs.items() if "xyz.openbmc_project.Sensor.Value" in ifs}
+
+
+def handed_over(b):
+    """what reimu-fand read is what reimu-hwmon publishes (the board's device
+    tree: its names, the IPMI SDR config's), nothing read twice: reimu-hwmon
+    reads none of reimu-fand's chips"""
+    c, env = T.ssh_cmd("mkdir -p /run/systemd/system/reimu-hwmon.service.d && cat > /var/volatile/motherboard_devtree.dtb")
+    ok = subprocess.run(c, env=env, input=open(DTB, "rb").read(), capture_output=True, timeout=120).returncode == 0
+    b.ssh("printf '[Service]\\nEnvironment=REIMU_HWMON_SETTLE_SEC=3\\n' > /run/systemd/system/reimu-hwmon.service.d/t.conf && "
+          "systemctl daemon-reload && systemctl restart reimu-hwmon")
+    want = {"temperature/CPU0_Cores_0_1": 50, "temperature/CPU0_System_Commutator": 56,
+            "temperature/FAN_Control_X38_X39_X40_IOHUB_Temp": 83, "temperature/UNCORE_in_12V_temp1": 65,
+            "temperature/1V2_23_in_12V_temp1": 65, "fan_tach/CPU_FAN_Control_X37_fan1": 2000}
+    got = {}
+    end = time.time() + 40
+    while time.time() < end:
+        got = dbus_sensors(b)
+        if all(k in got for k in want):
+            break
+        time.sleep(2)
+    print("    reimu-hwmon: %s" % sorted(got.items()))
+    check(ok and all(k in got and abs(got[k] - v) < 1 for k, v in want.items()),
+          "reimu-fand's readings on D-Bus by reimu-hwmon, the device tree's names %s" % {k: got.get(k) for k in want})
+    check(not any(k.startswith("fan_tach/Fan_") for k in got), "the EMC2305 fans with no tachometer reading: not published")
+    # --json: busctl's plain output escapes the quotes of the labels
+    m = json.loads(b.out("busctl get-property xyz.openbmc_project.Reimu.Hwmon /xyz/openbmc_project/reimu/hwmon "
+                         "xyz.openbmc_project.Reimu.Hwmon Metrics --json=short") or '{"data":""}')["data"]
+    n0 = re.search(r"reimu_hwmon_transfers_total (\d+)", m)
+    j = json.loads(json.loads(b.out("busctl get-property xyz.openbmc_project.Reimu.Hwmon /xyz/openbmc_project/reimu/sensors "
+                                    "xyz.openbmc_project.Reimu.Sensors Json --json=short") or '{"data":"{}"}')["data"])
+    srcs = {x["src"] for x in j.get("sensors", [])}
+    check({"6-004c", "2-004c", "2-002c", "2-002e", "5-0020"} <= srcs and "reimu_temperature_celsius{sensor=\"CPU0_Cores_0_1\"" in m,
+          "the web UI's document and the metrics have them (%s)" % sorted(srcs))
+    print("    reimu-hwmon transfers so far: %s (its own chips: the PMBus rails of the VRMs, 6-0060)" % (n0.group(1) if n0 else "?"))
+    # an input of reimu-fand's going: off D-Bus within STALE_SEC and a poll
+    b.temps(t26=0)
+    end = time.time() + 20
+    while time.time() < end and "temperature/CPU0_System_Commutator" in dbus_sensors(b):
+        time.sleep(1)
+    check("temperature/CPU0_System_Commutator" not in dbus_sensors(b), "a PCS sensor reading 0: off D-Bus")
+    b.temps(t26=56)
+    b.ssh("rm -f /run/systemd/system/reimu-hwmon.service.d/t.conf; systemctl daemon-reload")
+
+
 def t_board():
     b = Bmc("fand-board", fresh("fand-board"), chips=True).start()
     try:
@@ -370,6 +427,7 @@ def t_board():
               "TACH_MODE accurate on the CPU fan chip (0x4A 0x2b -> 0x2a), the other untouched")
         check(abs((cpu["fans"][0]["rpm"] or 0) - 2000) < 1, "CPU fan rpm %s" % cpu["fans"][0]["rpm"])
         check(b.led() == "none", "LED off")
+        handed_over(b)
 
         # D-Bus control
         check(b.busctl("SetDuty", "sd", "cpu", "60").returncode == 0, "SetDuty cpu 60")

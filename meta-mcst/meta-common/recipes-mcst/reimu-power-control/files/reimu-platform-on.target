@@ -1,0 +1,6 @@
+[Unit]
+Description=REIMU platform powered
+# started by reimupwr at platform power-on, stopped at power-off; what runs
+# only while the platform is powered is PartOf it: hwmon-instantiator (where
+# it is in the image), the FRU ID read at power-on (reimu-fru-power)
+Wants=hwmon-instantiator.service reimu-fru-power.service

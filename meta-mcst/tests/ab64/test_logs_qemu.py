@@ -153,23 +153,32 @@ def t_retention(b):
     b.ssh("rm -f %s" % p)
 
 
-# ------------------------------------------------------------------ hwmon's lines
+# ------------------------------------------------------------------ a flapping sensor's lines
 def t_flap(b):
+    b.load_lm()
     b.transition("On")
     wait(lambda: len(b.sensors()) >= 4, 300, 5)
     time.sleep(10)
-    n0 = int(b.out("journalctl -b --no-pager -o cat -t phosphor-hwmon-readd | wc -l").strip() or 0)
-    # pcs1 reading 0 is a failing read (l_pcs_i2c EIO, REMOVERCS): 2 min of flapping
-    t = time.time()
-    while time.time() - t < 120:
-        b.temperature("pcs1", 0)
-        time.sleep(4)
-        F.pcs_warm(b)
-        time.sleep(4)
-    n1 = int(b.out("journalctl -b --no-pager -o cat -t phosphor-hwmon-readd | wc -l").strip() or 0)
-    u = b.out("systemctl show -p LogRateLimitBurst -p LogRateLimitIntervalUSec 'xyz.openbmc_project.Hwmon@-x.service' 2>/dev/null | tr '\\n' ' '")
-    print("    %d phosphor-hwmon lines in 2 min of a flapping sensor (%s)" % (n1 - n0, u))
-    check(n1 - n0 <= 20, "a flapping sensor's lines are limited (%d in 2 min)" % (n1 - n0))
+    lines = "journalctl -b --no-pager -o cat -u reimu-fand -u reimu-hwmon | wc -l"
+
+    def flap(fail, ok, secs):
+        """pcs1 failing (reads 0) fail s, reading ok s, for secs: the lines logged, the cycles"""
+        n0, t, k = int(b.out(lines).strip() or 0), time.time(), 0
+        while time.time() - t < secs:
+            b.temperature("pcs1", 0)
+            time.sleep(fail)
+            F.pcs_warm(b)
+            time.sleep(ok)
+            k += 1
+        return int(b.out(lines).strip() or 0) - n0, k
+    # shorter than STALE_SEC (5 s): a reading missed now and then is no failure
+    n, k = flap(3, 3, 60)
+    print("    %d lines of reimu-fand and reimu-hwmon in %d failures of 3 s" % (n, k))
+    check(n <= 2, "failures shorter than STALE_SEC: no lines (%d in a minute)" % n)
+    # longer: a failure and its end said once each (the sensor, its zones), not every poll
+    n, k = flap(9, 4, 60)
+    print("    %d lines in %d failures of 9 s" % (n, k))
+    check(n <= 7 * k, "a failure of 9 s: its lines once, not a line a poll (%d in %d)" % (n, k))
     F.pcs_warm(b)
     b.transition("Off")
     wait(lambda: not b.sensors(), 120, 5)

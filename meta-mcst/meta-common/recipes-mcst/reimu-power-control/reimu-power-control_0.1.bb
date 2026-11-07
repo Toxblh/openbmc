@@ -18,6 +18,7 @@ SRC_URI = " \
             file://Makefile \
             file://reimupwr.c \
             file://reimupwr.service \
+            file://reimu-platform-on.target \
           "
 
 S = "${WORKDIR}"
@@ -27,7 +28,7 @@ do_install_append() {
   install -d ${D}/var/lib/reimu
   install -d ${D}${systemd_system_unitdir}
   install -m 755 reimupwr ${D}/sbin
-  install -m 644 reimupwr.service ${D}${systemd_system_unitdir}
+  install -m 644 reimupwr.service reimu-platform-on.target ${D}${systemd_system_unitdir}
 }
 
 FILES_${PN} = "/sbin /var/lib/reimu ${systemd_system_unitdir}"

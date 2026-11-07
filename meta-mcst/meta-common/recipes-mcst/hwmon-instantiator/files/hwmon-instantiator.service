@@ -2,9 +2,9 @@
 Description=Sensor instantiator for phosphor-hwmon
 After=systemd-udevd.service
 After=mcst-fruid.service
-# started at platform power-on, stopped at power-off (reimupwr); the FRU ID
-# is read then too, if it wasn't at boot
-Wants=reimu-fru-power.service
+# started at platform power-on, stopped at power-off: reimu-platform-on.target
+# (reimupwr)
+PartOf=reimu-platform-on.target
 # and the sensors not ready at the first try get more tries
 Wants=hwmon-instantiator-rescan.service
 

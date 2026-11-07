@@ -37,6 +37,7 @@ CONTAINER_SUITES = {"test_static": ["python3", AB + "/test_static.py"], "test_ab
                     # the USB network to the host (reimu-usbnet against a fake configfs)
                     "test_reimu_usbnet": ["python3", AB + "/../../meta-common/recipes-mcst/reimu-usbnet/files/tests/test_usbnet.py"]}
 WWW = "meta-common/recipes-phosphor/reimu-webui/files/www"
+HWMON_TESTS = "meta-common/recipes-mcst/reimu-hwmon/files/tests"
 QEMU_SUITES = ["ab", "agentux", "docs_smoke", "fand", "fru_sensors", "hostlink", "ipmi_redfish",
                "kvm_hid", "logs", "overheatd", "pns", "regressions", "usbnet"]
 # bug-for-bug: stock + new need both images, the group list below is the new one's
@@ -157,7 +158,9 @@ def main():
     os.makedirs(out)
     src, img = os.path.join(out, "src"), os.path.join(WORK, "runs", "image")
     os.makedirs(src)
-    subprocess.check_call("docker exec %s tar -C %s/.. -cf - meta-mcst/tests meta-mcst/tools meta-mcst/%s | tar -xf - -C %s" % (DOCKER, TREE, WWW, src), shell=True)
+    # (+ the device trees the sensor tests give the BMC)
+    subprocess.check_call("docker exec %s tar -C %s/.. -cf - meta-mcst/tests meta-mcst/tools meta-mcst/%s meta-mcst/%s | tar -xf - -C %s"
+                          % (DOCKER, TREE, WWW, HWMON_TESTS, src), shell=True)
     os.makedirs(img, exist_ok=True)
     gone = [n for n in FIXTURES if not os.path.exists(os.path.join(WORK, "fixtures", n))]
     if gone or not chromium() or not os.path.isdir(os.path.join(WORK, "e2e/node_modules/playwright")):

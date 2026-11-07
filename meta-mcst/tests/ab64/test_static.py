@@ -83,6 +83,7 @@ class Ctx:
         self.fruid_seds = True
         self.libreimu_patched = True
         self.fand_mutant = None
+        self.hwmon_mutant = None
         self.backup_flip = None  # a file of the backup read with a bit flipped
 
     def src(self, rel):
@@ -928,10 +929,14 @@ FAND_MUTANTS = [
     ("35j", "fand.c", "cfg = rb >= 0 ? rb : wr ? cfg : want;", "cfg = rb >= 0 ? rb : cfg;", "bug 76: 0x4A written, not read back: taken as inverted, the fan stopped by a 0"),
     ("35k", "fand.c", "return hw_now_ms() < (k ? s_fs_chip_end : s_fs_hard_end);", "return 1;", "bug 76: the fail-safe not limited in time (18 s on dead buses, TimeoutStopSec=15)"),
     ("35l", "fand.c", 'fand_log(3, "fail-safe: fan %d-%04x: PWPGM', 'fand_log(5, "fail-safe: fan %d-%04x: PWPGM', "bug 76: PWPGM that can't be set not said at error level"),
+    ("35m", "fand.c", "if (raw == o->raw && o->ok && o->wr_at && f->now - o->wr_at < EMC_KEEPALIVE_MS && hw_rd_byte(b, a, 0x30) == raw) return 0;",
+     "", "bug 138: the EMC2305 drive written and read back every poll (half the shared bus's traffic)"),
+    ("35n", "fand.c", "    if (f->phase != PH_RUN) return 0;\n    for (int g = 0; g < NGROUPS; g++)\n    {\n        if (g == G_GPU) continue;",
+     "    return 0;\n    for (int g = 0; g < NGROUPS; g++)\n    {\n        if (g == G_GPU) continue;", "bug 139: nothing of what reimu-fand reads handed over (others read its chips again)"),
 ]
 
 
-@check("S35", 35, "reimu-fand unit tests (tests/test_fand.c, ASan): PWM scale, tach after a failed readback, tach dropouts, tach mode")
+@check("S35", 35, "reimu-fand unit tests (tests/test_fand.c, ASan): PWM scale, tach after a failed readback, tach dropouts, tach mode, the bus cost, the readings handed over")
 def s35(ctx):
     if not shutil.which("gcc"):
         raise Skip("no gcc")
@@ -954,6 +959,77 @@ for _id, _f, _old, _new, _what in FAND_MUTANTS:
     def _m(ctx, f=_f, old=_old, new=_new):
         ctx.fand_mutant = (f, old, new)
     next(c for c in CHECKS if c[0] == "S35")[4].append(("%s: %s" % (_id, _what), _m))
+
+
+HWMON = os.path.join(COMMON, "recipes-mcst", "reimu-hwmon", "files")
+
+
+@check("S74", 139, "reimu-hwmon unit tests (tests/test_hwmon.c, ASan): the device trees 1.0 and 2.0, its chips (fake), the sensors' names = the IPMI SDR config's paths, the documents")
+def s74(ctx):
+    if not shutil.which("gcc"):
+        raise Skip("no gcc")
+    w = os.path.join(TMP, "hwmon")
+    shutil.rmtree(w, ignore_errors=True)
+    shutil.copytree(HWMON, w)
+    common = os.path.join(COMMON, "recipes-mcst", "reimu-common", "files")
+    yaml = os.path.join(ROOT, "meta-mcst/meta-ab64/recipes-phosphor/ipmi/reimu-ab-ipmi-sensor-inventory/config.yaml")
+    if ctx.hwmon_mutant:
+        f, old, new = ctx.hwmon_mutant
+        t = open(os.path.join(w, f)).read()
+        if old not in t:
+            raise Skip("mutant: %r not in %s" % (old, f))
+        open(os.path.join(w, f), "w").write(t.replace(old, new))
+    r = subprocess.run(["make", "-s", "-C", w, "test", "COMMON=" + common, "IPMI_YAML=" + yaml], capture_output=True, text=True,
+                       timeout=600)
+    fails = [l.strip() for l in r.stdout.splitlines() if "FAIL" in l]
+    summary = (r.stdout.strip().splitlines() or [""])[-1]
+    return r.returncode == 0 and not fails and "no $IPMI_YAML" not in r.stdout, "%s%s" % (
+        summary[:120], ("; " + " | ".join(fails[:3])[:300]) if fails else "")
+
+
+HWMON_MUTANTS = [
+    ("M1", "hwmon-model.c", 'object_name(x, e->oname, sizeof(e->oname), devlabel, dlabel);',
+     'snprintf(e->oname, sizeof(e->oname), "%s", dlabel);', "D-Bus names without the device's label (not the SDR's paths)"),
+    ("M2", "hwmon-dt.c", 'if (strstr(compat, "ir3806")) return DK_IR3806X;', 'if (!strcmp(compat, "ir38064")) return DK_IR3806X;',
+     "device tree 2.0's \"infineon,ir38064\" not taken"),
+    ("M3", "hwmon-model.c", "        add(x, find(x, d->bus, d->addr + k, \"temp1\"), \"temp\", group, name, src, d->label, en);",
+     "        add(x, find(x, d->bus, d->addr, \"temp1\"), \"temp\", group, name, src, d->label, en);", "every PCS sensor given the first one's reading"),
+]
+for _id, _f, _old, _new, _what in HWMON_MUTANTS:
+    def _m(ctx, f=_f, old=_old, new=_new):
+        ctx.hwmon_mutant = (f, old, new)
+    next(c for c in CHECKS if c[0] == "S74")[4].append(("%s: %s" % (_id, _what), _m))
+
+
+@check("S75", 139, "one reader per platform chip: no hwmon-instantiator or phosphor-hwmon in the image, nothing loads a platform chip's driver (l_pcs_i2c: overheatd's tests only); reimu-fand and reimu-hwmon are")
+def s75(ctx):
+    there = [p for p in ("/sbin/hwmon-instantiator", "/usr/bin/phosphor-hwmon-readd", "/usr/bin/start_hwmon.sh",
+                         "/lib/systemd/system/hwmon-instantiator.service", "/lib/systemd/system/xyz.openbmc_project.Hwmon@.service")
+             if ctx.fs(p) is not None]
+    loads = []
+    for d in ("/etc/modules-load.d", "/usr/lib/modules-load.d", "/lib/modules-load.d", "/lib/systemd/system", "/etc/systemd/system"):
+        for n in ctx.fs_list(d):
+            b = ctx.fs(d + "/" + n) or b""
+            if re.search(rb"l[-_]pcs[-_]i2c|\blm63\b|new_device", b):
+                loads.append(d + "/" + n)
+    ours = all(ctx.fs(p) is not None for p in ("/usr/sbin/reimu-fand", "/usr/sbin/reimu-hwmon", "/lib/systemd/system/reimu-hwmon.service"))
+    return not there and not loads and ours, "the old path: %s; loading a platform driver: %s; reimu-fand, reimu-hwmon: %s" % (
+        there or "none", loads or "none", ours)
+
+
+@mutant("S75", "phosphor-hwmon left in the image (obmc-sensors)")
+def _(ctx):
+    ctx.rootfs["/usr/bin/phosphor-hwmon-readd"] = b"\x7fELF"
+
+
+@mutant("S75", "hwmon-instantiator left in the image")
+def _(ctx):
+    ctx.rootfs["/sbin/hwmon-instantiator"] = b"\x7fELF"
+
+
+@mutant("S75", "the l_pcs_i2c module loaded at boot")
+def _(ctx):
+    ctx.rootfs["/etc/modules-load.d/l-pcs-i2c.conf"] = b"l-pcs-i2c\n"
 
 
 # ------------------------------------------------------------------ native tests of the power code

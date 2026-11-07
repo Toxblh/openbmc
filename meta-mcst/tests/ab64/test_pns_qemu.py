@@ -1007,7 +1007,7 @@ def t_autopower(b):
 # ------------------------------------------------------------------ restart policy
 # (unit, RestartUSec as its own file declares it) for the units that set
 # their own; the rest: reimu-restart-policy's 5 s
-OWN_RESTART = {"reimupwr": "2s", "reimu-kvm": "10s", "reimu-pnsd": "5s", "reimu-serial": "2s",
+OWN_RESTART = {"reimupwr": "2s", "reimu-kvm": "10s", "reimu-pnsd": "5s", "reimu-hwmon": "5s", "reimu-serial": "2s",
                "xyz.openbmc_project.Chassis.Buttons": "3s", "xyz.openbmc_project.ObjectMapper": "5s"}
 
 

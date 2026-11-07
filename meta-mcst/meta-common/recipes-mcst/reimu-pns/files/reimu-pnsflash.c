@@ -52,7 +52,7 @@
 #include <unistd.h>
 #include <systemd/sd-bus.h>
 
-#include "reimu-sensors.h"
+#include "rbuf.h"
 #include "reimu-pnsflash.h"
 
 #define PF_PATH  "/xyz/openbmc_project/reimu/pns_flash"

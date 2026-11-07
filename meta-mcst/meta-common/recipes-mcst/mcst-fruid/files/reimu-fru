@@ -10,8 +10,8 @@
 #                    is the host's then). The FRU ID only at a cold boot of a
 #                    powered platform: unpowered, the EEPROM doesn't answer and
 #                    stalls the bus, and a running platform uses that bus.
-#   reimu-fru power  reimu-fru-power.service, pulled in by hwmon-instantiator
-#                    at platform power-on: the FRU ID once the platform has run
+#   reimu-fru power  reimu-fru-power.service, pulled in by
+#                    reimu-platform-on.target at platform power-on: the FRU ID once the platform has run
 #                    FRU_SETTLE seconds (its boot loader uses the bus early),
 #                    if it wasn't read yet. Stopped at power-off. And the
 #                    time: a BMC that lost its standby power with the platform

@@ -47,6 +47,15 @@ OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-pns-flash"
 # reimu-fand owns them
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-fand"
 IMAGE_FEATURES_remove = "obmc-fan-control"
+# the platform's sensors: each chip read by one daemon, every reading given to
+# all (Redfish, IPMI, the web UI, metrics): reimu-fand reads the fans' chips
+# and the PCS, reimu-hwmon the rest and publishes them. No kernel driver bound
+# to the platform's chips (the lm63 driver polled the fan chips reimu-fand
+# drives), no phosphor-hwmon pollers. (The l_pcs_i2c module stays, loaded by
+# nobody: overheatd still reads a device tree that binds it.)
+OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-hwmon"
+OBMC_IMAGE_EXTRA_INSTALL_remove = "hwmon-instantiator"
+IMAGE_FEATURES_remove = "obmc-sensors"
 # the host agent's link (reimu-hostd on the host, meta-mcst/tools/host):
 # inventory, health, GPU sensors and fan policy, events
 OBMC_IMAGE_EXTRA_INSTALL_append = " reimu-hostlink"

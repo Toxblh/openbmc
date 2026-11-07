@@ -1,4 +1,4 @@
-// The BMC's view (reimu-pnsd: /xyz/openbmc_project/reimu/view/live and
+// The BMC's view (reimu-hwmon: /xyz/openbmc_project/reimu/view/live; reimu-pnsd:
 // /static): what the pages read, gathered on the BMC into one answer instead
 // of 10-20 requests through bmcweb. The pages keep asking for the same URLs:
 // api.get answers those the view has from it, in the shape bmcweb gives them

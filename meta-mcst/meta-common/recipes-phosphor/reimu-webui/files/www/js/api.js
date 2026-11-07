@@ -48,7 +48,7 @@ function release() {
 }
 
 // What the BMC's view answers (lib/view.js): these URLs come from it, one
-// request (reimu-pnsd's view/live) for all of them, again after VIEW_TTL; its
+// request (reimu-hwmon's view/live) for all of them, again after VIEW_TTL; its
 // static part only when its version changes. A BMC without the view: bmcweb.
 const VIEW = "/xyz/openbmc_project/reimu/view";
 const VIEWED = new RegExp(

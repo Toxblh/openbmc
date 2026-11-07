@@ -1,0 +1,16 @@
+[Unit]
+Description=REIMU platform sensors (Redfish, IPMI, the web UI, metrics)
+# the device tree of the platform (reimu-fru)
+After=mcst-fruid.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=dbus
+BusName=xyz.openbmc_project.Reimu.Hwmon
+ExecStart=/usr/sbin/reimu-hwmon
+# back 5 s after any exit, no start limit
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

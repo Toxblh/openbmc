@@ -9,9 +9,10 @@ let showIdle = false;
 
 const num = (v, d = 1) => (v === undefined || v === null ? "—" : Number(v).toFixed(d));
 
-// Platform sensors read by reimu-pnsd from the ПНС device tree's devices
-// (Redfish has none on boards whose device tree hwmon-instantiator does not
-// understand). Shared with the overview page.
+// Platform sensors of the ПНС device tree's devices, as reimu-hwmon read them
+// last (reimu-fand reads the fans' chips and the PCS), with their groups and
+// limits (Redfish has the same values, by D-Bus names). Shared with the
+// overview page.
 export async function platformSensors() {
   try {
     const r = await api.get("/xyz/openbmc_project/reimu/sensors");
@@ -28,7 +29,7 @@ const STATUS = {
   na: { State: "нет сигнала" },
 };
 
-// reimu-pnsd sensor -> row of the tables below
+// reimu-hwmon sensor -> row of the tables below
 export function rowOf(s) {
   return { group: s.group, name: s.name, src: s.src, value: s.value, warn: s.warn, crit: s.crit, duty: s.duty, status: STATUS[s.status] || {} };
 }
@@ -152,7 +153,7 @@ function table(title, rows, unit, digits, opts = {}) {
 }
 
 function platformNote(p) {
-  if (!p) return h("div", { class: "note warn section" }, "Сервис reimu-pnsd недоступен: показаны только датчики из Redfish.");
+  if (!p) return h("div", { class: "note warn section" }, "Сервис reimu-hwmon недоступен: показаны только датчики из Redfish.");
   if (p.platform === "off") return h("div", { class: "note section" }, "Платформа выключена: её датчики питаются от неё и читаются только при включённом питании.");
   if (p.platform === "starting") return h("div", { class: "note section" }, "Платформа включается: датчики начнут читаться через ~30 с после включения, чтобы не мешать её запуску на шине I²C.");
   if (p.error) return h("div", { class: "note warn section" }, `Датчики платформы не прочитаны: ${p.error === "no device tree" ? "нет devtree ПНС (/var/volatile/motherboard_devtree.dtb)" : p.error}`);

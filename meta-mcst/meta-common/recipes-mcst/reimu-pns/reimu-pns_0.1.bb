@@ -13,19 +13,21 @@ DEPENDS = "systemd"
 RDEPENDS_${PN} += "bash gpio-funcs mcst-fruid"
 SYSTEMD_SERVICE_${PN} = "reimu-pnsd.service"
 
+# rbuf.c, dbusjson.c: shared with reimu-hwmon
+FILESEXTRAPATHS_prepend := "${THISDIR}/../reimu-common/files:"
+
 SRC_URI = " \
             file://LICENSE \
             file://Makefile \
             file://reimu-pnsd.c \
-            file://reimu-sensors.c \
-            file://reimu-journal.c \
-            file://reimu-sensors.h \
             file://reimu-pnsflash.c \
             file://reimu-pnsflash.h \
-            file://reimu-overheat.c \
-            file://reimu-overheat.h \
             file://reimu-view.c \
             file://reimu-view.h \
+            file://rbuf.c \
+            file://rbuf.h \
+            file://dbusjson.c \
+            file://dbusjson.h \
             file://reimu-pns-scan \
             file://reimu-pnsd.service \
             file://xyz.openbmc_project.Reimu.Pns.conf \

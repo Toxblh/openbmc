@@ -1027,7 +1027,7 @@ def t_latch(b):
     all_temps(b, 96)
     check(wait_seen(b, lambda s: not s["power"], 25) and latched(b), "96 °C again: forced off, the marker")
     all_temps(b, 50)
-    check(b.ssh("busctl call xyz.openbmc_project.Reimu.Pns %s xyz.openbmc_project.Reimu.Overheat ClearEmergency" % OBJ).returncode == 0
+    check(b.ssh("busctl call xyz.openbmc_project.Reimu.Hwmon %s xyz.openbmc_project.Reimu.Overheat ClearEmergency" % OBJ).returncode == 0
           and not latched(b), "D-Bus ClearEmergency: the marker gone, the host stays off (%s)" % b.seen()["power"])
     s = b.wait_state(lambda s: "<emergency>" not in s["xml"], 10)
     check("<emergency>" not in s["xml"], "... not in the state file any more")

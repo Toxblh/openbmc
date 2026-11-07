@@ -17,12 +17,20 @@ AB_HTTPS as for test_ab_qemu.py (RQ short: QMP sockets are AF_UNIX, at most
 
 The emulated platform: the EEPROM and the sensors answer whether it is
 powered or not (QEMU can't power a device off), so "off" is what the BMC must
-not touch: nothing may read the EEPROM then, and the sensors may only be
-instantiated once it is powered. Stand-ins (the device tree of the board):
-tmp105 for the lm96163 at 2-004c and 6-004c, and for the E8C2 PCS sensors
-5-0020 and 5-0021 (5-0022..0026 don't answer); a tmp105's reading (9 bits by
-default) as a PCS one: register / 8 °C. No stand-in for the PMBus devices
-(QEMU's fail the pmbus driver's chip identification).
+not touch: nothing may read the EEPROM then, and the sensors may only be read
+once it has run SETTLE_SEC. Stand-ins (the device tree of the board): the
+lm96163 at 2-004c and 6-004c as register files (at24c, 256 bytes, loaded over
+I2C as in test_fand_qemu.py: their ID, setup and local temperature), tmp105s
+for the E8C2 PCS sensors 5-0020 and 5-0021 (5-0022..0026 don't answer); a
+tmp105's reading (9 bits by default) as a PCS one: register / 8 °C. No
+stand-in for the PMBus devices or the EMC2305 (reimu-fand fails safe without
+them: no matter here).
+
+The sensors' path (beta7 on): reimu-fand reads the fans' chips and the PCS
+and hands its Readings to reimu-hwmon, which names them from the device tree
+(the names hwmon-instantiator gave phosphor-hwmon: the IPMI SDR config's
+paths) and publishes them; no kernel driver is bound to a platform chip, no
+I2C client is made.
 
 Tests (all by default):
 
@@ -41,10 +49,10 @@ Tests (all by default):
             FRU's but doesn't reboot (the platform would be reset)
   nopns     the PNS flash blank (a kexec: the flash is the host's): the
             device tree read before is used, sensors work
-  offearly  power cuts 2, 10, 35, 45 s after power-on (hwmon-instantiator
-            settling or instantiating): nothing left; then the full set
-  slowbind  a driver binding late, a chip answering late: the sensors come in
-            the same power cycle (hwmon-instantiator-rescan), nothing half-made
+  offearly  power cuts 2, 10, 35, 45 s after power-on (settling or reading):
+            nothing left; then the full set
+  slowbind  a chip answering late: its sensor comes in the same power cycle;
+            power cut meanwhile: nothing left
   freeze    QEMU stopped 70 s: a silent watchdog reset; 20 s: nothing
   resetcause  a forced WDT1 expiry, reboot -f, a QMP reset: recorded as such
   noeeprom  the platform on, no FRU EEPROM: no failed unit, boot not held
@@ -63,6 +71,19 @@ FRU_MAC = "98:A7:B0:06:0F:7E"  # FRU base 98:A7:B0:06:0F:60 + 0x1E (set_mac)
 EXPECT_SENSORS = {"CPU_FAN_Control_X37_Internal_Temp", "FAN_Control_X38_X39_X40_Internal_Temp",
                   "CPU0_Cores_0_1", "CPU0_Cores_2_3"}
 PLATFORM_DEVS = ["2-002c", "2-002e", "2-0058", "2-0059", "2-004c", "6-004c", "6-0060"] + ["5-%04x" % a for a in range(0x20, 0x27)]
+HWMON = "xyz.openbmc_project.Reimu.Hwmon"
+
+
+def lm96163_regs(local, remote):
+    """an LM96163's registers as reimu-fand wants them (test_fand_qemu.py)"""
+    r = bytearray(256)
+    r[0xfe], r[0xff] = 0x01, 0x49
+    r[0x4a], r[0x4d], r[0x03] = 0x2b, 0x17, 0x06
+    r[0x04], r[0x05], r[0x07], r[0x19], r[0x21] = 0x08, 0x46, 0x69, 0x6e, 0x0a
+    r[0x4c] = 0x2e
+    r[0x00], r[0x01] = local, remote
+    r[0x46], r[0x47] = 0x8c, 0x0a
+    return r
 
 
 def sha(path):
@@ -199,8 +220,9 @@ class Platform(ab.Bmc):
         # the platform RTC (mcp7940x in its device tree): a ds1338 has its
         # time registers
         dev += ["-device", "ds1338,bus=aspeed.i2c.bus.3,address=0x6f,id=rtc"]
-        dev += ["-device", "tmp105,bus=aspeed.i2c.bus.2,address=0x4c,id=lm2",
-                "-device", "tmp105,bus=aspeed.i2c.bus.6,address=0x4c,id=lm6",
+        # the lm96163s: register files (loaded by load_lm())
+        dev += ["-device", "at24c-eeprom,bus=aspeed.i2c.bus.2,address=0x4c,rom-size=256",
+                "-device", "at24c-eeprom,bus=aspeed.i2c.bus.6,address=0x4c,rom-size=256",
                 "-device", "tmp105,bus=aspeed.i2c.bus.5,address=0x20,id=pcs0",
                 "-device", "tmp105,bus=aspeed.i2c.bus.5,address=0x21,id=pcs1"]
         self.p = subprocess.Popen(
@@ -304,6 +326,26 @@ class Platform(ab.Bmc):
     def temperature(self, dev, mc):
         self.qmp(("qom-set", {"path": "/machine/peripheral/" + dev, "property": "temperature", "value": mc}))
 
+    def load_lm(self, local2=45, local6=38):
+        """the lm96163 stand-ins' registers, over I2C from the BMC (the
+        platform off: before anything reads them)"""
+        cmds = []
+        for bus, local, remote in ((2, local2, 83), (6, local6, 39)):
+            cmds += ["i2cset -f -y %d 0x4c 0x%02x 0x%02x" % (bus, r, v) for r, v in enumerate(lm96163_regs(local, remote)) if v]
+        return self.ssh(" && ".join(cmds), timeout=300).returncode == 0
+
+    def lm_local(self, bus, t):
+        return self.ssh("i2cset -f -y %d 0x4c 0x00 %d" % (bus, t)).returncode == 0
+
+    def hwmon_transfers(self):
+        """the I2C transfers reimu-hwmon made (its Metrics), None: no answer"""
+        m = re.search(r"reimu_hwmon_transfers_total (\d+)", self.out(
+            "busctl get-property %s /xyz/openbmc_project/reimu/hwmon %s Metrics" % (HWMON, HWMON)).replace("\\n", "\n"))
+        return int(m.group(1)) if m else None
+
+    def restarts(self, *units):
+        return self.out("systemctl show -p NRestarts --value %s" % " ".join(units)).split()
+
     # -------------------------------------------------------------- BMC side
     def host_state(self):
         return self.out("busctl get-property xyz.openbmc_project.State.Host /xyz/openbmc_project/state/host0 "
@@ -339,7 +381,7 @@ class Platform(ab.Bmc):
                      "xyz.openbmc_project.ObjectMapper GetSubTree sias /xyz/openbmc_project/sensors 0 1 "
                      "xyz.openbmc_project.Sensor.Value | grep -o '\"/xyz/openbmc_project/sensors/[^\"]*\"' | tr -d '\"'); do "
                      "s=$(busctl call xyz.openbmc_project.ObjectMapper /xyz/openbmc_project/object_mapper "
-                     "xyz.openbmc_project.ObjectMapper GetObject sas $p 0 | grep -o '\"xyz.openbmc_project.Hwmon[^\"]*\"' | tr -d '\"'); "
+                     "xyz.openbmc_project.ObjectMapper GetObject sas $p 0 | grep -o '\"xyz.openbmc_project.Reimu.Hwmon\"' | tr -d '\"'); "
                      "[ -n \"$s\" ] && echo ${p##*/} $(busctl get-property $s $p xyz.openbmc_project.Sensor.Value Value | cut -d' ' -f2); done")
         r = {}
         for l in o.splitlines():
@@ -355,12 +397,9 @@ class Platform(ab.Bmc):
         o = self.out(r"""
             echo clients $(ls /sys/bus/i2c/devices | grep -c -- -)
             echo hwmon $(ls /sys/class/hwmon | wc -l)
-            echo readd $(pidof phosphor-hwmon-readd | wc -w)
-            echo units $(systemctl list-units --state=active --no-legend --plain 'xyz.openbmc_project.Hwmon@*' | wc -l)
-            echo confs $(find /etc/default/obmc/hwmon/ -name '*.conf*' | wc -l)
             echo procs $(ls -d /proc/[0-9]* | wc -l)
             echo avail $(awk '/MemAvailable/{print $2}' /proc/meminfo)
-            echo rss $( (for n in systemd-udevd dbus-daemon mapperx reimupwr reimu-pnsd phosphor-host-state-manager phosphor-chassis-state-manager overheatd; do p=$(pidof -s $n) && awk '/VmRSS/{print $2}' /proc/$p/status; done; awk '/VmRSS/{print $2}' /proc/1/status) 2>/dev/null | awk '{s+=$1} END {print s}')
+            echo rss $( (for n in systemd-udevd dbus-daemon mapperx reimupwr reimu-pnsd reimu-hwmon reimu-fand phosphor-host-state-manager phosphor-chassis-state-manager overheatd; do p=$(pidof -s $n) && awk '/VmRSS/{print $2}' /proc/$p/status; done; awk '/VmRSS/{print $2}' /proc/1/status) 2>/dev/null | awk '{s+=$1} END {print s}')
             echo fds $(ls /proc/1/fd | wc -l)
             """)
         return dict((l.split()[0], int(l.split()[1])) for l in o.splitlines() if len(l.split()) == 2)
@@ -377,15 +416,15 @@ def journal(b, unit):
     return b.out("journalctl -b -o cat -u %s" % unit)
 
 
-def fast(b, settle=5, fru_settle=5, tries=2, rescan="3600"):
-    """shorter settle times (a drop-in in /run, gone at the next boot)"""
-    # (the rescan far off: its passes make clients come and go)
-    b.ssh("mkdir -p /run/systemd/system/hwmon-instantiator-rescan.service.d && "
-          "printf '[Service]\\nEnvironment=\"RESCAN=%s\"\\n' > /run/systemd/system/hwmon-instantiator-rescan.service.d/test.conf" % rescan)
-    b.ssh("mkdir -p /run/systemd/system/hwmon-instantiator.service.d /run/systemd/system/reimu-fru-power.service.d && "
-          "printf '[Service]\\nEnvironment=SETTLE=%d\\n' > /run/systemd/system/hwmon-instantiator.service.d/test.conf && "
+def fast(b, settle=5, fru_settle=5, tries=2):
+    """shorter settle times: reimu-fand's SETTLE_SEC (its config, reloaded),
+    reimu-hwmon's and reimu-fru-power's (drop-ins in /run, gone at the next
+    boot; reimu-hwmon restarted)"""
+    b.ssh("sed -i '/^SETTLE_SEC=/d' /etc/reimu-fand.conf && echo SETTLE_SEC=%d >> /etc/reimu-fand.conf && systemctl reload reimu-fand" % settle)
+    b.ssh("mkdir -p /run/systemd/system/reimu-hwmon.service.d /run/systemd/system/reimu-fru-power.service.d && "
+          "printf '[Service]\\nEnvironment=REIMU_HWMON_SETTLE_SEC=%d\\n' > /run/systemd/system/reimu-hwmon.service.d/test.conf && "
           "printf '[Service]\\nEnvironment=FRU_SETTLE=%d FRU_TRIES=%d\\n' > /run/systemd/system/reimu-fru-power.service.d/test.conf && "
-          "systemctl daemon-reload" % (settle, fru_settle, tries))
+          "systemctl daemon-reload && systemctl restart reimu-hwmon" % (settle, fru_settle, tries))
 
 
 def pcs_warm(b):
@@ -401,17 +440,15 @@ def power_on(b, sensors=True, timeout=120):
     if sensors:
         got = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), timeout, 3)
         check(bool(got), "sensors on D-Bus %s" % sorted(b.sensors()))
-        # (it goes on probing the chips that may not be there)
-        b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 60)
 
 
 def power_off(b):
     check(b.transition("Off"), "RequestedHostTransition Off")
     st = b.wait(lambda: b.host_state() == "Off" and not b.state().get("power"), 40)
     check(st, "platform off, host state Off")
-    clean = b.wait(lambda: not b.clients() and b.out("systemctl is-active hwmon-instantiator hwmon-instantiator-rescan reimu-fru-power").split()
-                   == ["inactive"] * 3 and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == "", 60)
-    check(clean, "off: no platform device, phosphor-hwmon, sensor left (%s, %s)" % (b.clients(), sorted(b.sensors())))
+    clean = b.wait(lambda: not b.clients() and b.out("systemctl is-active reimu-fru-power").strip() == "inactive"
+                   and not b.sensors(), 60)
+    check(clean, "off: no platform device, no sensor left (%s, %s)" % (b.clients(), sorted(b.sensors())))
 
 
 def common_end(b, boots=1):
@@ -450,6 +487,7 @@ def t_off():
     b = Platform("off", fresh_env("off")).start()
     try:
         check(b.wait_ssh(), "up")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
         j = journal(b, "mcst-fruid")
         print("    " + j.strip().replace("\n", "\n    "))
         check("read from the PNS flash" in j, "device tree read from the PNS flash")
@@ -466,7 +504,12 @@ def t_off():
         check(b.host_state() == "Off", "host state Off")
         time.sleep(20)
         check(b.clients(eeprom=True) == set(), "no platform I2C device instantiated, not even the EEPROM (%s)" % b.clients(eeprom=True))
-        check(b.out("systemctl is-active hwmon-instantiator").strip() == "inactive", "hwmon-instantiator not started")
+        x0 = b.hwmon_transfers()
+        check(x0 == 0, "reimu-hwmon: no transfer while the platform is off (%s)" % x0)
+        check(b.out("systemctl is-active hwmon-instantiator reimu-hwmon reimu-fand").split() == ["inactive", "active", "active"],
+              "no hwmon-instantiator (out of the image); reimu-hwmon, reimu-fand running")
+        check(not b.out("pidof phosphor-hwmon-readd").strip() and not b.out("lsmod | grep -E 'lm63|l_pcs|pmbus'").strip(),
+              "no phosphor-hwmon, no platform chip driver loaded")
         f = b.failed_units()
         check(not f, "no failed units %s" % sorted(f))
         for u in f:
@@ -484,13 +527,13 @@ def t_off():
         t0 = time.time()
         b.temperature("pcs0", 2500)   # PCS 0x280 = 80 °C (14.5 in the u16 of the old l_pcs_i2c)
         b.temperature("pcs1", 2000)   # 0x200 = 64 °C
-        b.temperature("lm2", 45000)   # lm63 local: the register's high byte, 45 °C
-        b.temperature("lm6", 38000)
+        # (the lm96163s' local temperatures 45 and 38 °C: load_lm())
         check(b.transition("On"), "RequestedHostTransition On")
         check(b.wait(lambda: b.host_state() == "Running", 30), "host state Running")
         check(b.state().get("presses") == 1 and b.state().get("power"), "one power button press, platform on (%s)" % b.state())
         time.sleep(15)
-        check(not b.clients(), "devices left alone while the platform powers up (15 s: %s)" % b.clients())
+        check(not b.clients() and b.hwmon_transfers() == 0 and not b.sensors(),
+              "devices left alone while the platform powers up (15 s: %s, %s transfers)" % (b.clients(), b.hwmon_transfers()))
         s = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), 120, 3)
         dt = time.time() - t0
         s = b.sensors()
@@ -505,31 +548,31 @@ def t_off():
         check(all(v is not None and v > -1 for v in s.values()), "no sensor reads an -errno")
         check(not any("not_connected" in n.lower() or n.endswith("temp2") for n in s if n.startswith("CPU_FAN")),
               "\"not connected\" input left out")
-        b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 60)
         c = b.clients()
-        check(c == {"2-004c:bound", "6-004c:bound", "5-0020:bound", "5-0021:bound"},
-              "drivers bound, nothing else left instantiated %s" % sorted(c))
-        print("    hwmon-instantiator:\n    " + journal(b, "hwmon-instantiator").strip()[-1500:].replace("\n", "\n    "))
-        u = b.out("systemctl list-units --all --no-legend --plain 'xyz.openbmc_project.Hwmon@*'")
-        print("    " + u.strip().replace("\n", "\n    "))
-        check("failed" not in u, "no phosphor-hwmon failed")
+        check(not c, "no I2C client made, no driver bound to a platform chip %s" % sorted(c))
+        check(b.lm_local(2, 47) and b.wait(lambda: abs((b.sensors().get("FAN_Control_X38_X39_X40_Internal_Temp") or 0) - 47) < 1, 30),
+              "a new local temperature of 2-004c on D-Bus within reimu-fand's extras (5 s) and a poll")
         time.sleep(15)
-        u2 = b.out("systemctl show -p NRestarts --value $(systemctl list-units --no-legend --plain 'xyz.openbmc_project.Hwmon@*' | cut -d' ' -f1)").split()
-        check(all(x == "0" for x in u2), "phosphor-hwmon instances never restarted %s" % u2)
-        # a sensor that stops reading: off D-Bus (REMOVERCS), not -errno, and
-        # back once it reads; its phosphor-hwmon keeps running
-        b.temperature("pcs1", 0)   # the PCS reads 0: l_pcs_i2c says EIO
+        u2 = b.restarts("reimu-hwmon", "reimu-fand")
+        check(u2 == ["0", "0"], "reimu-hwmon, reimu-fand never restarted %s" % u2)
+        # a sensor that stops reading: off D-Bus (reimu-fand's reading stale:
+        # no value), not -errno, and back once it reads
+        b.temperature("pcs1", 0)   # the PCS reads 0: no sensor
         gone = b.wait(lambda: "CPU0_Cores_2_3" not in b.sensors(), 30)
-        check(gone, "failing sensor off D-Bus, not a reading of -5 (%s)" % b.sensors().get("CPU0_Cores_2_3"))
+        check(gone, "failing sensor off D-Bus, not a reading of 0 or -5 (%s)" % b.sensors().get("CPU0_Cores_2_3"))
         b.temperature("pcs1", 2000)
         back = b.wait(lambda: abs((b.sensors().get("CPU0_Cores_2_3") or 0) - 64) < 0.2, 30)
         check(back, "and back at 64 °C once it reads")
-        u3 = b.out("systemctl show -p NRestarts --value $(systemctl list-units --no-legend --plain 'xyz.openbmc_project.Hwmon@*' | cut -d' ' -f1)").split()
-        check(all(x == "0" for x in u3), "phosphor-hwmon never restarted %s" % u3)
-        # web UI: reimu-pnsd's sensors, now through the drivers
-        js = b.out("busctl get-property xyz.openbmc_project.Reimu.Pns /xyz/openbmc_project/reimu/sensors "
-                   "xyz.openbmc_project.Reimu.Sensors Json")
-        check('"platform\\":\\"on' in js or '\\"platform\\":\\"' in js, "reimu-pnsd sensors answer")
+        u3 = b.restarts("reimu-hwmon", "reimu-fand")
+        check(u3 == ["0", "0"], "still never restarted %s" % u3)
+        # web UI: reimu-hwmon's document, what it read last
+        js = b.out("busctl get-property %s /xyz/openbmc_project/reimu/sensors xyz.openbmc_project.Reimu.Sensors Json" % HWMON)
+        check('\\"platform\\":\\"on' in js and 'IOHUB Temp' in js and '5-0020' in js, "reimu-hwmon's sensors document %s" % js[:200])
+        x1 = b.hwmon_transfers()
+        time.sleep(10)
+        x2 = b.hwmon_transfers()
+        print("    reimu-hwmon: %s transfers in 10 s (the PMBus devices that aren't there: tried once a minute)" % (x2 - x1 if x1 is not None and x2 is not None else "?"))
+        check(x1 is not None and x2 is not None and x2 - x1 <= 12, "reimu-hwmon reads next to nothing of a platform without its chips")
         r = subprocess.run(["curl", "-ks", "-u", "root:0penBmc", "https://127.0.0.1:%d/redfish/v1/Chassis" % HTTPS],
                            capture_output=True, text=True)
         print("    Redfish Chassis: " + re.sub(r"\s+", " ", r.stdout)[:300])
@@ -559,18 +602,18 @@ def t_off():
         for i in range(10):
             power_on(b, timeout=60)
             if i == 4:
-                # cut short: off while hwmon-instantiator waits out the settle time
+                # cut short: off while the platform settles
                 power_off(b)
-                b.ssh("printf '[Service]\\nEnvironment=SETTLE=15\\n' > /run/systemd/system/hwmon-instantiator.service.d/test.conf && systemctl daemon-reload")
+                fast(b, settle=15)
+                x0 = b.hwmon_transfers()
                 check(b.transition("On"), "on again")
                 b.wait(lambda: b.host_state() == "Running", 30)
                 time.sleep(5)
-                check(b.out("systemctl is-active hwmon-instantiator").strip() == "activating", "settling")
+                check(not b.sensors() and b.hwmon_transfers() == x0, "settling: nothing read")
                 b.set_power(False)  # a power cut: reimupwr sees power good go
                 check(b.wait(lambda: b.host_state() == "Off", 20), "power cut seen")
-                ok = b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "inactive", 30)
-                check(ok, "hwmon-instantiator's start cancelled (%s)" % b.out("systemctl is-active hwmon-instantiator; journalctl -b -o cat -u hwmon-instantiator | tail -5").strip())
-                check(not b.clients(), "nothing instantiated %s" % b.clients())
+                time.sleep(15)
+                check(not b.sensors() and b.hwmon_transfers() == x0 and not b.clients(), "nothing read, nothing instantiated %s" % b.clients())
                 fast(b)
                 power_on(b, timeout=60)
             on = b.snapshot()
@@ -579,18 +622,18 @@ def t_off():
             off = b.snapshot()
             snaps.append((on, off, n))
             print("    cycle %d: on %s sensors %d | off %s" % (i + 1, on, n, off))
-        for k in ("clients", "hwmon", "readd", "units", "confs"):
+        for k in ("clients", "hwmon"):
             check(len(set(s[0][k] for s in snaps)) == 1 and len(set(s[1][k] for s in snaps)) == 1,
                   "%s the same every cycle (on %s, off %s)" % (k, [s[0][k] for s in snaps], [s[1][k] for s in snaps]))
         check(len(set(s[2] for s in snaps)) == 1, "the same sensors every cycle %s" % [s[2] for s in snaps])
-        check(all(s[1]["readd"] == 0 for s in snaps), "no phosphor-hwmon while off")
+        check(all(s[1]["clients"] == s[0]["clients"] for s in snaps), "no I2C client made at power-on")
         # a leak grows every cycle: the least of cycles 2-4 against the least of 8-10
         lo = lambda k, r: min(snaps[i][1][k] for i in r)
         early, late = range(1, 4), range(7, 10)
         d = (lo("avail", early) - lo("avail", late)) // 1024
         check(d < 3, "MemAvailable cycles 2-4 -> 8-10: down %d MiB (< 3)" % d)
         d = lo("rss", late) - lo("rss", early)
-        check(d < 1024, "RSS of systemd, udevd, dbus, mapper, reimupwr, reimu-pnsd, state managers, overheatd: +%d KiB (< 1024)" % d)
+        check(d < 1024, "RSS of systemd, udevd, dbus, mapper, reimupwr, reimu-pnsd, reimu-hwmon, reimu-fand, state managers, overheatd: +%d KiB (< 1024)" % d)
         check(lo("procs", late) <= lo("procs", early) + 3, "processes %d -> %d" % (lo("procs", early), lo("procs", late)))
         check(lo("fds", late) <= lo("fds", early) + 2, "systemd's fds %d -> %d" % (lo("fds", early), lo("fds", late)))
         n = b.out("journalctl -b -o cat | grep -c 'FRU ID read:'").strip()
@@ -604,7 +647,7 @@ def t_off():
 
 
 def view_vs_bmcweb():
-    """the web UI's view (reimu-pnsd view/live, view/static through js/lib/view.js)
+    """the web UI's view (reimu-hwmon view/live, reimu-pnsd view/static through js/lib/view.js)
     says what bmcweb says, for every URL it answers (tests/e2e/view.qemu.mjs)"""
     www = os.path.join(ab.HERE, "..", "..", "meta-common", "recipes-phosphor", "reimu-webui", "files", "www")
     env = dict(os.environ, BASE="https://127.0.0.1:%d" % HTTPS, WWW=www)
@@ -617,6 +660,7 @@ def t_hoston():
     b = Platform("hoston", fresh_env("hoston", ethaddr=FRU_MAC.lower(), eth1addr="98:a7:b0:06:0f:7f"), power=True).start()
     try:
         check(b.wait_ssh(), "up")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
         j = journal(b, "mcst-fruid")
         print("    " + j.strip().replace("\n", "\n    "))
         check(dtb_ok(b), "device tree read")
@@ -692,6 +736,7 @@ def t_nopns():
     b = Platform("nopns", img, power=True, pns=False).start()
     try:
         check(b.wait_ssh(), "up (PNS flash blank)")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
         j = journal(b, "mcst-fruid")
         print("    " + j.strip().replace("\n", "\n    "))
         check("Can't read the platform device tree" in j and "read before" in j, "the device tree read before is used")
@@ -708,6 +753,7 @@ def t_noeeprom():
     b = Platform("noeeprom", fresh_env("noeeprom"), power=True, eeprom=False).start()
     try:
         check(b.wait_ssh(), "up")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
         j = journal(b, "mcst-fruid")
         print("    " + j.strip().replace("\n", "\n    "))
         check("doesn't answer" in j, "FRU ID EEPROM doesn't answer at boot")
@@ -730,8 +776,8 @@ def t_noeeprom():
         power_on(b, timeout=60)
         check(b.out("systemctl is-active reimu-fru-power").strip() == "active", "reimu-fru-power tries again")
         power_off(b)
-        check(b.out("systemctl is-failed reimu-fru-power hwmon-instantiator").split() == ["inactive"] * 2,
-              "reimu-fru-power, hwmon-instantiator stopped, not failed")
+        check(b.out("systemctl is-failed reimu-fru-power reimu-platform-on.target").split() == ["inactive"] * 2,
+              "reimu-fru-power, reimu-platform-on.target stopped, not failed")
         power_on(b, timeout=60)
         common_end(b)
     finally:
@@ -739,58 +785,28 @@ def t_noeeprom():
 
 
 def t_slowbind():
-    """a driver that binds late, a chip that answers late: their sensors come
-    in the same power cycle; nothing half-made is left; power-off meanwhile"""
+    """a chip that answers late: its sensor comes in the same power cycle
+    (reimu-fand reads every poll; no instantiation pass to miss); a power cut
+    meanwhile: nothing left"""
     b = Platform("slowbind", fresh_env("slowbind")).start()
-    full = {"2-004c:bound", "6-004c:bound", "5-0020:bound", "5-0021:bound"}
     try:
         check(b.wait_ssh(), "up")
-        # the PCS driver isn't there for the first pass: its module is moved
-        # away (busybox modprobe has no "install" rules to delay it with) and
-        # loaded by hand once that pass is over
-        r = b.ssh("mv $(find /lib/modules -name 'l-pcs-i2c.ko*') /tmp/l-pcs-i2c.ko")
-        check(r.returncode == 0, "PCS module out of the way %s" % r.stderr.strip())
-        check(b.transition("On"), "on")
-        check(b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 120), "first pass done")
-        s0 = sorted(b.sensors())
-        c0 = b.clients()
-        print("    after the first pass: %s, %s" % (s0, sorted(c0)))
-        check(not any(n.startswith("CPU0") for n in s0), "the slow driver missed the first pass (the point of this test)")
-        check(not any(not x.endswith(":bound") for x in c0), "no half-made client %s" % sorted(c0))
-        check(b.ssh("insmod /tmp/l-pcs-i2c.ko").returncode == 0, "driver loaded, late")
-        ok = b.wait(lambda: EXPECT_SENSORS <= set(b.sensors()), 150, 3)
-        check(bool(ok), "the late driver's sensors on D-Bus in the same power cycle %s" % sorted(b.sensors()))
-        ok = b.wait(lambda: b.clients() == full, 40, 1)
-        check(bool(ok), "and only what is there left instantiated, all bound %s" % sorted(b.clients()))
-        print("    " + journal(b, "hwmon-instantiator-rescan").strip()[-400:].replace("\n", "\n    "))
-        s1 = b.sensors()
-        check(len(s1) == 5 and all(v is not None for v in s1.values()), "the full set, readings %s" % s1)
-        u = b.out("systemctl list-units --all --no-legend --plain 'xyz.openbmc_project.Hwmon@*'")
-        check("failed" not in u, "no phosphor-hwmon failed")
-        power_off(b)
-
-        # the module is there now: a chip that answers late
-        print("    -- a PCS sensor answering late")
-        fast(b, rescan="5 5 5 10 10 10")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
+        fast(b)
         b.temperature("pcs0", 1500)
-        b.temperature("pcs1", 0)   # reads 0: "doesn't answer"
+        b.temperature("pcs1", 0)   # reads 0: "no sensor"
         check(b.transition("On"), "on")
-        check(b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "active", 60), "first pass done")
-        check("CPU0_Cores_2_3" not in b.sensors(), "late chip not there yet")
+        check(b.wait(lambda: "CPU0_Cores_0_1" in b.sensors(), 60), "the others there")
+        check("CPU0_Cores_2_3" not in b.sensors(), "the late chip not there yet")
         b.temperature("pcs1", 2000)
-        ok = b.wait(lambda: abs((b.sensors().get("CPU0_Cores_2_3") or 0) - 64) < 0.2, 60, 2)
+        ok = b.wait(lambda: abs((b.sensors().get("CPU0_Cores_2_3") or 0) - 64) < 0.2, 30, 2)
         check(bool(ok), "there later in the cycle, 64 °C (%s)" % b.sensors().get("CPU0_Cores_2_3"))
-        check(len(set(b.sensors())) == 5, "the same names as ever %s" % sorted(b.sensors()))
-
-        # power-off while the rescan waits or probes: nothing left, not failed
-        print("    -- off during a rescan")
-        check(b.out("systemctl is-active hwmon-instantiator-rescan").strip() == "active", "rescan still going")
+        check(EXPECT_SENSORS <= set(b.sensors()), "the same names as ever %s" % sorted(b.sensors()))
+        print("    -- a power cut")
         b.set_power(False)
         check(b.wait(lambda: b.host_state() == "Off", 20), "power cut seen")
-        clean = b.wait(lambda: not b.clients() and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == "", 60)
+        clean = b.wait(lambda: not b.clients() and not b.sensors(), 30)
         check(clean, "nothing left (%s, %s)" % (b.clients(), sorted(b.sensors())))
-        check(b.out("systemctl is-active hwmon-instantiator hwmon-instantiator-rescan").split() == ["inactive"] * 2,
-              "both stopped, not failed")
         common_end(b)
         pns_unchanged(b)
     finally:
@@ -803,7 +819,7 @@ def t_freeze():
     import signal
     b = Platform("freeze", fresh_env("freeze"), power=True, eeprom=False).start()
     try:
-        check(b.wait_console(r"l_pcs_i2c at 0x24", 300) is not None, "instantiating")
+        check(b.wait_ssh(), "up, the platform on: the sensors being read")
         os.kill(b.p.pid, signal.SIGSTOP)
         time.sleep(70)
         os.kill(b.p.pid, signal.SIGCONT)
@@ -854,11 +870,12 @@ def t_resetcause():
 
 
 def t_offearly():
-    """power-off while hwmon-instantiator settles or instantiates (default
-    settle time 30 s; the instantiation takes ~15 s more): nothing left"""
+    """power-off while the platform settles (default 30 s) or its sensors are
+    read: nothing left"""
     b = Platform("offearly", fresh_env("offearly")).start()
     try:
         check(b.wait_ssh(), "up")
+        check(b.load_lm(), "lm96163 stand-ins loaded")
         for at in (2, 10, 35, 45):
             pcs_warm(b)
             check(b.transition("On"), "on")
@@ -866,20 +883,16 @@ def t_offearly():
             t0 = time.time()
             while time.time() - t0 < at:
                 time.sleep(0.5)
-            st = b.out("systemctl is-active hwmon-instantiator").strip()
             n = len(b.sensors())
             b.set_power(False)  # power cut, at once
-            check(b.wait(lambda: b.host_state() == "Off", 20), "power off at %d s (instantiator %s, %d sensors)" % (at, st, n))
-            clean = b.wait(lambda: b.out("systemctl is-active hwmon-instantiator").strip() == "inactive" and not b.clients()
-                           and not b.sensors() and b.out("pidof phosphor-hwmon-readd").strip() == ""
-                           and not b.out("systemctl list-units --state=active --no-legend --plain 'xyz.openbmc_project.Hwmon@*'").strip(), 60)
-            check(clean, "off at %d s: no sensor, phosphor-hwmon, Hwmon@ unit or I2C client left (%s, %s, %s)"
-                  % (at, sorted(b.sensors()), b.clients(), b.out("pidof phosphor-hwmon-readd").strip()))
+            check(b.wait(lambda: b.host_state() == "Off", 20), "power off at %d s (%d sensors)" % (at, n))
+            clean = b.wait(lambda: not b.clients() and not b.sensors(), 30)
+            check(clean, "off at %d s: no sensor or I2C client left (%s, %s)" % (at, sorted(b.sensors()), b.clients()))
             f = b.failed_units()
             check(not f, "no failed units %s" % sorted(f))
         power_on(b, timeout=120)
         s = b.sensors()
-        check(len(s) == 5, "then a normal power-on: the full set %s" % sorted(s))
+        check(EXPECT_SENSORS <= set(s) and "CPU0_Cores_4_5" not in s, "then a normal power-on: the full set %s" % sorted(s))
         common_end(b)
     finally:
         b.stop()

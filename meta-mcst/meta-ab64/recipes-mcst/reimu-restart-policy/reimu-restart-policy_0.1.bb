@@ -12,7 +12,7 @@ inherit allarch
 # own RestartSec= or StartLimit*= is not in REIMU_RESTART_ALWAYS (the units
 # there declare at most Restart=always, the same). Units that declare their
 # whole policy are in none of the lists: reimu-kvm (RestartSec=10: waits for
-# bmcweb's certificate), reimu-pnsd.
+# bmcweb's certificate), reimu-pnsd, reimu-hwmon.
 #
 # Restart=always, RestartSec=5, no start limit. Socket-activated ones
 # (bmcweb, phosphor-ipmi-net@, triggerhappy) keep their

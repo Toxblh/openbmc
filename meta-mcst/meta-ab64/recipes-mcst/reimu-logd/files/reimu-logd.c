@@ -18,11 +18,16 @@
  *            step, done, total, size, name, error}
  *     method DiagDownload(t offset, u length) -> s   as Read, the archive
  *     method DiagDelete() -> s
+ *   object    /xyz/openbmc_project/reimu/journal
+ *   interface xyz.openbmc_project.Reimu.Journal
+ *     method Read(s cursor, i count) -> s     a window of the BMC journal for
+ *            the web UI, JSON (reimu-journal.c); count < 0: before the cursor
  * The archive goes after a download (DiagDelete) or after REIMU_DIAG_TTL s
  * (900), so that it can't fill /run. Through bmcweb the methods are POSTs,
  * which take the Administrator's privileges.
  *
  *   reimu-logd --decode-reset BOOTSTATUS SCU3C CLEAN CMDLINE
+ *   reimu-logd --journal [n [cursor]]   the web UI's window, printed
  *
  * Copyright (c) 2026 MCST REIMU contributors. Licensed under GPLv2.
  */
@@ -48,6 +53,8 @@
 #include <systemd/sd-journal.h>
 
 #include "ev-core.h"
+#include "rbuf.h"
+#include "reimu-journal.h"
 
 #define LOGDIR  "/var/lib/reimu-logd"
 #define LOGFILE LOGDIR "/events.log"
@@ -469,6 +476,25 @@ static const sd_bus_vtable vtable[] = {
     SD_BUS_VTABLE_END
 };
 
+static int m_journal(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    const char *cur;
+    int32_t count;
+    int r = sd_bus_message_read(m, "si", &cur, &count);
+    if (r < 0) return r;
+    struct buf b = { 0 };
+    journal_json(&b, cur, count);
+    r = sd_bus_reply_method_return(m, "s", b.s ? b.s : "{}");
+    free(b.s);
+    return r;
+}
+
+static const sd_bus_vtable journal_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("Read", "si", "s", m_journal, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_VTABLE_END
+};
+
 /* ------------------------------------------------------------------ main */
 static int shutting_down(void)
 {
@@ -483,9 +509,17 @@ int main(int argc, char **argv)
         puts(ev_reset_reason(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), atoi(argv[4]), argv[5]));
         return 0;
     }
+    if (argc >= 2 && argc <= 4 && !strcmp(argv[1], "--journal"))
+    {
+        struct buf b = { 0 };
+        journal_json(&b, argc > 3 ? argv[3] : "", argc > 2 ? atoi(argv[2]) : -20);
+        if (b.s) puts(b.s);
+        free(b.s);
+        return 0;
+    }
     if (argc != 1)
     {
-        fprintf(stderr, "usage: %s [--decode-reset BOOTSTATUS SCU3C CLEAN CMDLINE]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--decode-reset BOOTSTATUS SCU3C CLEAN CMDLINE | --journal [n [cursor]]]\n", argv[0]);
         return 2;
     }
     const char *t = getenv("REIMU_DIAG_TTL");
@@ -504,6 +538,9 @@ int main(int argc, char **argv)
     }
     r = sd_bus_default_system(&s_bus);
     if (r >= 0) r = sd_bus_add_object_vtable(s_bus, NULL, OBJ, SERVICE, vtable, NULL);
+    if (r >= 0)
+        r = sd_bus_add_object_vtable(s_bus, NULL, "/xyz/openbmc_project/reimu/journal", "xyz.openbmc_project.Reimu.Journal",
+                                     journal_vtable, NULL);
     if (r >= 0) r = sd_bus_add_object_manager(s_bus, NULL, "/");
     if (r >= 0) r = sd_bus_request_name(s_bus, SERVICE, 0);
     if (r < 0)

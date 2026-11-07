@@ -195,7 +195,7 @@ function diagCard() {
 }
 
 // ---------------------------------------------------------------- BMC journal
-// journald of the BMC, read by reimu-pnsd (the stock bmcweb is built
+// journald of the BMC, read by reimu-logd (the stock bmcweb is built
 // without its journal log service). Newest entries first.
 
 const PAGE = 1000;
@@ -220,7 +220,7 @@ async function jReload() {
     J.older = !!r.older;
     if (r.error) J.error = "журнал недоступен";
   } catch (e) {
-    J.error = e.status === 404 ? "сервис reimu-pnsd не отвечает или устарел (нужна новая версия devkit)" : e.message;
+    J.error = e.status === 404 ? "сервис reimu-logd не отвечает или устарел (нужна новая версия devkit)" : e.message;
   }
   J.busy = false;
   jRender();

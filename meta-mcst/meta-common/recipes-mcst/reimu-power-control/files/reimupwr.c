@@ -42,11 +42,13 @@ static void set_power_state_on_dbus(int pgood, int changed)
      * hours, anything keyed on the chassis state) */
     const char *cstate = pgood ? "xyz.openbmc_project.State.Chassis.PowerState.On" : "xyz.openbmc_project.State.Chassis.PowerState.Off";
 
-    /* the sensors: on a change only (the states are re-asserted every 10 s) */
+    /* what runs while the platform is powered (reimu-platform-on.target: the
+     * sensors' instantiator, the FRU ID read at power-on): on a change only
+     * (the states are re-asserted every 10 s) */
     static int managed = -1;
     if (changed || managed != pgood)
     {
-        reimu_dbus_manage_service("/org/freedesktop/systemd1/unit/hwmon_2dinstantiator_2eservice", pgood ? "Start" : "Stop");
+        reimu_dbus_manage_service("/org/freedesktop/systemd1/unit/reimu_2dplatform_2don_2etarget", pgood ? "Start" : "Stop");
         managed = pgood;
     }
 
@@ -109,8 +111,9 @@ int main(void)
             else
             {
                 /* State.Host not up yet (BMC boot with the platform on):
-                 * again in a second, or the host state and the sensors
-                 * (hwmon-instantiator) would wait for the next change */
+                 * again in a second, or the host state and what runs while
+                 * it's powered (reimu-platform-on.target) would wait for the
+                 * next change */
                 if (changed) reimu_message(stdout, "(%s) Host state service not available yet, retrying\n", reimu_gettime());
                 success = 0;
             }

@@ -36,19 +36,20 @@ Groups (all by default):
            unit multi-user.target requires: systemd never gets there; [8]
            restore-stock checks only its four files' lines of SHA256SUMS
            (red: sha256sum -c of the whole file)
-  platform [15] l_pcs_i2c above 65.5 C and a failed read (not 0 C); [38]
-           reimu-pns-scan never has the flash on the BMC's side while the
-           platform powers up
+  platform [15] a PCS above 65.5 C and a failed read (not 0 C): on D-Bus
+           (reimu-fand -> reimu-hwmon) and through the l_pcs_i2c driver
+           (overheatd's old format: loaded by nobody else, bound by hand);
+           [38] reimu-pns-scan never has the flash on the BMC's side while
+           the platform powers up
   fruid    [17] mcst-fruid opens the PNS flash read-only (an LD_PRELOAD
            logger of open(), openlog.c, cross-built) and survives an EEPROM
            that fails the header check (red: the mcst-fruid of the image
            before the fixes, from OLD_IMAGE, default WORKDIR/../old/ab.mtd)
-  hwmon    [12] the lm96163 sensors (device tree label props) get configs
-           (red: today's hwmon-instantiator source with only that fix taken
-           out, cross-built; the unchanged source cross-built is the
-           control); [21] a failing PCS read never published as a value,
-           also without REMOVERCS (red: phosphor-hwmon-readd built with the
-           negative-errno-on-fail at its default, REG_HWMON_ERRNO=file)
+  hwmon    [12] the lm96163 sensors named by the device tree's label props
+           (reimu-hwmon; its red is native: test_static S74, the names
+           without the device label); [21] a failing PCS read never
+           published as a value (hwmon-instantiator and phosphor-hwmon,
+           where these bugs were, are out of the image since beta7)
   pns      [39] reimu-pns-flash switches the PNS flash back to the host when
            a job fails (red: its switch() through gpiowrite in the EXIT trap)
 """
@@ -190,7 +191,7 @@ def t_mcinfo(b):
 
 
 def t_bmc_load(b):
-    o = b.out("busctl get-property xyz.openbmc_project.Reimu.Pns /xyz/openbmc_project/reimu/sensors xyz.openbmc_project.Reimu.Sensors Json 2>&1 | head -c 200")
+    o = b.out("busctl get-property xyz.openbmc_project.Reimu.Hwmon /xyz/openbmc_project/reimu/sensors xyz.openbmc_project.Reimu.Sensors Json 2>&1 | head -c 200")
     check(bool(re.search(r'bmc.{1,6}load.{1,6}\[[0-9.]+,[0-9.]+,[0-9.]+\]', o)), "the BMC's load average in the sensors' Json (%s)" % o[:100])
 
 
@@ -335,25 +336,35 @@ def g_platform():
         if not check(b.wait_ssh(600), "up, platform off"):
             return
         F.fast(b)
-        # [15] the PCS sensor of l_pcs_i2c: 1/8 C over I2C, m C in hwmon
+        # [15] the PCS: 1/8 C over I2C; 80 C is past the u16 of m C
         b.temperature("pcs0", 2500)  # the stand-in's register: 80 C as a PCS reads it
         b.temperature("pcs1", 2500)
         b.transition("On")
         b.wait(lambda: b.host_state() == "Running", 40)
+        got = b.wait(lambda: abs((b.sensors().get("CPU0_Cores_0_1") or 0) - 80) < 0.2, 90, 3)
+        check(bool(got), "[15] CPU0_Cores_0_1 80 C on D-Bus (reimu-fand -> reimu-hwmon), not 14.5 (%s)" % b.sensors().get("CPU0_Cores_0_1"))
+        b.temperature("pcs0", 0)  # a PCS reading 0: no sensor, a failed read
+        seen = set()
+        end = time.time() + 20
+        while time.time() < end:
+            seen.add(b.sensors().get("CPU0_Cores_0_1"))
+            time.sleep(2)
+        check(None in seen and not any(v is not None and v < 1 for v in seen),
+              "[15] a failed PCS read: off D-Bus, never 0 C (%s)" % sorted(seen, key=lambda v: (v is None, v or 0)))
+        b.temperature("pcs0", 2500)
+        # the l_pcs_i2c driver (overheatd reads it with a device tree that binds it)
+        b.ssh("modprobe l-pcs-i2c; echo l_pcs_i2c 0x20 > /sys/bus/i2c/devices/i2c-5/new_device")
         h = "ls -d /sys/bus/i2c/devices/5-0020/hwmon/hwmon* 2>/dev/null | head -1"
-        got = b.wait(lambda: b.out(h).strip(), 90, 3)
-        if not got:  # no hwmon-instantiator that works: the driver by hand
-            b.ssh("modprobe l-pcs-i2c; echo l_pcs_i2c 0x20 > /sys/bus/i2c/devices/i2c-5/new_device")
-            got = b.wait(lambda: b.out(h).strip(), 20)
-            print("    5-0020 instantiated by hand: %s" % (got or "no hwmon"))
+        got = b.wait(lambda: b.out(h).strip(), 20)
         time.sleep(3)
         v = b.out("cat %s/temp1_input" % got).strip() if got else ""
         check(v == "80000", "[15] l_pcs_i2c reads 80 C as 80000 (u16 wrapped at 65.5 C) (%s)" % (v or "-"))
-        b.temperature("pcs0", 0)  # a PCS reading 0: no sensor, a failed read
+        b.temperature("pcs0", 0)
         time.sleep(3)
         r = b.ssh("cat %s/temp1_input" % got) if got else None
-        check(r is not None and r.returncode != 0, "[15] a failed PCS read is an error, not 0 C (%s)" % (
+        check(r is not None and r.returncode != 0, "[15] l_pcs_i2c: a failed PCS read is an error, not 0 C (%s)" % (
             ("rc %d %s" % (r.returncode, (r.stdout + r.stderr).strip()[-60:])) if r else "-"))
+        b.ssh("echo 0x20 > /sys/bus/i2c/devices/i2c-5/delete_device; rmmod l_pcs_i2c")
         b.temperature("pcs0", 1500)
         # [38] reimu-pns-scan while the platform is asked to power up
         b.transition("Off")
@@ -417,9 +428,6 @@ def old_rootfs_file(path):
                         "unsquashfs -no-progress -d %s /tmp/reg-old.sqfs >/dev/null; rm -f /tmp/reg-old.sqfs" % (d, d)],
                        input=sq, capture_output=True, timeout=300)
     return docker_file(d + path)
-
-
-HWI_SRC = "meta-mcst/meta-common/recipes-mcst/hwmon-instantiator/files/hwmon-instantiator.c"
 
 
 # ------------------------------------------------------------------ fruid
@@ -496,90 +504,36 @@ def g_fruid():
 
 
 # ------------------------------------------------------------------ hwmon
-def hwi_conf(b, dev):
-    return b.out("cat $(find /etc/default/obmc/hwmon/ -name '%s.conf') 2>/dev/null" % dev)
-
-
-def restart_instantiator(b):
-    b.ssh("systemctl stop hwmon-instantiator; systemctl reset-failed 'xyz.openbmc_project.Hwmon@*' hwmon-instantiator; "
-          "systemctl start hwmon-instantiator", timeout=300)
-
-
 def g_hwmon():
-    """[12] hwmon-instantiator: the lm96163 inputs named by the device tree's
-    temp1_label props; [21] phosphor-hwmon: a PCS read error never a value.
-    Red (REG_RED=1): today's hwmon-instantiator source with only bug 12 put
-    back (bug 11's fix kept), cross-built; phosphor-hwmon-readd built with
-    only negative-errno-on-fail at its meson default, true (REG_HWMON_ERRNO=file, from
-    the build container; see REGRESSIONS.md for how it was built)"""
+    """[12] the lm96163 inputs named by the device tree's temp1_label props
+    (reimu-hwmon: the names hwmon-instantiator gave); [21] a PCS read error
+    never a value. hwmon-instantiator and phosphor-hwmon, where these bugs
+    were, are out of the image since beta7: the reds are native (test_static
+    S74, S35)"""
     import test_fru_sensors_qemu as F
     b = F.Platform("reg-hwmon", image("reg-hwmon")).start()
     try:
-        if not check(b.wait_ssh(600), "up, platform off"):
+        if not check(b.wait_ssh(600), "up, platform off") or not check(b.load_lm(), "lm96163 stand-ins"):
             return
         F.fast(b)
         F.power_on(b)
-        lm = {"FAN_Control_X38_X39_X40_Internal_Temp", "CPU_FAN_Control_X37_Internal_Temp"}
-
-        def lm_state(tag):
-            got = b.wait(lambda: lm <= set(b.sensors()), 60, 3)
-            c = hwi_conf(b, "2-004c")
-            return bool(got) and "LABEL_temp1=" in c, "[12] %s: lm96163 sensors %s, 2-004c.conf %r" % (
-                tag, sorted(lm & set(b.sensors())), c.strip().replace("\n", " ")[:120])
-
-        if RED:
-            src = open(os.path.join(HERE, "..", "..", "..", HWI_SRC), "rb").read() if os.path.exists(
-                os.path.join(HERE, "..", "..", "..", HWI_SRC)) else docker_file("/work/openbmc/" + HWI_SRC)
-            mut = src.replace(b"    if (!s_sensors)\n", b"    if (0) /* bug 12 back */\n") if src else None
-            for tag, s in (("today's source, cross-built (the control)", src), ("only bug 12 put back", mut)):
-                bn = cross(s, "-lfdt -lreimu -lreimu_fdt") if s and not (s is mut and mut == src) else None
-                if not bn or not put(b, bn, "/tmp/hwi"):
-                    red(True, "[12] build: " + tag)
-                    continue
-                b.ssh("chmod 755 /tmp/hwi; mount --bind /tmp/hwi /sbin/hwmon-instantiator")
-                restart_instantiator(b)
-                ok, what = lm_state(tag)
-                (red(ok, what) if s is mut else check(ok, what))
-                b.ssh("umount /sbin/hwmon-instantiator")
-            restart_instantiator(b)
-        ok, what = lm_state("the image's hwmon-instantiator")
-        check(ok, what)
-
-        def errno_state(tag, strip_rcs=False):
-            if strip_rcs:
-                b.ssh("for f in $(find /etc/default/obmc/hwmon/ -name '5-0021.conf'); do sed -i '/^REMOVERCS=/d' $f; done")
-            # every phosphor-hwmon again: the binary bind-mounted now is the one that runs
-            b.ssh("systemctl restart 'xyz.openbmc_project.Hwmon@*'", timeout=120)
-            b.wait(lambda: "CPU0_Cores_2_3" in b.sensors(), 60, 3)
-            before = b.sensors().get("CPU0_Cores_2_3")
-            b.temperature("pcs1", 0)  # the PCS reads 0: l_pcs_i2c says EIO
-            seen = set()
-            end = time.time() + 30
-            while time.time() < end:
-                seen.add(b.sensors().get("CPU0_Cores_2_3"))
-                time.sleep(2)
-            b.temperature("pcs1", 2000)
-            neg = sorted(v for v in seen if v is not None and v < 0)
-            exe = b.out("for p in $(pidof phosphor-hwmon-readd); do md5sum < /proc/$p/exe; done | cut -c1-8 | sort -u").split()
-            return not neg, "[21] %s: CPU0_Cores_2_3 %s, while its read fails %s (readd md5 %s)" % (
-                tag, before, sorted(seen, key=lambda v: (v is None, v or 0)), exe)
-
-        ex = os.environ.get("REG_HWMON_ERRNO")
-        if RED and ex and os.path.exists(ex) and put(b, open(ex, "rb").read(), "/tmp/readd"):
-            b.ssh("chmod 755 /tmp/readd; mount --bind /tmp/readd /usr/bin/phosphor-hwmon-readd")
-            ok, what = errno_state("phosphor-hwmon with negative-errno-on-fail at its default, REMOVERCS as written")
-            red(ok, what)
-            ok, what = errno_state("phosphor-hwmon with negative-errno-on-fail at its default, no REMOVERCS", True)
-            red(ok, what)
-            # a binary being run can't be unmounted
-            b.ssh("systemctl stop 'xyz.openbmc_project.Hwmon@*'; umount /usr/bin/phosphor-hwmon-readd", timeout=120)
-            restart_instantiator(b)
-        elif RED:
-            red(True, "[21] REG_HWMON_ERRNO (the errno build of phosphor-hwmon-readd)")
-        ok, what = errno_state("the image's phosphor-hwmon, REMOVERCS as written")
-        check(ok, what)
-        ok, what = errno_state("the image's phosphor-hwmon, no REMOVERCS", True)
-        check(ok, what)
+        lm = {"FAN_Control_X38_X39_X40_Internal_Temp", "CPU_FAN_Control_X37_Internal_Temp", "FAN_Control_X38_X39_X40_IOHUB_Temp"}
+        got = b.wait(lambda: lm <= set(b.sensors()), 60, 3)
+        check(bool(got), "[12] the lm96163 sensors by their device tree labels %s" % sorted(lm & set(b.sensors())))
+        check(not any("not_connected" in n.lower() or n == "CPU_FAN_Control_X37_temp2" for n in b.sensors()),
+              "[12] \"not connected\" left out")
+        b.wait(lambda: "CPU0_Cores_2_3" in b.sensors(), 60, 3)
+        before = b.sensors().get("CPU0_Cores_2_3")
+        b.temperature("pcs1", 0)  # the PCS reads 0: no sensor
+        seen = set()
+        end = time.time() + 30
+        while time.time() < end:
+            seen.add(b.sensors().get("CPU0_Cores_2_3"))
+            time.sleep(2)
+        b.temperature("pcs1", 2000)
+        bad = sorted(v for v in seen if v is not None and v < 1)
+        check(not bad and None in seen, "[21] CPU0_Cores_2_3 %s, while its read fails %s" % (
+            before, sorted(seen, key=lambda v: (v is None, v or 0))))
     finally:
         b.stop()
 

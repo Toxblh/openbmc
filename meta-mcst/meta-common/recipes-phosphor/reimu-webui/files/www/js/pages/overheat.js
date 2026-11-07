@@ -1,7 +1,7 @@
 import { api, h, toast } from "../api.js";
 
 // The overheat protection (overheatd; D-Bus xyz.openbmc_project.Reimu.Overheat
-// of reimu-pnsd): the toggle of the power actions, a card of the settings page,
+// of reimu-hwmon): the toggle of the power actions, a card of the settings page,
 // and what the sensors page must show about it.
 const PATH = "/xyz/openbmc_project/reimu/overheat";
 export const OFF_WARNING = "Если отключить, BMC не будет выключать хост при перегреве. Встроенная защита процессора может не сработать.";
@@ -44,7 +44,7 @@ export function overheatCard(st, refresh) {
     "div",
     { class: "card", id: "overheat-card" },
     h("h3", {}, "Защита от перегрева"),
-    !st ? h("div", { class: "note warn" }, "Сервис reimu-pnsd недоступен.") : null,
+    !st ? h("div", { class: "note warn" }, "Сервис reimu-hwmon недоступен.") : null,
     st && st.poweroff === false ? h("div", { class: "row section" }, h("span", { class: "badge warn", id: "overheat-card-off" }, "Выключение при перегреве отключено")) : null,
     h("label", { class: "inline" }, on, "Выключать хост при перегреве"),
     h("p", { class: "muted small" }, limits),

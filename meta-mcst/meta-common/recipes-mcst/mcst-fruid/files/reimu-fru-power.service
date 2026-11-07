@@ -1,9 +1,9 @@
 [Unit]
 Description=Get FRU ID data from Motherboard once it is powered
 After=mcst-fruid.service
-# pulled in by hwmon-instantiator.service (started at platform power-on,
+# pulled in by reimu-platform-on.target (started at platform power-on,
 # stopped at power-off by reimupwr), stopped with it
-PartOf=hwmon-instantiator.service
+PartOf=reimu-platform-on.target
 
 [Service]
 # not oneshot: a start job waiting for minutes would hold "boot finished"
