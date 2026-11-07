@@ -27,6 +27,7 @@ SCRIPT = sys.argv[1]
 PROBE, ADDR, SCAN = 0.05, 0.15, 0.15
 PORT = "1e6a0000.usb-vhub:p1"
 failed = []
+BUSCTL_KVM = '#!/tmp/bb/sh\ncase "$*" in\n  *Reimu.Kvm*Status*) printf \'s "{\\\\"usboff\\\\":%s}"\\n\' "$(cat %W%/usboff)" ;;\n  *) exit 1 ;;\nesac\n'
 
 
 def check(cond, what):
@@ -38,11 +39,18 @@ def check(cond, what):
 
 class Fake:
     def __init__(self, off=99, state="configured", host=True, media=False, hs=True, addr=True, agent=False,
-                 dbus=None, fand=None, argv=()):
+                 dbus=None, fand=None, argv=(), kvm="override", count=False):
         """dbus=(chassis, host): the D-Bus power states the fake busctl
         answers (host None: unreadable), fand: reimu-fand --status "host";
-        both None: the HOST_ON override (host=True/False)"""
+        both None: the HOST_ON override (host=True/False); kvm: how the
+        watcher learns reimu-kvm's "usboff": "override" (USBOFF, a command),
+        "file" (/run/reimu-kvm/usboff: since when, uptime s; absent: on),
+        "dbus" (no /run/reimu-kvm: an older reimu-kvm, its Status);
+        count: every cat/cut/sed/busctl the watcher runs is logged (calls())"""
         self.w = tempfile.mkdtemp(prefix="hidwatch-")
+        self.kvm = kvm
+        if kvm == "file":
+            os.makedirs(self.w + "/run/reimu-kvm")
         self.hs, self.addr_comes = hs, addr
         self.g = self.w + "/sys/kernel/config/usb_gadget"
         os.makedirs(self.g + "/obmc_hid")
@@ -79,12 +87,25 @@ class Fake:
             open(rf, "w").write('#!/bin/sh\n%s\n' % ('exit 1' if fand is None else
                                 'echo \'{"version":1,"host":"%s","zones":[]}\'' % fand))
             os.chmod(rf, 0o755)
+        if kvm == "dbus":
+            bc = self.w + "/bin/busctl"
+            open(bc, "w").write(BUSCTL_KVM.replace("%W%", self.w))
+            os.chmod(bc, 0o755)
+        if count:
+            os.makedirs(self.w + "/cbin")
+            for c in ("cat", "cut", "sed", "busctl"):
+                real = self.w + "/bin/busctl" if c == "busctl" else "/tmp/bb/" + c
+                open(self.w + "/cbin/" + c, "w").write('#!/tmp/bb/sh\necho %s >> %s/calls\nexec %s "$@"\n' % (c, self.w, real))
+                os.chmod(self.w + "/cbin/" + c, 0o755)
         dm = self.w + "/bin/devmem"
         open(dm, "w").write('#!/bin/sh\ncat "%s/regs/$1" 2>/dev/null || echo 0x00000000\n' % self.w)
         os.chmod(dm, 0o755)
         self.host(host)
-        env = dict(os.environ, ROOT=self.w, POLL="1", GRACE="2", USBOFF="cat %s/usboff" % self.w, DEVMEM=dm,
-                   PATH="%s/bin:/tmp/bb" % self.w)
+        env = dict(os.environ, ROOT=self.w, POLL="1", GRACE="2", DEVMEM=dm,
+                   PATH=("%s/cbin:" % self.w if count else "") + "%s/bin:/tmp/bb" % self.w)
+        env.pop("USBOFF", None)
+        if kvm == "override":
+            env["USBOFF"] = "cat %s/usboff" % self.w
         if dbus is None and fand is None:
             env["HOST_ON"] = "test -f %s/host_on" % self.w
         self.log = open(self.w + "/log", "w")
@@ -157,6 +178,20 @@ class Fake:
 
     def set_off(self, n):
         open(self.w + "/usboff", "w").write("%d\n" % n)
+        if getattr(self, "kvm", None) == "file":
+            f = self.w + "/run/reimu-kvm/usboff"
+            if n:
+                up = float(open("/proc/uptime").read().split()[0])
+                open(f + ".new", "w").write("%d\n" % (up - n))
+                os.rename(f + ".new", f)
+            elif os.path.exists(f):
+                os.unlink(f)
+
+    def calls(self):
+        try:
+            return open(self.w + "/calls").read().split()
+        except OSError:
+            return []
 
     def host(self, on):
         f = self.w + "/host_on"
@@ -194,6 +229,29 @@ def main():
         os.makedirs("/tmp/bb")
         for a in subprocess.run(["/usr/bin/busybox", "--list"], capture_output=True, text=True).stdout.split():
             os.symlink("/usr/bin/busybox", "/tmp/bb/" + a)
+
+    print("== the host has the keyboard: a poll runs no command (reimu-kvm's file, sysfs by read)")
+    f = Fake(kvm="file", off=0, count=True)
+    time.sleep(5)
+    c = f.calls()
+    check(f.resets() == 0, "no reset (%d)" % f.resets())
+    check(not c, "5 polls, no command run (%d: %s)" % (len(c), " ".join(sorted(set(c)))))
+    f.stop()
+
+    print("== reimu-kvm's file: the keyboard gone for 99 s: one reset, the host gets it")
+    f = Fake(kvm="file", off=99)
+    time.sleep(4)
+    check(f.resets() == 1, "one reset (%d)" % f.resets())
+    check(f.enumerated is True, "enumerated")
+    time.sleep(3)
+    check(f.resets() == 1, "and no more resets (%d)" % f.resets())
+    f.stop()
+
+    print("== no /run/reimu-kvm (an older reimu-kvm): its Status over D-Bus, one reset")
+    f = Fake(kvm="dbus", off=99)
+    time.sleep(4)
+    check(f.resets() == 1, "one reset (%d)" % f.resets())
+    f.stop()
 
     print("== host off: nothing")
     f = Fake(host=False, state="not attached")

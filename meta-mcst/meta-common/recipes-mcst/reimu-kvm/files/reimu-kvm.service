@@ -10,6 +10,9 @@ BusName=xyz.openbmc_project.Reimu.Kvm
 ExecStart=/usr/sbin/reimu-kvm
 Restart=always
 RestartSec=10
+# /run/reimu-kvm/usboff for reimu-hid-watch; gone with the daemon (the watcher
+# then asks over D-Bus, which fails: "the host has it", as before)
+RuntimeDirectory=reimu-kvm
 
 [Install]
 WantedBy=multi-user.target

@@ -299,11 +299,12 @@ def s_watch():
             return os.read(p.stdout.fileno(), 65536).decode()
         except BlockingIOError:
             return ""
-    out, ok, enabled = "", False, False
+    out, ok, enabled, had_file = "", False, False, None
     for _ in range(150):
         time.sleep(0.2)
         out += more()
         if not enabled and "resetting the virtual hub" in out:
+            had_file = os.path.exists("/run/reimu-kvm/usboff")
             K.sh("echo 0 > %s" % port)
             enabled = True
         if enabled and K.udc_state() == "configured" and len(K.input_devices()) == 2:
@@ -320,10 +321,11 @@ def s_watch():
     w.send(K.key(HID_A, 1), K.key(HID_A, 0))
     kb.read(quiet=0.8)
     check(kb.keys(KEY_A) == [(KEY_A, 1), (KEY_A, 0)], "reimu-kvm's next key reaches the host (%s)" % kb.keys(KEY_A))
+    check(had_file is True, "reimu-kvm's /run/reimu-kvm/usboff there when the watcher reset (what it read)")
+    check(not os.path.exists("/run/reimu-kvm/usboff"), "and gone once the host has the keyboard again")
     kb.close()
     w.close()
     K.kvm_stop()
-
 
 def s_watch_kexec():
     """the board after a kexec: the UDC made anew ("not attached"), the

@@ -13,10 +13,13 @@
 # Whether the host has the gadget, either of:
 #   - the port's UDC state "not attached": the port was (re)made (a boot, a
 #     kexec, a vhub reset) and the host has never configured the gadget since;
-#   - reimu-kvm's Status "usboff", the seconds since the host's configuration
+#   - reimu-kvm's "usboff", the seconds since the host's configuration
 #     of the keyboard went away (f_hid answers ESHUTDOWN until the host
 #     configures it again): the state stays "configured" across an unbind and
-#     bind of the gadget (only a bus reset changes it).
+#     bind of the gadget (only a bus reset changes it). Read from its file
+#     /run/reimu-kvm/usboff (since when, uptime s; absent: the host has it),
+#     so that a poll runs no command; no /run/reimu-kvm (an older reimu-kvm):
+#     its Status over D-Bus.
 #
 # The host on: as reimu-fand judges it: Host CurrentHostState (reimupwr sets
 # it from GPIO_POWER_IN) anything but Off; Off or unreadable: reimu-fand's own
@@ -56,7 +59,8 @@ VHUB=${VHUB:-1e6a0000.usb-vhub}
 G=$ROOT/sys/kernel/config/usb_gadget
 DRV=$ROOT/sys/bus/platform/drivers/${VHUB_DRIVER:-aspeed_vhub}
 HOST_ON=${HOST_ON:-host_on}     # tests: a command saying whether the host is on
-USBOFF=${USBOFF:-usb_off}       # tests: a command printing reimu-kvm's "usboff"
+USBOFF=${USBOFF:-}              # tests: a command printing reimu-kvm's "usboff"
+KVM_RUN=${KVM_RUN:-$ROOT/run/reimu-kvm}
 DEVMEM=${DEVMEM:-devmem}        # tests: a fake register read
 REG_CONF=0x1E6A0004             # AST_VHUB_CONF: the hub's USB address
 REG_USBSTS=0x1E6A0024           # AST_VHUB_USBSTS: bit 27 high speed
@@ -78,11 +82,26 @@ host_on() {
     return 1
 }
 
-uptime_s() { cut -d. -f1 /proc/uptime; }
+# $t: uptime, whole seconds (a builtin read: no command per poll)
+uptime_t() { read -r t _ < /proc/uptime; t=${t%.*}; }
 
 usb_off() {
     busctl call xyz.openbmc_project.Reimu.Kvm /xyz/openbmc_project/reimu/kvm \
         xyz.openbmc_project.Reimu.Kvm Status 2>/dev/null | sed -n 's/.*\\"usboff\\":\([0-9]*\).*/\1/p'
+}
+
+# $off: reimu-kvm's "usboff" at uptime $t
+usb_off_now() {
+    if [ -n "$USBOFF" ]; then
+        off=$($USBOFF)
+    elif [ -d "$KVM_RUN" ]; then
+        since=
+        { read -r since < "$KVM_RUN/usboff"; } 2>/dev/null
+        off=0
+        case $since in ''|*[!0-9]*) ;; *) off=$((t - since)); [ $off -ge 0 ] || off=0 ;; esac
+    else
+        off=$(usb_off)
+    fi
 }
 
 # a disk the host may be using: the virtual media (jsnbd's mass-storage0/1)
@@ -174,20 +193,21 @@ fi
 
 on_since= na_since= done_this_power_on=0 media_said=
 while :; do
-    t=$(uptime_s)
+    uptime_t
     if $HOST_ON; then
         [ -n "$on_since" ] || on_since=$t
     else
         on_since= done_this_power_on=0
     fi
-    udc=$(cat $G/obmc_hid/UDC 2>/dev/null)
-    state=$(cat $ROOT/sys/class/udc/$udc/state 2>/dev/null)
+    udc= state=
+    { read -r udc < $G/obmc_hid/UDC; } 2>/dev/null
+    [ -n "$udc" ] && { read -r state < $ROOT/sys/class/udc/$udc/state; } 2>/dev/null
     if [ -n "$udc" ] && [ "$state" = "not attached" ]; then
         [ -n "$na_since" ] || na_since=$t
     else
         na_since=
     fi
-    off=$($USBOFF)
+    usb_off_now
     lost=
     [ "${off:-0}" -ge $GRACE ] && lost="usboff $off s"
     [ -n "$na_since" ] && [ $((t - na_since)) -ge $GRACE ] && lost="not attached for $((t - na_since)) s"

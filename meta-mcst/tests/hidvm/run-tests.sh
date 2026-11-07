@@ -48,6 +48,7 @@ mkdir -p "$S/ikvm"
 docker exec reimu tar -C /tmp/hidvm-ikvm --exclude=.git -cf - . | tar -C "$S/ikvm" -xf -
 [ "${NEED_UPSTREAM_SCRIPT:-}" = 1 ] && cp "$S/ikvm/create_usbhid.sh" "$S/create_usbhid.sh"
 cp -R "$HERE/vm/." "$W/share/"
+cp "$HERE/../ab64/hid_desc.py" "$W/share/"   # kvmscen.py's iface: the stock descriptors
 "$HERE/vssh" "$W" true 2>/dev/null || "$HERE/run-hidvm.sh" "$W" || exit 1
 V() { "$HERE/vssh" "$W" "$@"; }
 V "cd /mnt/src && gcc -O2 -Wall -o reimu-kvm reimu-kvm.c -lssl -lcrypto -lsystemd" || exit 1

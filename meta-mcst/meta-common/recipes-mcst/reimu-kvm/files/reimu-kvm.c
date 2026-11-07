@@ -68,6 +68,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
@@ -172,8 +173,29 @@ static uint8_t leds; // the host's keyboard LEDs (bit 0 Num, 1 Caps, 2 Scroll Lo
 // configuration went (unbind, disconnect) until the host sets it again; the
 // UDC's sysfs "state" can't tell (it stays "configured" across a rebind).
 // Since when it has been off (0: on or unknown): Status "usboff" for
-// reimu-hid-watch
+// reimu-hid-watch, and its file RUN_DIR/usboff (since when, CLOCK_MONOTONIC
+// whole seconds = the BMC's uptime; absent: on), written on a change only, so
+// that the watcher's poll reads a file instead of calling Status
 static double usb_off_since;
+#define RUN_DIR "/run/reimu-kvm"
+
+static void usb_off_set(double since)
+{
+    if ((since != 0) == (usb_off_since != 0)) return;
+    usb_off_since = since;
+    if (!since) {
+        unlink(RUN_DIR "/usboff");
+        return;
+    }
+    char s[32];
+    int n = snprintf(s, sizeof s, "%.0f\n", since);
+    int fd = open(RUN_DIR "/usboff.new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    int ok = write(fd, s, n) == n;
+    close(fd);
+    if (ok) rename(RUN_DIR "/usboff.new", RUN_DIR "/usboff");
+    else unlink(RUN_DIR "/usboff.new");
+}
 
 static void hid_epoll(struct hiddev *d, int out)
 {
@@ -240,7 +262,7 @@ static void hid_flush(struct hiddev *d)
             d->written++;
             d->stuck = 0;
             d->gaveup = 0;
-            if (d == &kbd) usb_off_since = 0;
+            if (d == &kbd) usb_off_set(0);
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EINTR)) {
@@ -297,15 +319,15 @@ static void hid_read(struct hiddev *d)
     for (;;) {
         ssize_t n = read(d->fd, b, sizeof b);
         if (n > 0) {
-            if (d == &kbd) leds = b[0], usb_off_since = 0;
+            if (d == &kbd) leds = b[0], usb_off_set(0);
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
-            if (d == &kbd) usb_off_since = 0;
+            if (d == &kbd) usb_off_set(0);
             return;
         }
         // ESHUTDOWN: the host's configuration is gone (unbound, disconnected)
-        if (d == &kbd && !usb_off_since) usb_off_since = now();
+        if (d == &kbd && !usb_off_since) usb_off_set(now());
         hid_close(d);
         return;
     }
@@ -1266,6 +1288,8 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
+    mkdir(RUN_DIR, 0755); // RuntimeDirectory= under systemd; by hand: here
+    unlink(RUN_DIR "/usboff");
 
     ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
