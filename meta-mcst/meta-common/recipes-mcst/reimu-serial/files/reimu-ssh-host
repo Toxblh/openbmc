@@ -4,47 +4,90 @@
 # the COM console is stuck.
 #
 # State in $REIMU_SSH_STATE (default /var/lib/reimu-ssh): the BMC's key
-# (made once), the target user@host and known_hosts. Login is by that key or,
-# without it, by password typed in the terminal (never stored).
+# (made once), the user on the platform, known_hosts, and a fixed target
+# user@IP only when one was typed. Without a fixed target the platform's
+# address is found on every connect: its lease on the USB network to the
+# BMC (reimu-usbnet status: host_ipv4), so only the user is asked, once.
+# Login is by that key or, without it, by password typed in the terminal
+# (never stored).
 STATE=${REIMU_SSH_STATE:-/var/lib/reimu-ssh}
 KEY=$STATE/id_ed25519
+USBNET=${REIMU_USBNET:-/usr/libexec/reimu-usbnet}
 mkdir -p "$STATE" && chmod 700 "$STATE"
 # ^C ends ssh (it is in the same process group), not this script; a read it
 # interrupts returns > 128 and is asked again
 trap : INT
 [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "reimu-bmc@$(hostname)" -f "$KEY" || exit 1
 
+# the host's IPv4 on the USB network, "" when it has none
+usb_host()
+{
+    "$USBNET" status 2>/dev/null | sed -n 's/.*"host_ipv4":"\([0-9.]*\)".*/\1/p'
+}
+
+# a line typed: user@IP -> the fixed target, a user alone -> the user (the
+# address found by itself). 0: taken, 1: not a target
+take()
+{
+    case $1 in
+        *@?*) echo "$1" > "$STATE/target"; return 0 ;;
+        *[!A-Za-z0-9._-]* | '') return 1 ;;
+        *) rm -f "$STATE/target"; echo "$1" > "$STATE/user"; return 0 ;;
+    esac
+}
+
 ask_target()
 {
     local t
     while :; do
-        printf 'Адрес платформы для SSH (пользователь@IP): '
+        if [ -n "$(usb_host)" ]; then
+            printf 'Пользователь на платформе (адрес по USB-сети найдётся сам; или пользователь@IP): '
+        else
+            printf 'Адрес платформы для SSH (пользователь@IP; по USB-сети хост не виден): '
+        fi
         read -r t
         case $? in 0) ;; 1) exit 0 ;; *) echo; continue ;; esac
         case $t in
-            *@?*) echo "$t" > "$STATE/target"; return ;;
-            '') ;;
-            *) echo "нужно в виде пользователь@IP, например user@192.168.1.10" ;;
+            *@?*) take "$t"; return ;;
         esac
+        if [ -n "$t" ] && [ -n "$(usb_host)" ] && take "$t"; then return; fi
+        if [ -n "$(usb_host)" ]; then echo "нужно имя пользователя на платформе, например user (или user@192.168.1.10)"
+        else echo "нужно в виде пользователь@IP, например user@192.168.1.10"; fi
     done
+}
+
+# where to go now: the fixed target, or the user at today's USB address
+target()
+{
+    if [ -s "$STATE/target" ]; then cat "$STATE/target"; return; fi
+    local ip
+    ip=$(usb_host)
+    [ -s "$STATE/user" ] && [ -n "$ip" ] && echo "$(cat "$STATE/user")@$ip"
 }
 
 echo "Ключ BMC (добавьте его в ~/.ssh/authorized_keys на платформе, чтобы входить без пароля;"
 echo "без него ssh спросит пароль, он нигде не сохраняется):"
 cat "$KEY.pub"
-[ -s "$STATE/target" ] || ask_target
+[ -n "$(target)" ] || ask_target
 
 while :; do
-    target=$(cat "$STATE/target")
-    echo "ssh $target"
+    t=$(target)
+    if [ -z "$t" ]; then
+        echo "по USB-сети хост сейчас не виден"
+        ask_target
+        continue
+    fi
+    echo "ssh $t"
     ssh -tt -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
-        -o ServerAliveInterval=15 -o ConnectTimeout=10 "$target"
+        -o ServerAliveInterval=15 -o ConnectTimeout=10 "$t"
     rc=$?
     echo
     while :; do
-        printf 'SSH завершён (код %s). Enter: войти снова; пользователь@IP: другой адрес: ' $rc
+        printf 'SSH завершён (код %s). Enter: войти снова; имя: другой пользователь; пользователь@IP: другой адрес: ' $rc
         read -r t
-        case $? in 0) break ;; 1) exit 0 ;; *) echo ;; esac
+        case $? in 0) ;; 1) exit 0 ;; *) echo; continue ;; esac
+        [ -z "$t" ] && break
+        take "$t" && break
+        echo "нужно имя пользователя или пользователь@IP"
     done
-    case $t in *@?*) echo "$t" > "$STATE/target" ;; esac
 done
