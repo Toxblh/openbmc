@@ -109,7 +109,7 @@ function usersCard(accounts) {
 }
 
 async function rebootBmc() {
-  if (!confirm("Перезагрузить BMC? Веб-интерфейс будет недоступен около полутора минут (при записи нового образа — дольше).")) return;
+  if (!confirm("Перезагрузить BMC? Хост будет жёстко перезапущен вместе с ним. Веб-интерфейс будет недоступен около полутора минут (при записи нового образа — дольше).")) return;
   try {
     await api.post("/redfish/v1/Managers/bmc/Actions/Manager.Reset", { ResetType: "GracefulRestart" });
     toast("BMC перезагружается", "ok");

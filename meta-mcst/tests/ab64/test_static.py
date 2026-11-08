@@ -1032,6 +1032,33 @@ def _(ctx):
     ctx.rootfs["/etc/modules-load.d/l-pcs-i2c.conf"] = b"l-pcs-i2c\n"
 
 
+WDT1_MASK_GOOD = 0x023ffff3  # the AST2500's default: the ARM CPU (bit 0) reset too
+
+
+@check("S76", 140, "WDT1's reset mask with the ARM CPU in it: in the image's device tree (the kernel writes it at boot), a systemd-shutdown hook setting it before every reboot")
+def s76(ctx):
+    nodes = fdt_nodes(tar_member(KEXEC, "fdt"))
+    wdt = [p for n, p in nodes if n.endswith("/watchdog@1e785000")]
+    raw = wdt[0].get("aspeed,reset-mask") if wdt else None
+    if getattr(ctx, "wdt_mask_drop", False):
+        raw = None
+    mask = struct.unpack(">I", raw[:4])[0] if raw and len(raw) >= 4 else None
+    hook = ctx.fs("/lib/systemd/system-shutdown/reimu-wdt-mask") or b""
+    ok_hook = b"0x1e78501c" in hook and b"0x%08x" % WDT1_MASK_GOOD in hook
+    return mask == WDT1_MASK_GOOD and ok_hook, "watchdog@1e785000 aspeed,reset-mask %s; shutdown hook %s" % (
+        "0x%08x" % mask if mask is not None else "none", "there" if ok_hook else "missing")
+
+
+@mutant("S76", "no aspeed,reset-mask on WDT1 (beta7)")
+def _(ctx):
+    ctx.wdt_mask_drop = True
+
+
+@mutant("S76", "no shutdown hook")
+def _(ctx):
+    ctx.rootfs["/lib/systemd/system-shutdown/reimu-wdt-mask"] = None
+
+
 # ------------------------------------------------------------------ native tests of the power code
 SERVER_CTL = "meta-mcst/meta-common/recipes-mcst/buttonscripts/files/server_ctl.c"
 UNIT = os.path.join(HERE, "unit")

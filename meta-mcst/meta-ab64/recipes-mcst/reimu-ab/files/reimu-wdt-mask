@@ -1,0 +1,15 @@
+#!/bin/sh
+# systemd-shutdown hook (reimu-ab): WDT1's reset mask right before the
+# reboot (or poweroff, halt, kexec: $1), whatever wrote it since the boot.
+# The kernel's reboot is a WDT1 SoC reset; with the ARM CPU (bit 0) out of
+# the mask it resets no CPU ("Reboot failed -- System halted") and the BMC
+# stays dead until a power cycle (REGRESSIONS 140). The device tree sets
+# it at boot, reimu-logd at runtime; this is the last chance.
+REG=0x1e78501c
+GOOD=0x023ffff3
+v=$(devmem $REG 32 2>/dev/null) || exit 0
+[ $((v)) -eq $((GOOD)) ] && exit 0
+devmem $REG 32 $GOOD
+printf '<2>reimu: WDT1 reset mask 0x%08x set to 0x%08x (now 0x%08x) before the %s\n' \
+    $((v)) $((GOOD)) $(($(devmem $REG 32))) "${1:-reboot}" > /dev/kmsg
+exit 0

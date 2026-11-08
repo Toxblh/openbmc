@@ -52,6 +52,11 @@ Groups (all by default):
            where these bugs were, are out of the image since beta7)
   pns      [39] reimu-pns-flash switches the PNS flash back to the host when
            a job fails (red: its switch() through gpiowrite in the EXIT trap)
+  wdt      [140] WDT1's reset mask with the ARM CPU in it: at boot (the
+           device tree), put back at runtime (reimu-logd), right before every
+           reboot (a systemd-shutdown hook); red: the beta7 image
+  net      (a guard, no bug) eth0 asks DHCP again when networkd restarts
+           with no lease: the board's missing lease of 2026-11-08 was its RX
 """
 import os, re, subprocess, sys, time
 
@@ -67,7 +72,7 @@ W, check = T.W, T.check
 IMAGE = os.environ.get("REG_IMAGE", os.path.join(W, "ab.mtd"))
 RED = os.environ.get("REG_RED") == "1"
 DOCKER = os.environ.get("REIMU_DOCKER", "reimu")
-GROUPS = GROUPS_ARG or ["base", "kexec", "platform", "fruid", "hwmon", "pns"]
+GROUPS = GROUPS_ARG or ["base", "kexec", "platform", "fruid", "hwmon", "pns", "wdt", "net"]
 red_missing = []
 
 
@@ -591,12 +596,82 @@ def g_pns():
         b.stop()
 
 
+# ------------------------------------------------------------------ wdt
+WDT1_MASK = 0x1e78501c
+MASK_GOOD = 0x023ffff3  # the AST2500's default: the ARM CPU (bit 0) reset too
+MASK_BAD = 0x00d76300   # read on the board 2026-11-08: no CPU, no graphics
+
+
+def wdt1_mask(b):
+    try:
+        return int(b.out("devmem 0x%08x 32" % WDT1_MASK, timeout=20).strip(), 16)
+    except ValueError:
+        return None
+
+
+def g_wdt():
+    """[140] WDT1's reset mask: the board's read 0x00d76300 (written by
+    nobody known; U-Boot never rewrites it, it lasts until a power cycle):
+    a reboot (WDT1) then reset no ARM CPU, "Reboot failed -- System halted",
+    the BMC dead until someone came. The device tree's mask at every boot,
+    reimu-logd putting it back (and logging it) at runtime, a shutdown hook
+    setting it right before every reboot"""
+    b = T.Bmc("reg-wdt", image("reg-wdt")).start()
+    try:
+        if not check(b.wait_ssh(600), "up"):
+            return
+        b.ssh("devmem 0x%08x 32 0x%08x" % (WDT1_MASK, MASK_BAD))
+        if not check(wdt1_mask(b) == MASK_BAD, "QEMU keeps WDT1's reset mask (0x%08x read back)" % (wdt1_mask(b) or 0)):
+            return
+        ok = until(lambda: wdt1_mask(b) == MASK_GOOD, 90, 5)
+        ev = b.out("journalctl -q --no-pager -t reimu-logd | grep -i 'reset mask'; grep -a -i 'reset mask' /var/lib/reimu-logd/events.log")
+        check(ok and "0x00d76300" in ev, "[140] a bad mask at runtime put back by reimu-logd within 90 s, logged "
+              "(now 0x%08x; %s)" % (wdt1_mask(b) or 0, ev.strip().replace("\n", " | ")[-200:] or "no line"))
+        # the hook alone: reimu-logd stopped, so that it can't put it back first
+        b.ssh("systemctl stop reimu-logd; devmem 0x%08x 32 0x%08x" % (WDT1_MASK, MASK_BAD))
+        mark = len(b.console())
+        b.ssh("nohup sh -c 'sleep 1; systemctl reboot' >/dev/null 2>&1 &")
+        b.wait_console(r"reboot: Restarting system", 300, mark)
+        tail = b.console()[mark:]
+        hook = re.search(r"reimu: WDT1 reset mask .*", tail)
+        check(hook and "0x00d76300" in hook.group(0), "[140] the shutdown hook sets the mask before the reboot (%s)"
+              % (hook.group(0).strip() if hook else "no line on the console"))
+        if not check(b.wait_ssh(600), "up again"):
+            return
+        m = wdt1_mask(b)
+        check(m == MASK_GOOD, "[140] after the reboot 0x%08x" % (m or 0))
+    finally:
+        b.stop()
+
+
+def g_net():
+    """DHCP on eth0 when systemd-networkd starts with no lease (no bug: a
+    guard). On the board (2026-11-08) eth0 never got a lease after networkd
+    was restarted 8 s after boot ("DHCPv4 connection considered critical":
+    KeepConfiguration=dhcp of reimu-networkd-keep-dhcp) and fell back to
+    192.168.1.1; its RX was failing (29 packets in 12 min). Here networkd
+    asks again (green on the beta7 code too): the RX, not networkd"""
+    b = T.Bmc("reg-net", image("reg-net")).start()
+    try:
+        if not check(b.wait_ssh(600), "up"):
+            return
+        before = b.out("ip -4 addr show eth0 | sed -n 's/.*inet \\([0-9./]*\\).*/\\1/p'").strip()
+        # the lease gone and networkd restarted, as at that boot
+        b.ssh("nohup sh -c 'sleep 1; ip -4 addr flush dev eth0; systemctl restart systemd-networkd' >/dev/null 2>&1 &")
+        time.sleep(5)
+        up = b.wait_ssh(180)
+        after = b.out("ip -4 addr show eth0 | sed -n 's/.*inet \\([0-9./]*\\).*/\\1/p'").strip() if up else "unreachable"
+        check(up and after == before, "eth0 by DHCP again after networkd restarted with no lease (%s -> %s)" % (before, after))
+    finally:
+        b.stop()
+
+
 if __name__ == "__main__":
     t0 = time.time()
     for g in GROUPS:
         print("== %s (%s%s)" % (g, os.path.basename(IMAGE), ", red runs" if RED else ""), flush=True)
         t = time.time()
-        {"base": g_base, "kexec": g_kexec, "platform": g_platform, "fruid": g_fruid, "hwmon": g_hwmon, "pns": g_pns}[g]()
+        {"base": g_base, "kexec": g_kexec, "platform": g_platform, "fruid": g_fruid, "hwmon": g_hwmon, "pns": g_pns, "wdt": g_wdt, "net": g_net}[g]()
         print("   (%d s)" % (time.time() - t), flush=True)
     print("%d failed%s (%d s)" % (len(T.failed), ", %d red runs that passed" % len(red_missing) if RED else "",
                                   time.time() - t0))

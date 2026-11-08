@@ -7,7 +7,8 @@
  * priority <= warning, and every line of the daemons named below; kernel
  * oops/panic lines and the like count as critical. See ev-core.c for the
  * limits. At every BMC boot, one line: why it started (reset registers, read
- * only; the previous run's clean stop).
+ * only; the previous run's clean stop). Every 30 s WDT1's reset mask is
+ * checked and put back if something changed it (wdt_mask_check).
  *
  *   service   xyz.openbmc_project.Reimu.Logs
  *   object    /xyz/openbmc_project/reimu/logs
@@ -124,6 +125,43 @@ static unsigned read_reg(unsigned long addr)
     v = *(volatile unsigned *)((char *)m + (addr & (ps - 1)));
     munmap(m, ps);
     return v;
+}
+
+static int write_reg(unsigned long addr, unsigned v)
+{
+    int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (fd < 0) return -1;
+    long ps = sysconf(_SC_PAGESIZE);
+    void *m = mmap(NULL, ps, PROT_READ | PROT_WRITE, MAP_SHARED, fd, addr & ~(ps - 1));
+    close(fd);
+    if (m == MAP_FAILED) return -1;
+    *(volatile unsigned *)((char *)m + (addr & (ps - 1))) = v;
+    munmap(m, ps);
+    return 0;
+}
+
+/* WDT1's reset mask: the blocks its SoC reset (the kernel's reboot, the
+ * watchdog of systemd) resets. The board's read 0x00d76300 one day, the ARM
+ * CPU out of it: every reboot ended "System halted" and the BMC stayed dead
+ * until a power cycle (REGRESSIONS 140). Nothing known wrote it; U-Boot
+ * never does, so it lasts. The device tree sets the default at boot, the
+ * shutdown hook (reimu-ab) before a reboot; this puts it back in between,
+ * a critical event saying when. */
+#define WDT1_RESET_MASK 0x1e78501cUL
+#define WDT1_MASK_GOOD  0x023ffff3u
+#define WDT_MASK_SEC    30
+
+static void wdt_mask_check(void)
+{
+    unsigned v = read_reg(WDT1_RESET_MASK);
+    if (v == WDT1_MASK_GOOD || v == ~0u) return;
+    write_reg(WDT1_RESET_MASK, WDT1_MASK_GOOD);
+    unsigned now = read_reg(WDT1_RESET_MASK);
+    char failed[40] = "";
+    if (now != WDT1_MASK_GOOD) snprintf(failed, sizeof(failed), ", FAILED (still 0x%08x)", now);
+    sd_journal_send("MESSAGE=WDT1 reset mask was 0x%08x (a reboot or the watchdog would not restart the BMC's CPU): "
+                    "set to 0x%08x%s", v, WDT1_MASK_GOOD, failed,
+                    "PRIORITY=%d", LOG_CRIT, "SYSLOG_IDENTIFIER=reimu-logd", NULL);
 }
 
 static void read_text(const char *path, char *b, size_t n)
@@ -555,7 +593,7 @@ int main(int argc, char **argv)
     sigprocmask(SIG_BLOCK, &set, NULL);
     int sfd = signalfd(-1, &set, SFD_CLOEXEC);
     sd_notify(0, "READY=1");
-    int64_t last_sweep = 0, last_watchdog = 0;
+    int64_t last_sweep = 0, last_watchdog = 0, last_mask = -WDT_MASK_SEC;
     for (;;)
     {
         journal_read();
@@ -566,6 +604,11 @@ int main(int argc, char **argv)
         {
             last_sweep = now;
             diag_sweep();
+        }
+        if (now - last_mask >= WDT_MASK_SEC)
+        {
+            last_mask = now;
+            wdt_mask_check();
         }
         if (now - last_watchdog >= 15)
         {

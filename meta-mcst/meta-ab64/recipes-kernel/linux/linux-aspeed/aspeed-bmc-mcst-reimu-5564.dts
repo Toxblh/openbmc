@@ -131,6 +131,18 @@
 	};
 };
 
+/* WDT1 (the reboot and the watchdog of systemd): its reset mask, the blocks
+ * its SoC reset resets, written at every boot. U-Boot never writes it and
+ * it lasts until a power cycle: on the board (2026-11-08) it read 0x00d76300,
+ * without the ARM CPU (bit 0): every reboot then ended "Reboot failed --
+ * System halted", the BMC dead until a power cycle (REGRESSIONS 140). The
+ * AST2500's default: the CPU and the graphics (bit 7) reset too, which the
+ * host doesn't survive, but the BMC always comes back. reimu-logd puts it
+ * back at runtime, a systemd-shutdown hook before every reboot. */
+&wdt1 {
+	aspeed,reset-mask = <0x023ffff3>;
+};
+
 &wdt2 {
 	status = "disabled";
 };

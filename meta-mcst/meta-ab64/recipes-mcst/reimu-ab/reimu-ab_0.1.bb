@@ -20,6 +20,7 @@ SRC_URI = " \
             file://reimu-ab.env \
             file://reimu-ab.service \
             file://reimu-watchdog.conf \
+            file://reimu-wdt-mask \
             file://reimu-abd.c \
             file://reimu-abd.service \
             file://xyz.openbmc_project.Software.BMC.Updater.conf \
@@ -28,12 +29,15 @@ S = "${WORKDIR}"
 
 do_install() {
   install -d ${D}/usr/sbin ${D}/usr/share/reimu-ab ${D}${systemd_system_unitdir} \
-             ${D}${systemd_unitdir}/system.conf.d ${D}${sysconfdir}/dbus-1/system.d
+             ${D}${systemd_unitdir}/system.conf.d ${D}${sysconfdir}/dbus-1/system.d \
+             ${D}${systemd_unitdir}/system-shutdown
   install -m 755 reimu-flash reimu-fit reimu-ab reimu-ota reimu-abd ${D}/usr/sbin
   install -m 644 reimu-abd.service ${D}${systemd_system_unitdir}
   install -m 644 xyz.openbmc_project.Software.BMC.Updater.conf ${D}${sysconfdir}/dbus-1/system.d
   install -m 644 reimu-ab.env ${D}/usr/share/reimu-ab
   install -m 644 reimu-ab.service ${D}${systemd_system_unitdir}
   install -m 644 reimu-watchdog.conf ${D}${systemd_unitdir}/system.conf.d/reimu-watchdog.conf
+  # WDT1's reset mask right before every reboot (REGRESSIONS 140)
+  install -m 755 reimu-wdt-mask ${D}${systemd_unitdir}/system-shutdown/reimu-wdt-mask
 }
-FILES_${PN} += "${systemd_unitdir}/system.conf.d"
+FILES_${PN} += "${systemd_unitdir}/system.conf.d ${systemd_unitdir}/system-shutdown"
