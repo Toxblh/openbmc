@@ -314,17 +314,19 @@ void cfg_defaults(struct config *c)
     c->tach_valid_duty = 30;
     c->tach_valid_duty_other = 50;
     c->tach_mode = 2;
-    /* the X37 fan (measured): 1000-2400 rpm with a noisy tachometer at 30 %,
-     * readings dropping to 0 at 40 %, a steady ~1650 at 50 %, saturated at
-     * ~2700 from 60 % */
-    c->cpu_fan_min = 35;
-    c->cpu_fan_max = 65;
+    /* the X37 fan, measured 2026-11-08 (3-wire, driven by the chip's PWM):
+     * at PWM_FREQ 0x17 (~30 Hz) it jumped from ~1690 rpm at 55 % to ~2620 at
+     * 60 % and no higher (hunting on that edge, audibly), so its range had
+     * been squeezed to 35..65 %; at 12 (~58 Hz) it rises smoothly from ~1000
+     * at 30 % to ~2640 at 100 %, ±10 rpm: the whole range */
+    c->cpu_fan_min = 30;
+    c->cpu_fan_max = 100;
     c->board_fan_max = 100;
     c->case_fan_max = 100;
     c->cpu_tach = 1;
     c->emc_watchdog = 1;
     c->host_probe = 1;
-    c->pwm_freq = 0x17;
+    c->pwm_freq = 12;
     c->pwm_fast = 0;
     c->guard_ms = 5000;
     c->guard_corrupt_regs = 4;
@@ -996,10 +998,14 @@ static void read_groups(struct fand *f)
 
 /* ------------------------------------------------------------------ outputs */
 /* The LM96163 PWM value register (0x4C) is 6 bits wide, 100 % at
- * 2 * PWM_FREQ (0x4D, 5 bits): 46 with this board's 0x17. Only in the
+ * 2 * PWM_FREQ (0x4D, 5 bits): 24 with PWM_FREQ 12 (46 with the
+ * platform's 0x17). Only in the
  * high-resolution mode (ENHANCED 0x45 bit 4, the 360 kHz clock: 0x4A bit 3
  * clear, PWM_FREQ 8, as the lm63 driver tests it) is it 8 bits, 255 = 100 %.
  * The scale is read before every write. -1: unreadable */
+/* what the platform leaves in 0x4D (~30 Hz): set to PWM_FREQ at a takeover
+ * without counting it as a repair */
+#define LM96163_PLATFORM_FREQ 0x17
 static int lm96163_max(int b, int a, int cfg)
 {
     int freq = hw_rd_byte(b, a, 0x4d), enh = freq >= 0 ? hw_rd_byte(b, a, 0x45) : -1;
@@ -1132,7 +1138,9 @@ static void chip_guard(struct fand *f, struct output *o)
         int diff = (cur[i] ^ g[i].val) & g[i].mask;
         if (!diff) continue;
         todo |= 1u << i;
-        if (first && ((o->has_tach && g[i].rd == 0x4a && !(diff & ~3)) || (o->kind == OUT_EMC2305 && g[i].rd == 0x20))) silent |= 1u << i;
+        if (first && ((o->has_tach && g[i].rd == 0x4a && !(diff & ~3)) || (o->kind == OUT_EMC2305 && g[i].rd == 0x20) ||
+                      (o->kind == OUT_LM96163 && g[i].rd == 0x4d && cur[i] == LM96163_PLATFORM_FREQ)))
+            silent |= 1u << i;
         else if (!(o->guard_refused & (1u << i))) count++;
     }
     if (!todo) return;
@@ -1180,7 +1188,11 @@ static void chip_guard(struct fand *f, struct output *o)
             continue;
         }
         o->guard_refused &= ~bit;
-        if (silent & bit) continue;
+        if (silent & bit)
+        {
+            if (g[i].rd == 0x4d) fand_log(6, "fan %d-%04x: PWM frequency 0x%02x (the platform's) -> 0x%02x", b, a, cur[i], rb);
+            continue;
+        }
         fand_log(4, "fan %d-%04x: 0x%02x 0x%02x -> 0x%02x (%s) repaired", b, a, g[i].rd, cur[i], rb, g[i].name);
         o->repairs++;
         f->repairs++;

@@ -1,2 +1,3 @@
 __pycache__/
 *.pyc
+meta-common/recipes-mcst/reimu-fand/files/tests/test_fand

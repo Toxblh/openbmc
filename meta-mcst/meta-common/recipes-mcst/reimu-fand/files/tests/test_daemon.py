@@ -62,9 +62,14 @@ def board():
     open(D + "/leds/platform:red:fanfail/trigger", "w").write("none\n")
 
 
+def lmfull(bus):
+    return 2 * reg(bus, 0x4c, 0x4d)
+
+
 def full():
-    # 100 % on the LM96163s is 2 * PWM_FREQ (0x17): 46
-    return (reg(6, 0x4c, 0x4c) == 46 and reg(2, 0x4c, 0x4c) == 46 and
+    # 100 % on an LM96163 is 2 * its PWM_FREQ: 24 at the daemon's 12, 46 at
+    # the platform's 0x17 (a fail-safe writes the chip's own full scale)
+    return (reg(6, 0x4c, 0x4c) == lmfull(6) and reg(2, 0x4c, 0x4c) == lmfull(2) and
             all(reg(2, a, 0x30 + 0x10 * n) == 0xff for a in (0x2c, 0x2e) for n in range(5)))
 
 
@@ -95,7 +100,8 @@ try:
     time.sleep(0.5)
     check(full(), "starts at 100%")
     time.sleep(2.5)
-    check(not full() and reg(6, 0x4c, 0x4c) < 0x2e, "then quiet (cpu raw %d of 46)" % reg(6, 0x4c, 0x4c))
+    check(not full() and reg(6, 0x4c, 0x4c) < lmfull(6) and reg(6, 0x4c, 0x4d) == 12,
+          "then quiet (cpu raw %d of %d, PWM_FREQ 12)" % (reg(6, 0x4c, 0x4c), lmfull(6)))
     p.send_signal(signal.SIGTERM)
     rc = p.wait(5)
     check(rc == 0 and full(), "SIGTERM: exits (%s), fans 100%%" % rc)
@@ -159,7 +165,7 @@ try:
     # a fan chip gone at runtime: alarm, the rest 100 %, the LED
     os.rename("%s/i2c-2/2e" % D, "%s/i2c-2/2e.x" % D)
     time.sleep(3)
-    check(reg(6, 0x4c, 0x4c) == 46 and open(D + "/leds/platform:red:fanfail/trigger").read().strip() == "default-on",
+    check(reg(6, 0x4c, 0x4c) == lmfull(6) and open(D + "/leds/platform:red:fanfail/trigger").read().strip() == "default-on",
           "a fan chip gone: the others 100%, LED on")
     os.rename("%s/i2c-2/2e.x" % D, "%s/i2c-2/2e" % D)
     p.send_signal(signal.SIGTERM)
@@ -187,8 +193,9 @@ try:
     check(reg(2, 0x2c, 0x30) < 0xff and not full(), "no GPU file: quiet")
     open(D + "/gpu-temp", "w").write("96000\n")
     time.sleep(8)  # up at SLEW_UP 10 %/s
-    check(reg(2, 0x2c, 0x30) == 0xff and reg(2, 0x2e, 0x70) == 0xff and reg(2, 0x4c, 0x4c) == 46 and reg(6, 0x4c, 0x4c) < 46,
-          "GPU 96 °C: the board zone's fans full scale, the CPU fan not")
+    check(reg(2, 0x2c, 0x30) == 0xff and reg(2, 0x2e, 0x70) == 0xff and reg(2, 0x4c, 0x4c) == lmfull(2) and reg(6, 0x4c, 0x4c) < lmfull(6),
+          "GPU 96 °C: the board zone's fans full scale, the CPU fan not (%d %d %d/%d %d/%d)" % (reg(2, 0x2c, 0x30), reg(2, 0x2e, 0x70),
+                                                                                    reg(2, 0x4c, 0x4c), lmfull(2), reg(6, 0x4c, 0x4c), lmfull(6)))
     os.unlink(D + "/gpu-temp")
     time.sleep(2)
     check(reg(2, 0x2c, 0x30) < 0xff and open(D + "/leds/platform:red:fanfail/trigger").read().strip() == "none",
@@ -206,7 +213,7 @@ try:
         setreg(2, 0x4c, r, v)
     time.sleep(1.5)
     log = open(D + "/daemon.log").read()
-    check(reg(2, 0x4c, 0x4a) == 0x2b and reg(2, 0x4c, 0x11) == 0 and reg(2, 0x4c, 0x4d) == 0x17 and reg(2, 0x4c, 0x03) == 6,
+    check(reg(2, 0x4c, 0x4a) == 0x2b and reg(2, 0x4c, 0x11) == 0 and reg(2, 0x4c, 0x4d) == 12 and reg(2, 0x4c, 0x03) == 6,
           "corrupted chip repaired while running")
     check("0x11 0x98 -> 0x00" in log and "0x4a 0x38 -> 0x2b" in log, "a journal line per repair, old -> new")
     check("CHIP CORRUPTION" in log and "40: " in log and "98 98 38" in log, "corruption event, with a dump before the repair")

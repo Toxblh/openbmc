@@ -213,12 +213,19 @@ def zone(s, z):
 FAN_REGS = [(6, 0x4c, 0x4c), (2, 0x4c, 0x4c)] + [(2, a, 0x30 + 0x10 * n) for a in (0x2c, 0x2e) for n in range(5)]
 
 
+def lmfull(b, bus):
+    """an LM96163's 100 %: 2 * its PWM_FREQ (0x4D): 24 at the daemon's 12,
+    46 at the platform's 0x17"""
+    return 2 * b.reg(bus, 0x4c, 0x4d)
+
+
 def full_regs(b):
-    """every fan drive register, in one ssh call"""
-    o = b.out("; ".join("i2cget -f -y %d 0x%02x 0x%02x" % x for x in FAN_REGS))
-    v = [int(x, 16) for x in o.split() if x.startswith("0x")]
-    # 100 %: the LM96163s 2 * PWM_FREQ (0x17) = 46, the EMC2305s 255
-    want = [46, 46] + [0xff] * 10
+    """every fan drive register (and the LM96163s' PWM_FREQ), in one ssh call"""
+    o = b.out("; ".join("i2cget -f -y %d 0x%02x 0x%02x" % x for x in FAN_REGS + [(6, 0x4c, 0x4d), (2, 0x4c, 0x4d)]))
+    r = [int(x, 16) for x in o.split() if x.startswith("0x")]
+    v, f6, f2 = r[:-2], r[-2] if len(r) > 1 else 0, r[-1] if r else 0
+    # 100 %: the LM96163s 2 * PWM_FREQ, the EMC2305s 255
+    want = [2 * f6, 2 * f2] + [0xff] * 10
     return v == want, v
 
 
@@ -420,7 +427,8 @@ def t_board():
         check(abs(cpu["duty"] - 39.8) < 0.2 and abs(board["duty"] - 46) < 0.2, "then the curves: cpu %.1f, board %.1f" %
               (cpu["duty"], board["duty"]))
         check(not s.get("alarm"), "no alarm (%s)" % s.get("alarm_text"))
-        check(b.reg(6, 0x4c, 0x4c) == round(39.8 * 46 / 100), "cpu fan register %d of 46" % b.reg(6, 0x4c, 0x4c))
+        check(b.reg(6, 0x4c, 0x4d) == 12 and b.reg(6, 0x4c, 0x4c) == round(39.8 * 24 / 100),
+              "cpu fan register %d of 24 (PWM_FREQ 0x%02x: the platform's 0x17 set to 12)" % (b.reg(6, 0x4c, 0x4c), b.reg(6, 0x4c, 0x4d)))
         check(b.reg(2, 0x2e, 0x70) == round(46 * 255 / 100), "case fan register %d of 255" % b.reg(2, 0x2e, 0x70))
         check(b.reg(2, 0x2c, 0x20) & 0x20 and b.reg(2, 0x2e, 0x20) & 0x20, "EMC2305 watchdog on")
         check(b.reg(6, 0x4c, 0x4a) == 0x2a and b.reg(2, 0x4c, 0x4a) == 0x2b,
@@ -432,15 +440,15 @@ def t_board():
         # D-Bus control
         check(b.busctl("SetDuty", "sd", "cpu", "60").returncode == 0, "SetDuty cpu 60")
         time.sleep(1)
-        # zone 60 % -> the CPU fan's range 35..65 %: 47.9 % = 22 of 46
-        check(b.reg(6, 0x4c, 0x4c) == 22, "manual 60%%: CPU fan register %d (its range)" % b.reg(6, 0x4c, 0x4c))
+        # zone 60 % -> the CPU fan's range 30..100 %: 60 % = 14 of 24
+        check(b.reg(6, 0x4c, 0x4c) == 14, "manual 60%%: CPU fan register %d of 24" % b.reg(6, 0x4c, 0x4c))
         r = b.busctl("SetDuty", "sd", "cpu", "10")
         check(r.returncode != 0 and "outside" in r.stderr, "SetDuty below the floor refused: %s" % r.stderr.strip())
         s = b.wait_state(lambda s: zone(s, "cpu")["mode"] == "auto", 20)
         check(zone(s, "cpu")["mode"] == "auto", "manual not confirmed: auto after MANUAL_TIMEOUT_SEC")
         r = b.ssh("busctl set-property %s %s/board %s.Zone Mode s full" % (SVC, OBJ, SVC))
         time.sleep(1)
-        check(r.returncode == 0 and b.reg(2, 0x2e, 0x30) == 0xff and b.reg(2, 0x4c, 0x4c) == 46,
+        check(r.returncode == 0 and b.reg(2, 0x2e, 0x30) == 0xff and b.reg(2, 0x4c, 0x4c) == lmfull(b, 2),
               "Mode property: board full -> 100%")
         b.busctl("SetMode", "ss", "board", "auto")
         r = b.busctl("SetCurve", "sss", "cpu", "pcs", "'40:10 75:100'")
@@ -454,7 +462,7 @@ def t_board():
         # a sensor reading 0 ("no sensor")
         b.temps(t23=0)
         s = b.wait_state(lambda s: zone(s, "cpu")["failsafe"], 10)
-        check(zone(s, "cpu")["failsafe"] and b.reg(6, 0x4c, 0x4c) == 46, "PCS 0x23 reads 0: 100%% (%s)" % zone(s, "cpu")["reason"])
+        check(zone(s, "cpu")["failsafe"] and b.reg(6, 0x4c, 0x4c) == lmfull(b, 6), "PCS 0x23 reads 0: 100%% (%s)" % zone(s, "cpu")["reason"])
         b.temps(t23=53)
         s = b.wait_state(lambda s: not zone(s, "cpu")["failsafe"], 10)
         check(not zone(s, "cpu")["failsafe"], "back")
@@ -473,7 +481,7 @@ def t_board():
 
         # SIGKILL: ExecStopPost at once
         time.sleep(3)
-        check(b.reg(6, 0x4c, 0x4c) != 46, "quiet before the kill")
+        check(b.reg(6, 0x4c, 0x4c) != lmfull(b, 6), "quiet before the kill")
         b.ssh("kill -9 %s" % b.pid())
         time.sleep(1)
         full, v = full_regs(b)
@@ -507,7 +515,7 @@ def t_board():
         b.ssh(" ; ".join("i2cset -f -y 2 0x4c 0x%02x 0x%02x" % x for x in img.items()))
         s = b.wait_state(lambda s: s["corruptions"] >= 1 and s["repairs"] >= 9, 20)
         got = [b.reg(2, 0x4c, r) for r in (0x11, 0x12, 0x03, 0x05, 0x08, 0x19, 0x21, 0x4d, 0x4a)]
-        check(got == [0, 0, 0x06, 0x46, 0, 0x6e, 0x0a, 0x17, 0x2b], "2-004c corrupted while running: repaired %s" % got)
+        check(got == [0, 0, 0x06, 0x46, 0, 0x6e, 0x0a, 12, 0x2b], "2-004c corrupted while running: repaired %s" % got)
         check(s.get("corruptions") == 1 and s.get("repairs", 0) >= 9, "JSON: corruptions %s, repairs %s" % (s.get("corruptions"), s.get("repairs")))
         j = b.journal(t1)
         check("CHIP CORRUPTION" in j and "0x4a 0x38 -> 0x2b" in j and "0x11 0x98 -> 0x00" in j, "journal: the event, a line per repair")
@@ -526,7 +534,7 @@ def t_board():
         check(not b.reg(2, 0x4c, 0x4a) & 0x10 and b.reg(2, 0x4c, 0x4c) > 0, "--failsafe clears the polarity")
         b.ssh("systemctl start reimu-fand")
         b.wait_state(lambda s: s["host"] == "on" and zone(s, "cpu")["duty"] < 100, 30)
-        b.setreg(2, 0x4c, 0x4d, 0x17)
+        b.setreg(2, 0x4c, 0x4d, 12)
 
         # the host's GPU temperature (reimu-hostlink's file; a file of our own
         # here: reimu-hostlink manages /run/reimu-hostlink/gpu-temp)
@@ -540,7 +548,7 @@ def t_board():
         s = b.wait_state(lambda s: zone(s, "board")["duty"] == 100, 20)
         full, v = full_regs(b)
         gi = next((i for i in s.get("inputs", []) if i["id"] == "gpu"), {})
-        check(v[1:] == [46] + [255] * 10 and v[0] < 46 and gi.get("temp") == 96.0 and not s.get("alarm"),
+        check(v[1:] == [lmfull(b, 2)] + [255] * 10 and v[0] < lmfull(b, 6) and gi.get("temp") == 96.0 and not s.get("alarm"),
               "GPU 96 °C: the board zone's fans full scale, the CPU fan not %s, no alarm" % v)
         b.ssh("rm -f %s" % G)
         s = b.wait_state(lambda s: zone(s, "board")["duty"] < 100, 20)

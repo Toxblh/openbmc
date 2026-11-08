@@ -93,6 +93,9 @@ int __wrap_hw_wr_byte(int bus, int addr, int reg, int val)
 }
 
 static int s_fail, s_pass;
+/* an LM96163's 100 %: 2 * its PWM_FREQ (0x4D): 24 at the default 12, 46 at
+ * the platform's 0x17 (a fail-safe writes the chip's own full scale) */
+#define FULL(b) (2 * reg(b, 0x4c, 0x4d))
 static char R[200]; /* the fake root */
 
 #define CHECK(c, ...)                                                   \
@@ -287,7 +290,7 @@ static char *led(void)
 /* duty % as the chips have it */
 static double cpu_duty(void)
 {
-    return reg(6, 0x4c, 0x4c) * 100.0 / 46;
+    return reg(6, 0x4c, 0x4c) * 100.0 / FULL(6);
 }
 
 static double case_duty(int addr, int n)
@@ -297,7 +300,7 @@ static double case_duty(int addr, int n)
 
 static int all_full(void)
 {
-    if (reg(6, 0x4c, 0x4c) != 46 || reg(2, 0x4c, 0x4c) != 46) return 0;
+    if (reg(6, 0x4c, 0x4c) != FULL(6) || reg(2, 0x4c, 0x4c) != FULL(2)) return 0;
     for (int a = 0x2c; a <= 0x2e; a += 2)
         for (int n = 0; n < 5; n++)
             if (reg(2, a, 0x30 + 0x10 * n) != 0xff) return 0;
@@ -491,7 +494,7 @@ static void t_host(void)
     CHECK(d < 100 && d > 90, "then down, slowly (%.1f)", d);
     run(&f, 200, HOST_ON);
     /* PCS max 56 °C: 38 + (56-55)/5*9 = 39.8 %; VRMs 65: 30 */
-    CHECK(NEAR(f.z[Z_CPU].duty, 39.8, 0.01) && NEAR(cpu_duty(), 39.8, 100.0 / 46), "cpu settles at its demand (%.1f, %.1f)",
+    CHECK(NEAR(f.z[Z_CPU].duty, 39.8, 0.01) && NEAR(cpu_duty(), 39.8, 100.0 / FULL(6)), "cpu settles at its demand (%.1f, %.1f)",
           f.z[Z_CPU].duty, cpu_duty());
     /* board: IOHUB 83: 30 + 8/10*20 = 46 %; PCS 56: 30 + 6/10*10 = 36 */
     CHECK(NEAR(f.z[Z_BOARD].duty, 46, 0.01) && NEAR(case_duty(0x2e, 4), 46, 0.4), "board settles at IOHUB's demand (%.1f %.1f)",
@@ -595,7 +598,7 @@ static void t_hysteresis_slew(void)
     for (int a = 0x44; a <= 0x46; a++) vrm_temp(a, 20);
     iohub_temp(20);
     run(&f, 400, HOST_ON);
-    CHECK(f.z[Z_CPU].duty == 20 && reg(6, 0x4c, 0x4c) == 9 && reg(2, 0x2c, 0x30) == 51, "cold: the floor, not 0 (%d %d)",
+    CHECK(f.z[Z_CPU].duty == 20 && reg(6, 0x4c, 0x4c) == 5 && reg(2, 0x2c, 0x30) == 51, "cold: the floor, not 0 (%d %d)",
           reg(6, 0x4c, 0x4c), reg(2, 0x2c, 0x30));
 }
 
@@ -643,7 +646,7 @@ static void t_failsafe_inputs(void)
     run(&f, 6, HOST_ON);
     CHECK(f.z[Z_BOARD].failsafe && !f.z[Z_CPU].failsafe && f.z[Z_BOARD].duty == 100 && f.z[Z_CPU].duty < 100,
           "IOHUB diode fault: the board zone 100%%, the CPU zone not");
-    CHECK(reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x4c, 0x4c) == 46 && reg(6, 0x4c, 0x4c) != 46, "on the chips too");
+    CHECK(reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x4c, 0x4c) == FULL(2) && reg(6, 0x4c, 0x4c) != FULL(6), "on the chips too");
     setreg(2, 0x4c, 0x02, 0);
     run(&f, 300, HOST_ON);
 
@@ -677,14 +680,14 @@ static void t_outputs(void)
     fand_init(&f, &c, T);
     f.on_since_hint = T - 100000;
     run(&f, 3, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 46 && reg(2, 0x4c, 0x4c) == 46, "100%% is 2 * PWM_FREQ = 46 (%d %d)", reg(6, 0x4c, 0x4c),
+    CHECK(reg(6, 0x4c, 0x4c) == 24 && reg(2, 0x4c, 0x4c) == 24 && reg(6, 0x4c, 0x4d) == 12, "100%% is 2 * PWM_FREQ 12 = 24 (%d %d)", reg(6, 0x4c, 0x4c),
           reg(2, 0x4c, 0x4c));
     CHECK(f.z[Z_CPU].out[0].ok && f.z[Z_BOARD].out[0].ok, "driven and read back");
     CHECK(NEAR(f.z[Z_CPU].out[0].rpm, 5400000.0 / 0x07c4, 1), "tachometer 0x07c7: %.0f rpm", f.z[Z_CPU].out[0].rpm);
     run(&f, 20, HOST_ON);
     CHECK(!f.out_alarm && !f.tach_alarm && !fand_alarm(&f), "no alarm");
     run(&f, 300, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 18 && reg(6, 0x4c, 0x4c) < 46, "quiet: %d of 46", reg(6, 0x4c, 0x4c));
+    CHECK(reg(6, 0x4c, 0x4c) == 10 && reg(6, 0x4c, 0x4c) < FULL(6), "quiet: %d of 24", reg(6, 0x4c, 0x4c));
     /* another PWM_FREQ configured: the scale follows */
     struct config c2 = c;
     c2.pwm_freq = 0x10;
@@ -706,7 +709,7 @@ static void t_outputs(void)
     setreg(6, 0x4c, 0x4d, 0x17);
     fand_reconfig(&f, &c);
     fand_failsafe(&c);
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "fail-safe: 46");
+    CHECK(reg(6, 0x4c, 0x4c) == 46, "fail-safe on a chip at the platform's 0x17: its full scale 46");
     /* the latch: a reader that took the MSB first would get a stale one */
     setreg(6, 0x4c, 0x46, 0x10);
     setreg(6, 0x4c, 0x47, 0x0e); /* 0x0e10: 1500 rpm */
@@ -735,7 +738,7 @@ static void t_outputs(void)
     run(&f, 5, HOST_ON);
     CHECK(!f.out_alarm, "not yet");
     run(&f, 2, HOST_ON);
-    CHECK(f.out_alarm && reg(6, 0x4c, 0x4c) == 46 && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x4c, 0x4c) == 46,
+    CHECK(f.out_alarm && reg(6, 0x4c, 0x4c) == FULL(6) && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x4c, 0x4c) == FULL(2),
           "a fan chip not driven for STALE_SEC: everything else 100%%");
     CHECK(!strcmp(led(), "default-on"), "LED on");
     hide(2, 0x2e, 0);
@@ -777,7 +780,7 @@ static void t_outputs(void)
     run(&f, 300, HOST_ON);
     rmdev(2, 0x2c);
     fand_failsafe(&c);
-    CHECK(reg(6, 0x4c, 0x4c) == 46 && reg(2, 0x4c, 0x4c) == 46 && reg(2, 0x2e, 0x30) == 0xff && reg(2, 0x2e, 0x70) == 0xff,
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6) && reg(2, 0x4c, 0x4c) == FULL(2) && reg(2, 0x2e, 0x30) == 0xff && reg(2, 0x2e, 0x70) == 0xff,
           "fail-safe with a chip missing: the rest still 100%%");
     memset(other, 0x11, sizeof(other));
     mkdev(2, 0x2c, other);
@@ -913,7 +916,7 @@ static void t_tach_mode(void)
     start(&f, &c);
     CHECK(reg(6, 0x4c, 0x4a) == 0x2a && f.z[Z_CPU].out[0].tach_mode_ok, "CPU fan chip: 0x2b -> 0x2a (accurate), read back");
     CHECK(reg(2, 0x4c, 0x4a) == 0x2b, "the chip without a tachometer: untouched");
-    CHECK(reg(6, 0x4c, 0x4d) == 0x17, "PWM_FREQ untouched");
+    CHECK(reg(6, 0x4c, 0x4d) == 12 && f.repairs == 0, "PWM_FREQ: the platform's 0x17 set to 12 at the takeover, not a repair");
     /* the platform powers off and on: the chip is back to 0x2b */
     run(&f, 1, HOST_OFF);
     board();
@@ -987,15 +990,21 @@ static void t_floor_full(void)
 {
     struct config k;
     char err[FAND_MAX_ERR][128];
+    /* a fan with a narrow useful range, as the X37 had at the platform's PWM */
+    const char *narrow = "CPU_FAN_MIN_DUTY=35\nCPU_FAN_MAX_DUTY=65\n";
+    char txt[200];
     cfg_defaults(&k);
-    int n = cfg_parse(&k, "FLOOR=100\n", err, FAND_MAX_ERR);
+    snprintf(txt, sizeof(txt), "%sFLOOR=100\n", narrow);
+    int n = cfg_parse(&k, txt, err, FAND_MAX_ERR);
     CHECK(n == 0 && k.floor == 100 && k.cpu_fan_max == 65 && k.board_fan_max == 100 && k.case_fan_max == 100,
           "FLOOR=100: no error, ranges kept (%d: %s)", n, n ? err[0] : "");
     cfg_defaults(&k);
-    n = cfg_parse(&k, "FLOOR=65\n", err, FAND_MAX_ERR);
+    snprintf(txt, sizeof(txt), "%sFLOOR=65\n", narrow);
+    n = cfg_parse(&k, txt, err, FAND_MAX_ERR);
     CHECK(n == 0, "FLOOR=65 = CPU_FAN_MAX_DUTY: no error (%d: %s)", n, n ? err[0] : "");
     cfg_defaults(&k);
-    n = cfg_parse(&k, "FLOOR=80\n", err, FAND_MAX_ERR);
+    snprintf(txt, sizeof(txt), "%sFLOOR=80\n", narrow);
+    n = cfg_parse(&k, txt, err, FAND_MAX_ERR);
     CHECK(n == 0, "FLOOR=80 above CPU_FAN_MAX_DUTY: no error, the floor wins (%d: %s)", n, n ? err[0] : "");
     cfg_defaults(&k);
     n = cfg_parse(&k, "CPU_FAN_MIN_DUTY=50\nCPU_FAN_MAX_DUTY=50\n", err, FAND_MAX_ERR);
@@ -1012,21 +1021,23 @@ static void t_floor_full(void)
     run(&f, 300, HOST_ON);
     CHECK(all_full() && f.z[Z_CPU].duty == 100 && !fand_alarm(&f), "FLOOR=100: every fan full scale, no alarm");
     cfg_defaults(&k);
+    k.cpu_fan_min = 35, k.cpu_fan_max = 65;
     k.floor = 65;
     start(&f, &k);
     run(&f, 300, HOST_ON);
     fand_set_duty(&f, Z_CPU, 70, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 30 && NEAR(f.z[Z_CPU].out[0].duty, 65, 0.01), "FLOOR=65: the CPU fan at its 65%% (%d)",
+    CHECK(reg(6, 0x4c, 0x4c) == 16 && NEAR(f.z[Z_CPU].out[0].duty, 65, 0.01), "FLOOR=65: the CPU fan at its 65%% (%d)",
           reg(6, 0x4c, 0x4c));
     fand_set_duty(&f, Z_CPU, 100, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "and 100%%: full scale");
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6), "and 100%%: full scale");
     cfg_defaults(&k);
+    k.cpu_fan_min = 35, k.cpu_fan_max = 65;
     k.floor = 80;
     start(&f, &k);
     run(&f, 300, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 37 && reg(2, 0x2c, 0x30) >= 204, "FLOOR=80: the CPU fan at the floor 80%% (%d), not 65",
+    CHECK(reg(6, 0x4c, 0x4c) == 19 && reg(2, 0x2c, 0x30) >= 204, "FLOOR=80: the CPU fan at the floor 80%% (%d), not 65",
           reg(6, 0x4c, 0x4c));
 }
 
@@ -1042,7 +1053,7 @@ static void t_turbo(void)
     CHECK(!all_full() && !fand_turbo_left(&f), "quiet, no turbo");
     CHECK(!fand_set_turbo(&f, 15, e, sizeof(e)), "turbo 15 min");
     run(&f, 1, HOST_ON);
-    CHECK(all_full() && reg(6, 0x4c, 0x4c) == 46, "turbo: every fan full scale (the CPU fan 46, not its 65%%)");
+    CHECK(all_full() && reg(6, 0x4c, 0x4c) == FULL(6), "turbo: every fan full scale (the CPU fan 46, not its 65%%)");
     CHECK(!strcmp(f.z[Z_CPU].reason, "турбо") && !fand_alarm(&f) && !strcmp(led(), "none"), "reason турбо, no alarm, LED off (%s)",
           f.z[Z_CPU].reason);
     CHECK(fand_turbo_left(&f) == 899, "899 s left (%d)", fand_turbo_left(&f));
@@ -1232,13 +1243,13 @@ static void t_guard(void)
     struct config c;
     char err[FAND_MAX_ERR][128];
     cfg_defaults(&c);
-    CHECK(c.pwm_freq == 0x17 && !c.pwm_fast && c.guard_ms == 5000 && c.guard_corrupt_regs == 4, "defaults: PWM_FREQ pinned at 0x17");
+    CHECK(c.pwm_freq == 12 && !c.pwm_fast && c.guard_ms == 5000 && c.guard_corrupt_regs == 4, "defaults: PWM_FREQ pinned at 12");
     struct config k = c;
     int n = cfg_parse(&k, "LM96163_PWM_FREQ=0x10\nLM96163_PWM_CLOCK=fast\nGUARD_SEC=2\nGUARD_CORRUPT_REGS=9\n", err, FAND_MAX_ERR);
     CHECK(n == 0 && k.pwm_freq == 0x10 && k.pwm_fast && k.guard_ms == 2000 && k.guard_corrupt_regs == 9, "keys (%d: %s)", n, n ? err[0] : "");
     k = c;
     n = cfg_parse(&k, "LM96163_PWM_FREQ=0\nLM96163_PWM_CLOCK=warp\n", err, FAND_MAX_ERR);
-    CHECK(n == 2 && k.pwm_freq == 0x17, "bad PWM settings refused (%d)", n);
+    CHECK(n == 2 && k.pwm_freq == 12, "bad PWM settings refused (%d)", n);
 
     /* a healthy board at takeover: nothing to repair (the tachometer mode is
      * set, as at every power-on) */
@@ -1255,10 +1266,10 @@ static void t_guard(void)
     f.on_since_hint = T - 100000;
     run(&f, 1, HOST_ON);
     static const struct { int r, v; } want[] = { { 0x11, 0 }, { 0x12, 0 }, { 0x03, 6 }, { 0x09, 6 }, { 0x05, 0x46 }, { 0x08, 0 },
-        { 0x13, 0 }, { 0x14, 0 }, { 0x19, 0x6e }, { 0x21, 0x0a }, { 0x4a, 0x2b }, { 0x4d, 0x17 } };
+        { 0x13, 0 }, { 0x14, 0 }, { 0x19, 0x6e }, { 0x21, 0x0a }, { 0x4a, 0x2b }, { 0x4d, 12 } };
     for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++)
         CHECK(reg(2, 0x4c, want[i].r) == want[i].v, "2-004c 0x%02x repaired: 0x%02x", want[i].r, reg(2, 0x4c, want[i].r));
-    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == 46, "polarity right, 100%% = 46 of the right scale (%d)", reg(2, 0x4c, 0x4c));
+    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == FULL(2), "polarity right, 100%% = 24 of the right scale (%d)", reg(2, 0x4c, 0x4c));
     CHECK(f.corruptions == 1 && f.repairs >= 10 && f.z[Z_BOARD].out[0].repairs == f.repairs, "corruption event, %u repairs", f.repairs);
     CHECK(f.z[Z_CPU].out[0].repairs == 0 && f.z[Z_BOARD].out[1].repairs == 0 && f.z[Z_BOARD].out[2].repairs == 0,
           "the healthy chips of the dump: no repairs");
@@ -1344,7 +1355,7 @@ static void t_guard(void)
     setreg(2, 0x4c, 0x4a, 0x38);
     setreg(6, 0x4c, 0x4a, 0x3a);
     fand_failsafe(&c);
-    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && !(reg(6, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == 46, "--failsafe clears the polarity");
+    CHECK(!(reg(2, 0x4c, 0x4a) & 0x10) && !(reg(6, 0x4c, 0x4a) & 0x10) && reg(2, 0x4c, 0x4c) == FULL(2), "--failsafe clears the polarity");
 
     /* a chip with plain registers (QEMU): the write address doesn't work */
     board();
@@ -1388,41 +1399,49 @@ static void t_fan_range(void)
     struct fand f;
     struct config c;
     char e[160];
-    cfg_defaults(&c); /* CPU fan 35..65 */
+    cfg_defaults(&c);
+    CHECK(c.cpu_fan_min == 30 && c.cpu_fan_max == 100, "defaults: the CPU fan's whole range (smooth at PWM_FREQ 12)");
+    start(&f, &c);
+    run(&f, 300, HOST_ON);
+    fand_set_duty(&f, Z_CPU, 50, e, sizeof(e));
+    run(&f, 1, HOST_ON);
+    CHECK(reg(6, 0x4c, 0x4c) == 12 && NEAR(f.z[Z_CPU].out[0].duty, 50, 0.01), "defaults: zone 50%% = CPU fan 50%% = 12 of 24 (%d)",
+          reg(6, 0x4c, 0x4c));
+    c.cpu_fan_min = 35, c.cpu_fan_max = 65; /* a narrow range: zone FLOOR..100 spread over it */
     start(&f, &c);
     run(&f, 300, HOST_ON);
     fand_set_duty(&f, Z_CPU, 30, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 16 && NEAR(f.z[Z_CPU].out[0].duty, 35, 0.01), "zone 30%% (FLOOR): CPU fan 35%% = 16 (%d)",
+    CHECK(reg(6, 0x4c, 0x4c) == 8 && NEAR(f.z[Z_CPU].out[0].duty, 35, 0.01), "zone 30%% (FLOOR): CPU fan 35%% = 8 (%d)",
           reg(6, 0x4c, 0x4c));
     fand_set_duty(&f, Z_CPU, 65, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 23 && NEAR(f.z[Z_CPU].out[0].duty, 50, 0.01), "zone 65%%: CPU fan 50%% = 23 (%d)", reg(6, 0x4c, 0x4c));
+    CHECK(reg(6, 0x4c, 0x4c) == 12 && NEAR(f.z[Z_CPU].out[0].duty, 50, 0.01), "zone 65%%: CPU fan 50%% = 12 (%d)", reg(6, 0x4c, 0x4c));
     fand_set_duty(&f, Z_CPU, 99, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(NEAR(f.z[Z_CPU].out[0].duty, 64.57, 0.01) && reg(6, 0x4c, 0x4c) == 30, "zone 99%%: 64.6%% (%d)", reg(6, 0x4c, 0x4c));
+    CHECK(NEAR(f.z[Z_CPU].out[0].duty, 64.57, 0.01) && reg(6, 0x4c, 0x4c) == 15, "zone 99%%: 64.6%% (%d)", reg(6, 0x4c, 0x4c));
     fand_set_duty(&f, Z_CPU, 100, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "zone 100%%: full scale, not 65%% (%d)", reg(6, 0x4c, 0x4c));
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6), "zone 100%%: full scale, not 65%% (%d)", reg(6, 0x4c, 0x4c));
     fand_set_duty(&f, Z_BOARD, 30, e, sizeof(e));
     run(&f, 1, HOST_ON);
-    CHECK(reg(2, 0x2c, 0x30) == 77 && reg(2, 0x4c, 0x4c) == 14, "board fans: their own range (full): 30%%");
+    CHECK(reg(2, 0x2c, 0x30) == 77 && reg(2, 0x4c, 0x4c) == 7, "board fans: their own range (full): 30%% (%d)", reg(2, 0x4c, 0x4c));
     fand_set_mode(&f, Z_CPU, MODE_AUTO, e, sizeof(e));
     hide(5, 0x21, 1);
     run(&f, 6, HOST_ON);
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "fail-safe: full scale");
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6), "fail-safe: full scale");
     hide(5, 0x21, 0);
     fand_failsafe(&c);
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "--failsafe: full scale");
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6), "--failsafe: full scale");
     /* config checks */
     struct config k;
     char err[FAND_MAX_ERR][128];
     cfg_defaults(&k);
-    int n = cfg_parse(&k, "CPU_FAN_MAX_DUTY=30\n", err, FAND_MAX_ERR);
-    CHECK(n == 1 && k.cpu_fan_max == 100, "max not above min/floor: refused, 100 (%d)", n);
+    int n = cfg_parse(&k, "CPU_FAN_MAX_DUTY=25\n", err, FAND_MAX_ERR);
+    CHECK(n == 1 && k.cpu_fan_max == 100, "max below 30: refused, 100 (%d)", n);
     cfg_defaults(&k);
     n = cfg_parse(&k, "CPU_FAN_MIN_DUTY=10\nCASE_FAN_MAX_DUTY=80\nTACH_VALID_DUTY=40\n", err, FAND_MAX_ERR);
-    CHECK(n == 1 && k.cpu_fan_min == 35 && k.case_fan_max == 80 && k.tach_valid_duty == 40, "min below 20 refused (%d)", n);
+    CHECK(n == 1 && k.cpu_fan_min == 30 && k.case_fan_max == 80 && k.tach_valid_duty == 40, "min below 20 refused (%d)", n);
     cfg_defaults(&k);
     k.floor = 40;
     struct fand g;
@@ -1601,7 +1620,7 @@ static void t_failsafe_verify(void)
     setreg(2, 0x4c, 0x4a, 0x3b);
     I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.nak = 1;
     failsafe_logged(&c, log, sizeof(log));
-    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == 46, "0x4A refused once: retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == FULL(2), "0x4A refused once: retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
 
     /* acknowledged and lost, twice */
     board();
@@ -1609,7 +1628,7 @@ static void t_failsafe_verify(void)
     setreg(2, 0x4c, 0x4a, 0x3b);
     I.bus = 2, I.addr = 0x4c, I.reg = 0x4a, I.lose = 2;
     failsafe_logged(&c, log, sizeof(log));
-    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == 46, "0x4A lost twice: read back, retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
+    CHECK(reg(2, 0x4c, 0x4a) == 0x2b && reg(2, 0x4c, 0x4c) == FULL(2), "0x4A lost twice: read back, retried (0x%02x, %d)", reg(2, 0x4c, 0x4a), reg(2, 0x4c, 0x4c));
 
     /* the duty itself */
     board();
@@ -1617,7 +1636,7 @@ static void t_failsafe_verify(void)
     setreg(6, 0x4c, 0x4c, 5);
     I.bus = 6, I.addr = 0x4c, I.reg = 0x4c, I.lose = 2;
     failsafe_logged(&c, log, sizeof(log));
-    CHECK(reg(6, 0x4c, 0x4c) == 46, "0x4C lost twice: retried (%d)", reg(6, 0x4c, 0x4c));
+    CHECK(reg(6, 0x4c, 0x4c) == FULL(6), "0x4C lost twice: retried (%d)", reg(6, 0x4c, 0x4c));
     CHECK(!strstr(log, "<3>"), "... nothing to report: %s", log);
 
     /* an EMC2305 channel */
@@ -1670,7 +1689,7 @@ static void t_failsafe_verify(void)
     setreg(2, 0x2e, 0x30, 5);
     I.dead_bus = 6;
     int64_t took = failsafe_logged(&c, log, sizeof(log));
-    CHECK(reg(2, 0x4c, 0x4c) == 46 && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x2e, 0x30) == 0xff && took <= 3000,
+    CHECK(reg(2, 0x4c, 0x4c) == FULL(2) && reg(2, 0x2c, 0x30) == 0xff && reg(2, 0x2e, 0x30) == 0xff && took <= 3000,
           "the CPU fan's bus dead: the others 100%%, %lld ms", (long long)took);
 
     board();
@@ -1685,7 +1704,7 @@ static void t_failsafe_verify(void)
     setreg(2, 0x4c, 0x4a, 0x3b);
     I.dead_wr_bus = 2;
     took = failsafe_logged(&c, log, sizeof(log));
-    CHECK(took <= 9000 && reg(6, 0x4c, 0x4c) == 46, "every write on bus 2 hanging: %lld ms, the CPU fan done", (long long)took);
+    CHECK(took <= 9000 && reg(6, 0x4c, 0x4c) == FULL(6), "every write on bus 2 hanging: %lld ms, the CPU fan done", (long long)took);
 
     /* the worst there is: each chip answers its ID, then each transfer hangs */
     board();
