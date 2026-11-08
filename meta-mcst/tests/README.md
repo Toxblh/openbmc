@@ -45,6 +45,7 @@ Run the tests:
     node pns-blank.stub.mjs     # no BMC: the PNS card's button for a chip with no image
     node power-policy.stub.mjs  # no BMC: the host power restore policy on the settings page
     node fan-profile.stub.mjs   # no BMC: the CPU cooling profile (curves, holding a band)
+    node console-jitter.stub.mjs # no BMC: the COM terminal box doesn't move under vim's redraws
     node media.spec.mjs         # RW virtual media: OPFS, files, snapshot, CD-ROM
     node media-stress.spec.mjs  # parallel I/O, fsck, browser crash recovery
     node vm-buffer.spec.mjs     # bmcweb NBD buffer overflow regression

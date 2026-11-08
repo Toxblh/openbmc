@@ -68,6 +68,19 @@ function followCursor(p) {
   else if (y + rowPx > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = y + rowPx - wrap.clientHeight;
 }
 
+// the rows that fit in the terminal's box. The fit addon divides by the cell
+// height it computes, but the rows are drawn at whole device pixels: one
+// row more than fits makes the box scroll a few px each time the cursor
+// reaches the last row (vim's status line), the box jumping up and down
+function fitRows(p, dim) {
+  const screen = p.term.element && p.term.element.querySelector(".xterm-screen");
+  const drawn = screen && p.term.rows ? screen.getBoundingClientRect().height / p.term.rows : 0;
+  if (!drawn) return dim.rows;
+  const cs = getComputedStyle(p.termWrap);
+  const avail = p.termWrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  return Math.max(1, Math.min(dim.rows, Math.floor(avail / drawn)));
+}
+
 const termWidth = (p) => p.termWrap.clientWidth - 8 - (narrow() ? 0 : SCROLLBAR_PX);
 
 function fitTerm(p) {
@@ -78,7 +91,7 @@ function fitTerm(p) {
   // rows below them on the alternate screen (a running vim)
   const dim = p.fit.proposeDimensions();
   if (dim && dim.cols > 0 && dim.rows > 0) {
-    const rows = Math.max(dim.rows, host.rows);
+    const rows = Math.max(fitRows(p, dim), host.rows);
     if (host.cols !== p.term.cols || rows !== p.term.rows) p.term.resize(host.cols, rows);
   }
   followCursor(p);
@@ -95,7 +108,7 @@ function sizeToWindow(p) {
   const dim = p.fit.proposeDimensions();
   if (!dim || !(dim.rows > 0)) return;
   const cols = Math.max(Math.floor(termWidth(p) / (charRatio() * prefs.fontSize)), MIN_COLS);
-  const rows = Math.max(dim.rows, MIN_ROWS);
+  const rows = Math.max(fitRows(p, dim), MIN_ROWS);
   p.client.write(`stty rows ${rows} cols ${cols}\r`);
   hostSize.set(p.index, { rows, cols });
   fitTerm(p);
