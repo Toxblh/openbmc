@@ -24,7 +24,7 @@ async function render() {
   if (!root) return;
   if (fwCard) fwCard.stop();
   fwCard = firmwareCard(mgr, rebootBmc, fw);
-  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), overheatCard(overheat, render), bmcCard(mgr), fwCard);
+  root.querySelector("#set-grid").replaceChildren(networkCard(proto, ifaces), timeCard(mgr, proto), usersCard(accounts), powerPolicyCard(), overheatCard(overheat, render), bmcCard(mgr), fwCard);
 }
 
 function networkCard(proto, ifaces) {
@@ -106,6 +106,44 @@ function usersCard(accounts) {
     ),
     h("p", { class: "muted small" }, "Пароль VNC для KVM меняется командой vncpasswd в консоли BMC."),
   );
+}
+
+// What the host does when the board gets power again. Read from the D-Bus
+// object (Redfish's Systems/system comes from the view, which hasn't it),
+// written through Redfish (it takes LastState for D-Bus Restore).
+const POLICY = "/xyz/openbmc_project/control/host0/power_restore_policy";
+const POLICIES = [
+  ["LastState", "Как было до отключения"],
+  ["AlwaysOn", "Всегда включать"],
+  ["AlwaysOff", "Не включать"],
+];
+export function powerPolicyCard() {
+  const sel = h("select", { id: "power-policy-sel", disabled: true }, POLICIES.map(([v, t]) => h("option", { value: v }, t)));
+  const save = h("button", { class: "btn primary", disabled: true }, "Сохранить");
+  const note = h("div", { class: "muted small" }, "Загрузка…");
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      await api.patch("/redfish/v1/Systems/system", { PowerRestorePolicy: sel.value });
+      toast("Политика питания сохранена", "ok");
+    } catch (e) {
+      toast(`Ошибка: ${e.message}`, "err");
+    } finally {
+      save.disabled = false;
+    }
+  });
+  api
+    .get(POLICY)
+    .then((r) => {
+      const cur = String((r && r.data && r.data.PowerRestorePolicy) || "").split(".").pop();
+      sel.value = cur === "Restore" ? "LastState" : cur;
+      sel.disabled = save.disabled = false;
+      note.textContent = "Что делать хосту, когда на плату снова подали питание (например, после отключения света).";
+    })
+    .catch((e) => {
+      note.textContent = `Политику питания не удалось прочитать: ${e.message}`;
+    });
+  return h("div", { class: "card", id: "power-policy" }, h("h3", {}, "Питание хоста"), note, h("label", {}, "После подачи питания", sel), h("div", { class: "row end" }, save));
 }
 
 async function rebootBmc() {

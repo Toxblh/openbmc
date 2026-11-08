@@ -191,6 +191,8 @@ def main():
                                  "node", os.path.join(e2e, "kvm-h264.stub.mjs")]))
     jobs.append(Job("host_usbnet", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                     "node", os.path.join(e2e, "host-usbnet.stub.mjs")]))
+    jobs.append(Job("power_policy", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                     "node", os.path.join(e2e, "power-policy.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):
