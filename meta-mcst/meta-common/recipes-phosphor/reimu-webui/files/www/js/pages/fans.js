@@ -139,6 +139,20 @@ function profileRow(st, z, refresh) {
   if (!pcs) return null;
   const cur = profileOf(pcs);
   const btn = (name) => h("button", { class: `btn small${cur === name ? " active" : ""}`, onclick: () => setProfile(pcs, name, refresh) }, PROFILES[name]);
+  // the graph, in the same place for every profile: only custom is edited
+  const pts = h("input", { class: "curve-input", value: curveText(draft || pcs.curve), placeholder: "45:30 60:50 75:100" });
+  const ed = curveEditor({
+    points: (cur === "custom" && draft) || pcs.curve,
+    floor: st.floor || 30,
+    temp: pcs.temp,
+    readOnly: cur !== "custom",
+    band: cur === "hold" ? pcs.target : null,
+    nowDuty: cur === "hold" ? pcs.demand : null,
+    onChange: (p) => {
+      draft = p;
+      pts.value = curveText(p);
+    },
+  });
   let extra;
   if (cur === "hold") {
     const [lo, hi] = pcs.target;
@@ -147,7 +161,7 @@ function profileRow(st, z, refresh) {
     extra = h(
       "div",
       { class: "row" },
-      h("span", { class: "muted small" }, `держать процессор в ${lo}–${hi} °C, обороты подбираются сами; при ${pcs.curve[pcs.curve.length - 1][0]} °C — полные:`),
+      h("span", { class: "muted small" }, `держать процессор в ${lo}–${hi} °C (зелёная полоса), обороты подбираются сами; кривая — защита, при ${pcs.curve[pcs.curve.length - 1][0]} °C полные:`),
       h("label", { class: "inline" }, "от", from),
       h("label", { class: "inline" }, "до", to),
       h("span", {}, "°C"),
@@ -155,16 +169,6 @@ function profileRow(st, z, refresh) {
     );
   } else if (cur === "custom") {
     const parse = (v) => v.trim().split(/[\s,]+/).filter(Boolean).map((p) => p.split(":").map(Number));
-    const pts = h("input", { class: "curve-input", value: curveText(draft || pcs.curve), placeholder: "45:30 60:50 75:100" });
-    const ed = curveEditor({
-      points: draft || pcs.curve,
-      floor: st.floor || 30,
-      temp: pcs.temp,
-      onChange: (p) => {
-        draft = p;
-        pts.value = curveText(p);
-      },
-    });
     pts.addEventListener("change", () => {
       const p = parse(pts.value);
       if (p.length >= 2 && p.every((x) => x.length === 2 && x.every(Number.isFinite))) {
@@ -185,7 +189,6 @@ function profileRow(st, z, refresh) {
     extra = h(
       "div",
       {},
-      ed.el,
       h("div", { class: "muted small" }, "Точки двигаются мышью или пальцем и прилипают к 5 °C и 5 %; двойной щелчок по пустому месту добавляет точку, по точке — убирает."),
       h(
         "div",
@@ -195,8 +198,8 @@ function profileRow(st, z, refresh) {
         draft ? h("span", { class: "badge warn" }, "не сохранено") : null,
       ),
     );
-  } else extra = h("div", { class: "muted small" }, `кривая ${curveText(pcs.curve).replaceAll(" ", " · ")} (°C:%)`);
-  return h("div", { class: "section", id: "cpu-profile" }, h("div", { class: "row" }, h("b", {}, "Профиль процессора"), ["quiet", "normal", "hold", "custom"].map(btn)), extra);
+  } else extra = h("div", { class: "muted small" }, `кривая ${curveText(pcs.curve).replaceAll(" ", " · ")} (°C:%); чтобы изменить — «Свой»`);
+  return h("div", { class: "section", id: "cpu-profile" }, h("div", { class: "row" }, h("b", {}, "Профиль процессора"), ["quiet", "normal", "custom", "hold"].map(btn)), ed.el, extra);
 }
 
 function zoneBlock(st, z, refresh) {

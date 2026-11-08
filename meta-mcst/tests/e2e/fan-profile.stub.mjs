@@ -134,6 +134,53 @@ const settle = (s) => s.page.waitForTimeout(400);
   await settle(s);
   check(s.calls.some((c) => c[0] === "SetCurve" && c[1] === "cpu" && c[2] === "pcs" && c[3] === "42:30 60:60 72:100"), "the curve saved");
 }
+// every profile shows its curve as a graph, in one and the same place: quiet
+// and normal read-only, holding with its band, custom editable
+{
+  const s = await open({ curve: DEFAULT });
+  const g = () => s.page.locator("#cpu-profile svg.curve-editor");
+  const box = async () => {
+    const b = await g().boundingBox();
+    return b && [Math.round(b.x), Math.round(b.y), Math.round(b.width), Math.round(b.height)].join();
+  };
+  const curveOf = () => g().getAttribute("data-curve");
+  const order = (await s.page.locator("#cpu-profile > .row button").allInnerTexts()).join();
+  check(order === "Тихий,Обычный,Свой,Удержание", `the order: holding last (${order})`);
+  check((await g().count()) === 1, "Обычный: a graph");
+  check((await curveOf()) === "45:30 55:38 60:47 65:60 70:80 75:100", `of the normal curve (${await curveOf()})`);
+  check((await g().getAttribute("class")).includes("readonly") && (await g().locator("circle.pt").count()) === 0, "read-only: no handles to drag");
+  const b0 = await box();
+  // dragging on it changes nothing
+  const r = await g().boundingBox();
+  await s.page.mouse.move(r.x + r.width * 0.5, r.y + r.height * 0.5);
+  await s.page.mouse.down();
+  await s.page.mouse.move(r.x + r.width * 0.3, r.y + r.height * 0.8, { steps: 5 });
+  await s.page.mouse.up();
+  check((await curveOf()) === "45:30 55:38 60:47 65:60 70:80 75:100" && !s.calls.length, "a drag on it changes nothing");
+
+  await s.page.getByRole("button", { name: "Тихий" }).click();
+  await settle(s);
+  check((await curveOf()) === "50:30 60:38 65:50 70:75 75:100", `Тихий: its curve on the graph (${await curveOf()})`);
+  check((await box()) === b0, `in the same place (${await box()} vs ${b0})`);
+
+  await s.page.getByRole("button", { name: "Свой" }).click();
+  await settle(s);
+  check((await g().locator("circle.pt").count()) === 5 && !(await g().getAttribute("class")).includes("readonly"), "Свой: the same curve, now with handles");
+  check((await box()) === b0, `in the same place (${await box()} vs ${b0})`);
+
+  await s.page.getByRole("button", { name: "Удержание" }).click();
+  await settle(s);
+  check((await g().locator(".ce-band").count()) === 1, "Удержание: the band drawn on the graph");
+  const dot = await g().evaluate(async (svg) => {
+    const { GEOM } = await import("./js/lib/curve-editor.js");
+    const c = svg.querySelector(".ce-now circle");
+    return Math.round((1 - (Number(c.getAttribute("cy")) - GEOM.t) / GEOM.ph) * 100);
+  });
+  check(dot === 80, `the dot: the duty the hold gives now (80 %), not the curve's (${dot})`);
+  check((await box()) === b0, `in the same place (${await box()} vs ${b0})`);
+  check(!s.errors.length, `no page errors ${s.errors}`);
+}
+
 // the curve as a graph: points dragged by mouse and touch, sticking to 5s
 {
   const s = await open({ curve: [[40, 30], [60, 50], [70, 100]] });

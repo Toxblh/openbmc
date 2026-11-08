@@ -6,6 +6,10 @@
 // only sideways. Double click (tap) on empty space adds a point on the
 // curve there, on a point removes it (not the last; at least 2 stay).
 //
+// readOnly: only shown (no handles, no dragging); band: [lo, hi] °C shaded
+// (holding a temperature: the curve is then only the safety); nowDuty: the
+// duty the current temperature has now, when it isn't the curve's (holding).
+//
 //   const ed = curveEditor({ points: [[45, 30], [75, 100]], floor: 30, temp: 52.1, onChange(points) {} });
 //   el.append(ed.el); ed.set(points)
 
@@ -39,10 +43,10 @@ function evalCurve(pts, t) {
   return 100;
 }
 
-export function curveEditor({ points, floor = 30, temp = null, onChange = () => {} }) {
+export function curveEditor({ points, floor = 30, temp = null, onChange = () => {}, readOnly = false, band = null, nowDuty = null }) {
   let pts = points.map((p) => [...p]);
   let drag = null; // { i, id }
-  const svg = svgEl("svg", { viewBox: `0 0 ${GEOM.w} ${GEOM.h}`, class: "curve-editor", role: "img", style: "touch-action: none", "aria-label": "График вентилятора: скорость от температуры" });
+  const svg = svgEl("svg", { viewBox: `0 0 ${GEOM.w} ${GEOM.h}`, class: `curve-editor${readOnly ? " readonly" : ""}`, role: "img", style: readOnly ? "" : "touch-action: none", "aria-label": "График вентилятора: скорость от температуры" });
   const grid = svgEl("g", { class: "ce-grid" });
   // the floor: no duty below it
   grid.append(svgEl("rect", { x: GEOM.l, y: Y(floor), width: GEOM.pw, height: Y(0) - Y(floor), class: "ce-below" }));
@@ -56,6 +60,7 @@ export function curveEditor({ points, floor = 30, temp = null, onChange = () => 
     grid.append(svgEl("text", { x: GEOM.l - 6, y: Y(d) + 4, "text-anchor": "end", class: "ce-tick" }, `${d}`));
   }
   grid.append(svgEl("text", { x: GEOM.l - 6, y: GEOM.t - 2, "text-anchor": "end", class: "ce-tick" }, "%"));
+  if (band) grid.append(svgEl("rect", { x: X(band[0]), y: GEOM.t, width: Math.max(2, X(band[1]) - X(band[0])), height: Y(0) - GEOM.t, class: "ce-band" }));
   const now = svgEl("g", { class: "ce-now" });
   const line = svgEl("polyline", { class: "ce-line" });
   const handles = svgEl("g");
@@ -69,11 +74,16 @@ export function curveEditor({ points, floor = 30, temp = null, onChange = () => 
     const kk = k();
     svg.style.setProperty("--ce-font", `${11 * kk}px`);
     line.setAttribute("points", [[GEOM.t0, pts[0][1]], ...pts, [GEOM.t1, 100]].map(([t, d]) => `${X(t)},${Y(d)}`).join(" "));
-    handles.replaceChildren(...pts.map(([t, d], i) => svgEl("circle", { cx: X(t), cy: Y(d), r: 7 * kk, class: `pt${drag && drag.i === i ? " on" : ""}`, "data-i": i })));
+    svg.dataset.curve = pts.map(([t, d]) => `${t}:${d}`).join(" ");
+    handles.replaceChildren(
+      ...pts.map(([t, d], i) =>
+        readOnly ? svgEl("circle", { cx: X(t), cy: Y(d), r: 3.5 * kk, class: "pt-ro" }) : svgEl("circle", { cx: X(t), cy: Y(d), r: 7 * kk, class: `pt${drag && drag.i === i ? " on" : ""}`, "data-i": i }),
+      ),
+    );
     now.replaceChildren();
     if (temp !== null && temp !== undefined && temp >= GEOM.t0 && temp <= GEOM.t1) {
       now.append(svgEl("line", { x1: X(temp), x2: X(temp), y1: GEOM.t, y2: Y(0) }));
-      now.append(svgEl("circle", { cx: X(temp), cy: Y(evalCurve(pts, temp)), r: 4 }));
+      now.append(svgEl("circle", { cx: X(temp), cy: Y(nowDuty !== null && nowDuty !== undefined ? nowDuty : evalCurve(pts, temp)), r: 4 * k() }));
     }
     if (drag) {
       const [t, d] = pts[drag.i];
@@ -127,6 +137,7 @@ export function curveEditor({ points, floor = 30, temp = null, onChange = () => 
     onChange(pts.map((p) => [...p]));
   }
   svg.addEventListener("pointerdown", (e) => {
+    if (readOnly) return;
     const q = local(e);
     const at = performance.now();
     if (lastDown && at - lastDown.at < 400 && Math.hypot(q.x - lastDown.x, q.y - lastDown.y) < 14 * k()) {

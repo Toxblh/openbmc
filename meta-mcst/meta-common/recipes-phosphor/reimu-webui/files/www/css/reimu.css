@@ -388,5 +388,8 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .curve-editor .ce-now circle { fill: var(--warn); }
 .curve-editor circle.pt { fill: var(--panel); stroke: var(--accent); stroke-width: 2.5; cursor: grab; }
 .curve-editor circle.pt.on { fill: var(--accent); cursor: grabbing; }
+.curve-editor .ce-band { fill: var(--ok); opacity: 0.18; }
+.curve-editor.readonly .ce-line { stroke-width: 2; }
+.curve-editor circle.pt-ro { fill: var(--accent); }
 .curve-editor .ce-tip { fill: var(--text); font: 600 calc(var(--ce-font, 11px) * 1.1) var(--sans); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
 .curve-input { flex: 1 1 220px; min-width: 0; max-width: 100%; }
