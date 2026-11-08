@@ -86,13 +86,98 @@ export function stopTurboChip() {
   clearInterval(chipTimer);
 }
 
+// The CPU cooling profile: the CPU zone's PCS input. Quiet and normal are
+// curves (normal: reimu-fand's default), holding keeps it in a band of °C
+// (reimu-fand finds the duty, the curve stays its safety: full speed at its
+// last point); custom: any other curve, edited as "°C:% ...".
+const CURVES = {
+  quiet: "50:30 60:38 65:50 70:75 75:100",
+  normal: "45:30 55:38 60:47 65:60 70:80 75:100",
+};
+const PROFILES = { quiet: "Тихий", normal: "Обычный", hold: "Удержание", custom: "Свой" };
+const BAND = [48, 52];
+const curveText = (c) => (c || []).map(([t, d]) => `${t}:${d}`).join(" ");
+let customOpen = false;
+
+function profileOf(pcs) {
+  if (pcs.target) return "hold";
+  const c = curveText(pcs.curve);
+  if (customOpen) return "custom";
+  return c === CURVES.quiet ? "quiet" : c === CURVES.normal ? "normal" : "custom";
+}
+
+async function setProfile(pcs, name, refresh, band = BAND) {
+  customOpen = name === "custom";
+  const steps = [];
+  if (name === "hold") {
+    // the curve under it: the normal one (its full speed at 75 °C is the safety)
+    if (!pcs.target && curveText(pcs.curve) !== CURVES.normal && curveText(pcs.curve) !== CURVES.quiet) steps.push(["SetCurve", ["cpu", "pcs", CURVES.normal]]);
+    steps.push(["SetTarget", ["cpu", "pcs", `${band[0]}-${band[1]}`]]);
+  } else if (name === "custom") {
+    if (pcs.target) steps.push(["SetTarget", ["cpu", "pcs", "none"]]);
+  } else {
+    if (pcs.target) steps.push(["SetTarget", ["cpu", "pcs", "none"]]);
+    steps.push(["SetCurve", ["cpu", "pcs", CURVES[name]]]);
+  }
+  for (const [m, a] of steps) {
+    try {
+      await api.post(`${PATH}/action/${m}`, { data: a });
+    } catch (e) {
+      toast(`Вентиляторы: ${e.message || e}`, "err");
+      break;
+    }
+  }
+  refresh();
+}
+
+function profileRow(z, refresh) {
+  const pcs = z.inputs.find((i) => i.id === "pcs");
+  if (!pcs) return null;
+  const cur = profileOf(pcs);
+  const btn = (name) => h("button", { class: `btn small${cur === name ? " active" : ""}`, onclick: () => setProfile(pcs, name, refresh) }, PROFILES[name]);
+  let extra;
+  if (cur === "hold") {
+    const [lo, hi] = pcs.target;
+    const from = h("input", { type: "number", min: 30, max: 74, step: 1, value: lo, size: 3 });
+    const to = h("input", { type: "number", min: 30, max: 74, step: 1, value: hi, size: 3 });
+    extra = h(
+      "div",
+      { class: "row" },
+      h("span", { class: "muted small" }, `держать процессор в ${lo}–${hi} °C, обороты подбираются сами; при ${pcs.curve[pcs.curve.length - 1][0]} °C — полные:`),
+      h("label", { class: "inline" }, "от", from),
+      h("label", { class: "inline" }, "до", to),
+      h("span", {}, "°C"),
+      h("button", { class: "btn small", onclick: () => setProfile(pcs, "hold", refresh, [Number(from.value), Number(to.value)]) }, "Применить"),
+    );
+  } else if (cur === "custom") {
+    const pts = h("input", { value: curveText(pcs.curve), size: 36, placeholder: "45:30 60:50 75:100" });
+    const save = async () => {
+      try {
+        await api.post(`${PATH}/action/SetCurve`, { data: ["cpu", "pcs", pts.value.trim()] });
+        toast("Кривая сохранена", "ok");
+      } catch (e) {
+        toast(`Вентиляторы: ${e.message || e}`, "err");
+      }
+      refresh();
+    };
+    extra = h(
+      "div",
+      { class: "row" },
+      h("label", { class: "inline" }, "Кривая", pts),
+      h("button", { class: "btn small", onclick: save }, "Сохранить кривую"),
+      h("span", { class: "muted small" }, "°C:% через пробел, последняя точка 100 %"),
+    );
+  } else extra = h("div", { class: "muted small" }, `кривая ${curveText(pcs.curve).replaceAll(" ", " · ")} (°C:%)`);
+  return h("div", { class: "section", id: "cpu-profile" }, h("div", { class: "row" }, h("b", {}, "Профиль процессора"), ["quiet", "normal", "hold", "custom"].map(btn)), extra);
+}
+
 function zoneBlock(st, z, refresh) {
   const run = st.host === "on" || st.host === "unknown";
   const fan = z.fans.find((f) => f.rpm !== undefined);
   const inputs = z.inputs
     // the host's GPU only while reimu-hostlink reports it
     .filter((i) => i.used && !(i.id === "gpu" && i.temp === null))
-    .map((i) => `${INPUTS[i.id] || i.id} ${num(i.temp, 1)} °C → ${num(i.demand)} %`)
+    .map((i) => `${INPUTS[i.id] || i.id} ${num(i.temp, 1)} °C → ${num(i.demand)} %${i.target ? ` (держит ${i.target[0]}–${i.target[1]})` : ""}`)
     .join(" · ");
   const duty = h("input", { type: "number", min: st.floor, max: 100, step: 1, value: Math.round(z.manual_duty !== null ? z.manual_duty : z.duty !== null ? z.duty : 100), size: 4 });
   const setDuty = () => {
@@ -116,6 +201,7 @@ function zoneBlock(st, z, refresh) {
     ),
     run && inputs ? h("div", { class: "muted small" }, inputs) : null,
     run && z.reason ? h("div", { class: "small" }, z.reason) : null,
+    z.id === "cpu" ? profileRow(z, refresh) : null,
     h(
       "div",
       { class: "row" },

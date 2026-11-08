@@ -13,6 +13,10 @@
  *                                               MANUAL_TIMEOUT_SEC
  *     method   SetCurve(s zone, s input, s points) -> s   checked, applied,
  *                                               saved in the config file
+ *     method   SetTarget(s zone, s input, s band) -> s   hold the input
+ *                                               in "LO-HI" °C instead of its
+ *                                               curve ("none": the curve);
+ *                                               saved in the config file
  *     method   SetTurbo(u minutes)              Турбо: every fan full scale for
  *                                               1..720 min, 0 = off, 4294967295
  *                                               = until off (12 h at most); kept
@@ -438,6 +442,25 @@ static int m_set_curve(sd_bus_message *m, void *ud, sd_bus_error *err)
     return sd_bus_reply_method_return(m, "s", s);
 }
 
+static int m_set_target(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+    const char *zone, *input, *spec;
+    char e[160], s[40];
+    int r = sd_bus_message_read(m, "sss", &zone, &input, &spec);
+    if (r < 0) return r;
+    int zi = zone_by_name(zone), g = group_by_name(input);
+    if (fand_set_target(&F, zi, g, spec, e, sizeof(e))) return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, e);
+    if (isnan(F.c.tgt_lo[zi][g])) snprintf(s, sizeof(s), "none");
+    else snprintf(s, sizeof(s), "%g-%g", F.c.tgt_lo[zi][g], F.c.tgt_hi[zi][g]);
+    fand_log(5, "zone %s, input %s: target %s", zone, input, s);
+    if (cfg_save_key(s_conf, target_key(zi, g), s))
+    {
+        snprintf(e, sizeof(e), "applied, but not saved in %s: %s", s_conf, strerror(errno));
+        return sd_bus_error_set(err, SD_BUS_ERROR_IO_ERROR, e);
+    }
+    return sd_bus_reply_method_return(m, "s", s);
+}
+
 static int m_turbo(sd_bus_message *m, void *ud, sd_bus_error *err)
 {
     uint32_t min;
@@ -489,6 +512,7 @@ static const sd_bus_vtable root_vtable[] = {
     SD_BUS_METHOD("SetDuty", "sd", "", m_set_duty, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("Confirm", "s", "", m_confirm, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("SetCurve", "sss", "s", m_set_curve, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("SetTarget", "sss", "s", m_set_target, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("ClearAlarms", "", "", m_clear, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("Reload", "", "s", m_reload, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END

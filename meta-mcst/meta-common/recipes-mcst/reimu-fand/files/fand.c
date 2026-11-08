@@ -215,6 +215,61 @@ const char *curve_key(int zone, int group)
     return zone >= 0 && zone < NZONES && group >= 0 && group < NGROUPS ? curve_keys[zone][group] : NULL;
 }
 
+static const char *const target_keys[NZONES][NGROUPS] = {
+    { "CPU_PCS_TARGET", "CPU_VRM_TARGET", NULL, NULL },
+    { "BOARD_PCS_TARGET", "BOARD_VRM_TARGET", "BOARD_IOHUB_TARGET", "BOARD_GPU_TARGET" },
+};
+
+const char *target_key(int zone, int group)
+{
+    return zone >= 0 && zone < NZONES && group >= 0 && group < NGROUPS ? target_keys[zone][group] : NULL;
+}
+
+#define TARGET_MIN   30 /* °C */
+#define TARGET_WIDTH 15 /* °C, the widest band */
+int target_parse(const char *s, double *lo, double *hi, double full_t, char *err, size_t n)
+{
+    while (isspace((unsigned char)*s)) s++;
+    if (!strcasecmp(s, "none") || !strcasecmp(s, "off") || !*s)
+    {
+        *lo = *hi = NAN;
+        return 0;
+    }
+    char *e;
+    double a = strtod(s, &e), b = a;
+    if (e == s || !isfinite(a)) goto bad;
+    while (isspace((unsigned char)*e)) e++;
+    if (*e == '-')
+    {
+        const char *p = e + 1;
+        b = strtod(p, &e);
+        if (e == p || !isfinite(b)) goto bad;
+    }
+    while (isspace((unsigned char)*e)) e++;
+    if (*e) goto bad;
+    if (b < a)
+    {
+        snprintf(err, n, "%g-%g: the upper end below the lower", a, b);
+        return -1;
+    }
+    if (a < TARGET_MIN || b - a > TARGET_WIDTH)
+    {
+        snprintf(err, n, "%g-%g: from %d °C, at most %d °C wide", a, b, TARGET_MIN, TARGET_WIDTH);
+        return -1;
+    }
+    if (b >= full_t)
+    {
+        snprintf(err, n, "%g-%g: must be below the curve's full speed point %g °C", a, b, full_t);
+        return -1;
+    }
+    *lo = a;
+    *hi = b;
+    return 0;
+bad:
+    snprintf(err, n, "\"%s\": not LO-HI, a temperature or none", s);
+    return -1;
+}
+
 /* The defaults. CPU: the vendor's curve of the board's device tree (thermal
  * zone cpu-thermal_0 on the PCS: active trips 40/50/55/60/65/70/75 °C with
  * 3 °C hysteresis, every fan at cooling levels 0/60/70/90/120/150/200/255 of
@@ -235,6 +290,12 @@ void cfg_defaults(struct config *c)
     memset(c, 0, sizeof(*c));
     c->floor = 30;
     c->hyst = 3;
+    /* measured on the board 2026-11-08 (PCS at 50 °C, ~80 %): within ±2 °C,
+     * no swinging, with the fans' slew */
+    c->tgt_kp = 4;
+    c->tgt_ki = 0.1;
+    for (int z = 0; z < NZONES; z++)
+        for (int g = 0; g < NGROUPS; g++) c->tgt_lo[z][g] = c->tgt_hi[z][g] = NAN;
     c->slew_up = 10;
     c->slew_down = 1;
     c->poll_ms = 1000;
@@ -362,6 +423,8 @@ struct numkey
 static const struct numkey numkeys[] = {
     { "FLOOR", OFF(floor), 0, 0, ABS_MIN_FLOOR, 100 },
     { "HYSTERESIS", OFF(hyst), 0, 0, 0, 10 },
+    { "TARGET_KP", OFF(tgt_kp), 0, 0, 0, 50 },
+    { "TARGET_KI", OFF(tgt_ki), 0, 0, 0, 2 },
     { "SLEW_UP", OFF(slew_up), 0, 0, 5, 100 },
     { "SLEW_DOWN", OFF(slew_down), 0, 0, 0.2, 100 },
     { "POLL_MS", OFF(poll_ms), 0, 1, 100, 5000 },
@@ -407,8 +470,17 @@ static int is_curve_key(const char *k, int *z, int *g)
     return 0;
 }
 
-/* one KEY=VALUE; pass 0: everything but the curves, pass 1: the curves
- * (they are checked against the FLOOR of the same file) */
+static int is_target_key(const char *k, int *z, int *g)
+{
+    for (*z = 0; *z < NZONES; (*z)++)
+        for (*g = 0; *g < NGROUPS; (*g)++)
+            if (target_keys[*z][*g] && !strcmp(k, target_keys[*z][*g])) return 1;
+    return 0;
+}
+
+/* one KEY=VALUE; pass 0: everything but the curves and targets, pass 1: the
+ * curves (they are checked against the FLOOR of the same file), pass 2: the
+ * targets (against the curves) */
 static void cfg_line(struct config *c, char *line, int lineno, int pass, char err[][128], int maxerr, int *nerr)
 {
     char *eq = strchr(line, '=');
@@ -430,6 +502,15 @@ static void cfg_line(struct config *c, char *line, int lineno, int pass, char er
         v++;
     }
     int z, g;
+    if (is_target_key(k, &z, &g))
+    {
+        if (pass != 2) return;
+        char e[100];
+        const struct curve *cv = &c->curve[z][g];
+        if (target_parse(v, &c->tgt_lo[z][g], &c->tgt_hi[z][g], cv->t[cv->n - 1], e, sizeof(e)))
+            add_err(err, maxerr, nerr, "%s: %s (kept %s)", k, e, isnan(c->tgt_lo[z][g]) ? "the curve" : "the previous target");
+        return;
+    }
     if (is_curve_key(k, &z, &g))
     {
         if (pass != 1) return;
@@ -536,7 +617,7 @@ static void cfg_line(struct config *c, char *line, int lineno, int pass, char er
 int cfg_parse(struct config *c, const char *text, char err[][128], int maxerr)
 {
     int nerr = 0;
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < 3; pass++)
     {
         const char *p = text;
         int lineno = 0;
@@ -1610,11 +1691,28 @@ static void zone_step(struct fand *f, int zi, double dt)
             in->demand = NAN;
             continue;
         }
-        if (!in->have || t >= in->t_eff) in->t_eff = t;
-        else if (t <= in->t_eff - c->hyst) in->t_eff = t + c->hyst;
-        in->have = 1;
         const struct curve *cv = &c->curve[zi][g];
-        in->demand = curve_eval(cv, in->t_eff);
+        double lo = c->tgt_lo[zi][g], hi = c->tgt_hi[zi][g];
+        if (!isnan(lo))
+        {
+            /* holding lo..hi: PI on the distance from the band, nothing
+             * inside it; starts from the curve's duty, the integral kept
+             * within FLOOR..100 (no wind-up); no hysteresis */
+            double e = t > hi ? t - hi : t < lo ? t - lo : 0, step = dt > 5 ? 5 : dt;
+            if (!in->have) in->integ = curve_eval(cv, t);
+            in->integ = fmin(100, fmax(c->floor, in->integ + c->tgt_ki * e * step));
+            in->t_eff = t;
+            in->have = 1;
+            in->demand = fmin(100, fmax(c->floor, in->integ + c->tgt_kp * e));
+            if (t >= cv->t[cv->n - 1]) in->demand = 100;
+        }
+        else
+        {
+            if (!in->have || t >= in->t_eff) in->t_eff = t;
+            else if (t <= in->t_eff - c->hyst) in->t_eff = t + c->hyst;
+            in->have = 1;
+            in->demand = curve_eval(cv, in->t_eff);
+        }
         if (in->demand > demand) demand = in->demand;
         if (in->t_eff >= cv->t[cv->n - 1]) hot = 1;
     }
@@ -1912,8 +2010,32 @@ int fand_set_curve(struct fand *f, int zone, int group, const char *pts, char *e
     }
     struct curve cv;
     if (curve_parse(pts, &cv, f->c.floor, err, n)) return -1;
+    if (!isnan(f->c.tgt_hi[zone][group]) && f->c.tgt_hi[zone][group] >= cv.t[cv.n - 1])
+    {
+        snprintf(err, n, "full speed at %g °C, not above the target %g-%g", cv.t[cv.n - 1], f->c.tgt_lo[zone][group],
+                 f->c.tgt_hi[zone][group]);
+        return -1;
+    }
     f->c.curve[zone][group] = cv;
     f->c.use[zone][group] = 1;
+    f->z[zone].in[group].have = 0;
+    f->gen++;
+    return 0;
+}
+
+int fand_set_target(struct fand *f, int zone, int group, const char *spec, char *err, size_t n)
+{
+    if (check_zone(zone, err, n)) return -1;
+    if (!target_key(zone, group))
+    {
+        snprintf(err, n, "zone %s has no input %s", zone_id[zone], group >= 0 && group < NGROUPS ? group_id[group] : "?");
+        return -1;
+    }
+    const struct curve *cv = &f->c.curve[zone][group];
+    double lo, hi;
+    if (target_parse(spec, &lo, &hi, cv->t[cv->n - 1], err, n)) return -1;
+    f->c.tgt_lo[zone][group] = lo;
+    f->c.tgt_hi[zone][group] = hi;
     f->z[zone].in[group].have = 0;
     f->gen++;
     return 0;
@@ -2094,6 +2216,9 @@ void fand_json(const struct fand *f, struct buf *b)
             buf_num(b, run && z->in[g].have ? z->in[g].demand : NAN, 1);
             buf_printf(b, ",\"curve\":");
             json_curve(b, &c->curve[zi][g]);
+            if (isnan(c->tgt_lo[zi][g])) buf_printf(b, ",\"target\":null");
+            else buf_printf(b, ",\"target\":[%g,%g]", c->tgt_lo[zi][g], c->tgt_hi[zi][g]);
+            buf_printf(b, ",\"target_key\":\"%s\"", target_keys[zi][g]);
             buf_printf(b, "}");
         }
         buf_printf(b, "],\"fans\":[");

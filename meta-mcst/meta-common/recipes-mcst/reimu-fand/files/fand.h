@@ -76,6 +76,10 @@ struct config
     struct devaddr case_fan[FAND_MAX_CASE];
     struct curve curve[NZONES][NGROUPS];
     int use[NZONES][NGROUPS];
+    /* hold the input in tgt_lo..tgt_hi °C instead of its curve (NAN: the
+     * curve): PI, KP %/°C of the distance from the band, KI %/(°C s) */
+    double tgt_lo[NZONES][NGROUPS], tgt_hi[NZONES][NGROUPS];
+    double tgt_kp, tgt_ki;
 };
 
 struct sensor
@@ -100,6 +104,7 @@ struct zin
     int have;
     double t_eff; /* the temperature after hysteresis */
     double demand;
+    double integ; /* holding a target: the integral part, % */
 };
 
 struct output
@@ -191,6 +196,10 @@ void curve_format(const struct curve *cv, char *buf, size_t n);
 int cfg_save_key(const char *file, const char *key, const char *value);
 extern const char *const group_id[NGROUPS], *const zone_id[NZONES], *const mode_name[3];
 const char *curve_key(int zone, int group);
+const char *target_key(int zone, int group); /* CPU_PCS_TARGET, ... */
+/* "LO-HI", "T" (°C) or none/off (NAN); below full_t, the input's curve's
+ * full-speed point (it stays the safety) */
+int target_parse(const char *s, double *lo, double *hi, double full_t, char *err, size_t n);
 
 /* ---- control (fand.c) */
 void fand_init(struct fand *f, const struct config *c, int64_t now);
@@ -207,6 +216,7 @@ int fand_set_mode(struct fand *f, int zone, int mode, char *err, size_t n);
 int fand_set_duty(struct fand *f, int zone, double duty, char *err, size_t n);
 int fand_confirm(struct fand *f, int zone, char *err, size_t n);
 int fand_set_curve(struct fand *f, int zone, int group, const char *pts, char *err, size_t n);
+int fand_set_target(struct fand *f, int zone, int group, const char *spec, char *err, size_t n);
 void fand_clear_alarms(struct fand *f);
 /* minutes: 0 off, 1..FAND_TURBO_MAX_MIN, FAND_TURBO_UNTIL_OFF */
 int fand_set_turbo(struct fand *f, unsigned minutes, char *err, size_t n);

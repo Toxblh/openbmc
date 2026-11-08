@@ -193,6 +193,8 @@ def main():
                                     "node", os.path.join(e2e, "host-usbnet.stub.mjs")]))
     jobs.append(Job("power_policy", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
                                      "node", os.path.join(e2e, "power-policy.stub.mjs")]))
+    jobs.append(Job("fan_profile", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
+                                    "node", os.path.join(e2e, "fan-profile.stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
         for g in groups_of(py):

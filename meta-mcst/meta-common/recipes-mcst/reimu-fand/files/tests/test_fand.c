@@ -1876,6 +1876,95 @@ static void t_readings(void)
     CHECK(fand_readings(&f, r, FAND_MAX_READINGS) == 0, "host off: none");
 }
 
+/* ------------------------------------------------------------------ hold a temperature */
+/* a CPU that settles at EQ0 - 0.375 * fan duty (80 % -> 50 °C at EQ0 80, as
+ * measured on the board), time constant 20 s; every PCS sensor at it */
+static double s_cpu_t;
+static void run_model(struct fand *f, double sec, double eq0, double *tmin, double *tmax, double *dmin, double *dmax)
+{
+    for (int i = 0; i < (int)(sec * 1000 / f->c.poll_ms + 0.5); i++)
+    {
+        double eq = eq0 - 0.375 * f->z[Z_CPU].duty;
+        s_cpu_t += (eq - s_cpu_t) * (f->c.poll_ms / 1000.0) / 20;
+        for (int a = 0x20; a <= 0x26; a++) pcs_temp(a, s_cpu_t);
+        T += f->c.poll_ms;
+        fand_step(f, T, HOST_ON);
+        if (tmin && s_cpu_t < *tmin) *tmin = s_cpu_t;
+        if (tmax && s_cpu_t > *tmax) *tmax = s_cpu_t;
+        if (dmin && f->z[Z_CPU].duty < *dmin) *dmin = f->z[Z_CPU].duty;
+        if (dmax && f->z[Z_CPU].duty > *dmax) *dmax = f->z[Z_CPU].duty;
+    }
+}
+
+static void t_target(void)
+{
+    struct config c;
+    char err[FAND_MAX_ERR][128], e[160];
+    /* config */
+    cfg_defaults(&c);
+    CHECK(isnan(c.tgt_lo[Z_CPU][G_PCS]) && isnan(c.tgt_hi[Z_BOARD][G_IOHUB]), "no target by default");
+    int n = cfg_parse(&c, "CPU_PCS_TARGET=48-52\nBOARD_PCS_TARGET=\"50\"\nBOARD_GPU_TARGET=60-70\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && c.tgt_lo[Z_CPU][G_PCS] == 48 && c.tgt_hi[Z_CPU][G_PCS] == 52, "48-52 (%d: %s)", n, n ? err[0] : "");
+    CHECK(c.tgt_lo[Z_BOARD][G_PCS] == 50 && c.tgt_hi[Z_BOARD][G_PCS] == 50, "one temperature: lo = hi");
+    CHECK(c.tgt_lo[Z_BOARD][G_GPU] == 60, "every curve input can have one");
+    n = cfg_parse(&c, "CPU_PCS_TARGET=none\n", err, FAND_MAX_ERR);
+    CHECK(n == 0 && isnan(c.tgt_lo[Z_CPU][G_PCS]), "none: off");
+    const char *bad[] = { "CPU_PCS_TARGET=52-48", "CPU_PCS_TARGET=20-25", "CPU_PCS_TARGET=60-80", "CPU_PCS_TARGET=75",
+                          "CPU_PCS_TARGET=abc", "CPU_PCS_TARGET=30-60", "CPU_PCS_TARGET=50-", "CPU_IOHUB_TARGET=50" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        cfg_defaults(&c);
+        n = cfg_parse(&c, bad[i], err, FAND_MAX_ERR);
+        CHECK(n == 1 && isnan(c.tgt_lo[Z_CPU][G_PCS]), "refused: %s (%d)", bad[i], n);
+    }
+    cfg_defaults(&c);
+    n = cfg_parse(&c, "CPU_PCS_TARGET=60-65\nCPU_PCS_CURVE=40:30 62:100\n", err, FAND_MAX_ERR);
+    CHECK(n == 1 && isnan(c.tgt_lo[Z_CPU][G_PCS]), "checked against the same file's curve, after it: below its full-speed point (%d)", n);
+    CHECK(target_key(Z_CPU, G_PCS) && !strcmp(target_key(Z_CPU, G_PCS), "CPU_PCS_TARGET") && !target_key(Z_CPU, G_IOHUB), "keys");
+
+    /* the loop: from 60 °C into 48-52 and held there, no swinging */
+    struct fand f;
+    c = cfg_test();
+    cfg_parse(&c, "CPU_PCS_TARGET=48-52\n", err, FAND_MAX_ERR);
+    start(&f, &c);
+    s_cpu_t = 60;
+    run_model(&f, 300, 80, NULL, NULL, NULL, NULL);
+    double tmin = 1e9, tmax = -1e9, dmin = 1e9, dmax = -1e9;
+    run_model(&f, 600, 80, &tmin, &tmax, &dmin, &dmax);
+    CHECK(tmin >= 47.5 && tmax <= 52.5, "held in 48-52 (%.2f..%.2f)", tmin, tmax);
+    CHECK(dmax - dmin < 10 && dmax < 100, "the duty steady, not at full (%.1f..%.1f)", dmin, dmax);
+    CHECK(!f.z[Z_CPU].hot && !f.z[Z_CPU].failsafe, "neither hot nor fail-safe");
+    /* more load: the duty goes up, still in the band */
+    run_model(&f, 600, 85, NULL, NULL, NULL, NULL);
+    tmin = 1e9, tmax = -1e9, dmin = 1e9, dmax = -1e9;
+    run_model(&f, 300, 85, &tmin, &tmax, &dmin, &dmax);
+    CHECK(tmin >= 47.5 && tmax <= 52.5 && dmin > 80, "more load: more duty, still held (%.2f..%.2f, %.1f%%)", tmin, tmax, dmin);
+    /* idle, cool below the band at any duty: down to the floor */
+    run_model(&f, 900, 55, NULL, NULL, NULL, NULL);
+    CHECK(NEAR(f.z[Z_CPU].duty, c.floor, 0.01), "below the band: down to the floor (%.1f)", f.z[Z_CPU].duty);
+    /* safety: at the curve's full-speed point 100 % (at SLEW_UP, as the curves) */
+    for (int a = 0x20; a <= 0x26; a++) pcs_temp(a, 76);
+    run(&f, 8, HOST_ON);
+    CHECK(f.z[Z_CPU].duty == 100 && f.z[Z_CPU].hot && f.z[Z_CPU].in[G_PCS].demand == 100, "76 °C: 100%% (%.1f)", f.z[Z_CPU].duty);
+    /* JSON shows it */
+    struct buf b = { 0 };
+    fand_json(&f, &b);
+    CHECK(b.s && strstr(b.s, "\"target\":[48,52]") && strstr(b.s, "\"target\":null"), "JSON: target [48,52], others null");
+    free(b.s);
+
+    /* set over D-Bus */
+    CHECK(fand_set_target(&f, Z_CPU, G_PCS, "60-80", e, sizeof(e)), "above the curve's full speed refused");
+    CHECK(fand_set_target(&f, Z_CPU, G_IOHUB, "50", e, sizeof(e)), "cpu has no IOHUB input");
+    CHECK(!fand_set_target(&f, Z_CPU, G_PCS, "none", e, sizeof(e)) && isnan(f.c.tgt_lo[Z_CPU][G_PCS]), "none: off");
+    for (int a = 0x20; a <= 0x26; a++) pcs_temp(a, 60);
+    run(&f, 300, HOST_ON);
+    CHECK(NEAR(f.z[Z_CPU].in[G_PCS].demand, 47, 0.01), "off: the curve again (%.2f)", f.z[Z_CPU].in[G_PCS].demand);
+    CHECK(!fand_set_target(&f, Z_CPU, G_PCS, "48-52", e, sizeof(e)) && f.c.tgt_hi[Z_CPU][G_PCS] == 52, "set (%s)", e);
+    double d0 = f.z[Z_CPU].duty;
+    run(&f, 1, HOST_ON);
+    CHECK(f.z[Z_CPU].duty >= d0 - 1.01, "turned on: starts from the curve's duty, no drop (%.1f -> %.1f)", d0, f.z[Z_CPU].duty);
+}
+
 int main(void)
 {
     snprintf(R, sizeof(R), "%s/fand-test-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", getpid());
@@ -1887,7 +1976,7 @@ int main(void)
         { "failsafe_inputs", t_failsafe_inputs }, { "outputs", t_outputs }, { "tach", t_tach }, { "manual", t_manual },
         { "reload", t_reload }, { "json", t_json }, { "fan_model", t_fan_model }, { "fan_range", t_fan_range },
         { "tach_mode", t_tach_mode }, { "floor_full", t_floor_full }, { "turbo", t_turbo }, { "gpu", t_gpu }, { "guard", t_guard },
-        { "on_since_hint", t_on_since_hint }, { "poll_watchdog", t_poll_watchdog }, { "failsafe_verify", t_failsafe_verify }, { "bus_cost", t_bus_cost }, { "readings", t_readings },
+        { "on_since_hint", t_on_since_hint }, { "poll_watchdog", t_poll_watchdog }, { "failsafe_verify", t_failsafe_verify }, { "bus_cost", t_bus_cost }, { "readings", t_readings }, { "target", t_target },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
     {
