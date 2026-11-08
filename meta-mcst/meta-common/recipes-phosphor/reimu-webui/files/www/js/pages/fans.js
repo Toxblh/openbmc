@@ -1,4 +1,5 @@
 import { api, h, toast } from "../api.js";
+import { curveEditor } from "../lib/curve-editor.js";
 
 // Fan control (reimu-fand, D-Bus xyz.openbmc_project.Reimu.Fans): its state
 // and the zone controls, a card of the sensors page.
@@ -98,6 +99,8 @@ const PROFILES = { quiet: "Тихий", normal: "Обычный", hold: "Уде�
 const BAND = [48, 52];
 const curveText = (c) => (c || []).map(([t, d]) => `${t}:${d}`).join(" ");
 let customOpen = false;
+// the custom curve being edited, not saved yet: kept over refreshes
+let draft = null;
 
 function profileOf(pcs) {
   if (pcs.target) return "hold";
@@ -108,6 +111,7 @@ function profileOf(pcs) {
 
 async function setProfile(pcs, name, refresh, band = BAND) {
   customOpen = name === "custom";
+  draft = null;
   const steps = [];
   if (name === "hold") {
     // the curve under it: the normal one (its full speed at 75 °C is the safety)
@@ -130,7 +134,7 @@ async function setProfile(pcs, name, refresh, band = BAND) {
   refresh();
 }
 
-function profileRow(z, refresh) {
+function profileRow(st, z, refresh) {
   const pcs = z.inputs.find((i) => i.id === "pcs");
   if (!pcs) return null;
   const cur = profileOf(pcs);
@@ -150,10 +154,28 @@ function profileRow(z, refresh) {
       h("button", { class: "btn small", onclick: () => setProfile(pcs, "hold", refresh, [Number(from.value), Number(to.value)]) }, "Применить"),
     );
   } else if (cur === "custom") {
-    const pts = h("input", { value: curveText(pcs.curve), size: 36, placeholder: "45:30 60:50 75:100" });
+    const parse = (v) => v.trim().split(/[\s,]+/).filter(Boolean).map((p) => p.split(":").map(Number));
+    const pts = h("input", { class: "curve-input", value: curveText(draft || pcs.curve), placeholder: "45:30 60:50 75:100" });
+    const ed = curveEditor({
+      points: draft || pcs.curve,
+      floor: st.floor || 30,
+      temp: pcs.temp,
+      onChange: (p) => {
+        draft = p;
+        pts.value = curveText(p);
+      },
+    });
+    pts.addEventListener("change", () => {
+      const p = parse(pts.value);
+      if (p.length >= 2 && p.every((x) => x.length === 2 && x.every(Number.isFinite))) {
+        draft = p;
+        ed.set(p);
+      }
+    });
     const save = async () => {
       try {
         await api.post(`${PATH}/action/SetCurve`, { data: ["cpu", "pcs", pts.value.trim()] });
+        draft = null;
         toast("Кривая сохранена", "ok");
       } catch (e) {
         toast(`Вентиляторы: ${e.message || e}`, "err");
@@ -162,10 +184,16 @@ function profileRow(z, refresh) {
     };
     extra = h(
       "div",
-      { class: "row" },
-      h("label", { class: "inline" }, "Кривая", pts),
-      h("button", { class: "btn small", onclick: save }, "Сохранить кривую"),
-      h("span", { class: "muted small" }, "°C:% через пробел, последняя точка 100 %"),
+      {},
+      ed.el,
+      h("div", { class: "muted small" }, "Точки двигаются мышью или пальцем и прилипают к 5 °C и 5 %; двойной щелчок по пустому месту добавляет точку, по точке — убирает."),
+      h(
+        "div",
+        { class: "row" },
+        h("label", { class: "inline", style: "flex: 1 1 260px; min-width: 0" }, "Кривая", pts),
+        h("button", { class: "btn small", onclick: save }, "Сохранить кривую"),
+        draft ? h("span", { class: "badge warn" }, "не сохранено") : null,
+      ),
     );
   } else extra = h("div", { class: "muted small" }, `кривая ${curveText(pcs.curve).replaceAll(" ", " · ")} (°C:%)`);
   return h("div", { class: "section", id: "cpu-profile" }, h("div", { class: "row" }, h("b", {}, "Профиль процессора"), ["quiet", "normal", "hold", "custom"].map(btn)), extra);
@@ -201,7 +229,7 @@ function zoneBlock(st, z, refresh) {
     ),
     run && inputs ? h("div", { class: "muted small" }, inputs) : null,
     run && z.reason ? h("div", { class: "small" }, z.reason) : null,
-    z.id === "cpu" ? profileRow(z, refresh) : null,
+    z.id === "cpu" ? profileRow(st, z, refresh) : null,
     h(
       "div",
       { class: "row" },
@@ -247,5 +275,7 @@ export function renderFans(el, st, refresh) {
   updateChip(st || null);
   const a = document.activeElement;
   if (a && a.tagName === "INPUT" && el.contains(a)) return;
+  // a point of the curve being dragged
+  if (el.querySelector(".curve-editor.dragging")) return;
   el.replaceChildren(card(st, refresh));
 }

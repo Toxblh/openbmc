@@ -377,3 +377,16 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .bs-addr { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 0 0 4px 16px; font-size: 11px; color: var(--muted); user-select: text; }
 .bs-addr b { font-weight: 500; color: var(--text); }
 .bs-addr i { font-style: normal; }
+
+/* fan curve editor (js/lib/curve-editor.js) */
+.curve-editor { display: block; width: 100%; max-width: 640px; height: auto; touch-action: none; user-select: none; -webkit-user-select: none; margin: 6px 0; }
+.curve-editor .ce-grid line { stroke: var(--border); stroke-width: 1; }
+.curve-editor .ce-grid text { fill: var(--muted); font: var(--ce-font, 11px) var(--sans); }
+.curve-editor .ce-below { fill: var(--border); opacity: 0.35; }
+.curve-editor .ce-line { fill: none; stroke: var(--accent); stroke-width: 2.5; stroke-linejoin: round; }
+.curve-editor .ce-now line { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 4 3; }
+.curve-editor .ce-now circle { fill: var(--warn); }
+.curve-editor circle.pt { fill: var(--panel); stroke: var(--accent); stroke-width: 2.5; cursor: grab; }
+.curve-editor circle.pt.on { fill: var(--accent); cursor: grabbing; }
+.curve-editor .ce-tip { fill: var(--text); font: 600 calc(var(--ce-font, 11px) * 1.1) var(--sans); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+.curve-input { flex: 1 1 220px; min-width: 0; max-width: 100%; }
