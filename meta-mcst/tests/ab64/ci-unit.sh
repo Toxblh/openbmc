@@ -7,7 +7,7 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git python3 gcc libc6-dev libfdt-dev squashfs-tools mtd-utils xz-utils \
+apt-get install -y -qq git python3 gcc g++ make patch curl qemu-user libc6-dev libfdt-dev squashfs-tools mtd-utils xz-utils \
     device-tree-compiler >/dev/null
 git config --global --add safe.directory '*'
 cd /work/openbmc
