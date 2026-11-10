@@ -60,7 +60,7 @@ if (mode === "on") {
   await card.locator("input[type=file]").setInputFiles(process.env.PNS_IMAGE);
   await card.locator("button", { hasText: "Загрузить и проверить" }).click();
   let t = await waitJob(/годен|не годен/, 300000);
-  check(/годен/.test(t) && !/не годен/.test(t) && t.includes("f4c822e9"), `uploaded and checked: ${t.match(/Загружен[^]*?Записать/)?.[0]?.slice(0, 200)}`);
+  check(/годен/.test(t) && !/не годен/.test(t) && t.includes("c0c7328e4"), `uploaded and checked: ${t.match(/Загружен[^]*?Записать/)?.[0]?.slice(0, 200)}`);
   await page.screenshot({ path: `${OUT}/pns-checked.png`, fullPage: true });
   await card.locator("button", { hasText: "Записать во флеш ПНС" }).click();
   t = await waitJob(/Запись флеша: выполняется/, 60000);
@@ -68,7 +68,7 @@ if (mode === "on") {
   t = await waitJob(/Запись флеша: (готово|ошибка)/, 900000);
   await page.screenshot({ path: `${OUT}/pns-written.png`, fullPage: true });
   check(dialogs.some((d) => d.includes("Записать во флеш ПНС образ")), "a confirmation was asked");
-  check(/Запись флеша: готово/.test(t) && /Версия ПНС testing ::::::: \( unified-boot\/main commit f4c822e9/.test(t), `written, the new version shown: ${t.slice(0, 200)}`);
+  check(/Запись флеша: готово/.test(t) && /Версия ПНС release-2\.30\.5\.0-E8C2 ::::::: \( unified-boot\/release-2\.30\.5\.0-E8C2 commit c0c7328e4/.test(t), `written, the new version shown: ${t.slice(0, 200)}`);
 } else if (mode === "restore") {
   await card.locator("tr", { hasText: "backup-" }).first().locator("button", { hasText: "Записать обратно" }).click();
   await waitJob(/Запись флеша: выполняется/, 60000);

@@ -9,7 +9,7 @@ the board's PNS dump.
 WORKDIR holds what test_ab_qemu.py needs (ab.mtd, reimu-ab.tar) and
   pns-orig.bin   the 64 MiB dump of the board's PNS flash (unified-boot
                  release-2.30.13.1-E8C2, device tree 1.0_2025-02-06)
-  pns-new.bin    another image (the colleagues' 7 MiB pns+devtree_2.bin)
+  pns-new.bin    another image: release 2.30.5.0 + the same device tree at 0x700000
   pns-fault.so   LD_PRELOAD that breaks writes (pns-fault.c; built with the
                  A/B build's cross compiler when missing and docker is there)
 Environment: RQ, AB_SSH, AB_HTTPS as for test_ab_qemu.py (RQ short: unix
@@ -300,8 +300,8 @@ def t_tool(b):
     for name, data in (("new", new), ("orig", orig)):
         put(b, data, "/tmp/%s.bin" % name)
     rc, o = b.sh("reimu-pns-flash version /tmp/new.bin")
-    check(rc == 0 and "boot=testing ::::::: ( unified-boot/main commit f4c822e9, 202601311406 M)(uatx_445)" in o
-          and "devtree=1.0_2025-02-06" in o and "board=uatx_445" in o, "version of the colleagues' image")
+    check(rc == 0 and "boot=release-2.30.5.0-E8C2 ::::::: ( unified-boot/release-2.30.5.0-E8C2 commit c0c7328e4, 202411291539 )(uatx_445)" in o
+          and "devtree=1.0_2025-02-06" in o and "board=uatx_445" in o, "version of the other image (2.30.5.0)")
     for name in ("new", "orig"):
         rc, o = b.sh("reimu-pns-flash check /tmp/%s.bin --json" % name)
         j = json.loads(o.splitlines()[-1])
@@ -336,7 +336,7 @@ def t_tool(b):
     st = b.state()
     check(st.get("state") == "ok" and st.get("backup", "").startswith("/tmp/reimu-pns/backup-"), "state: write ok, backup %s" % st.get("backup"))
     rc, o = b.sh("cat /var/lib/reimu-pns/chip.json")
-    check('"source":"write"' in o and "f4c822e9" in o and sha(c) in o, "chip.json: the new version and the chip's sha256")
+    check('"source":"write"' in o and "c0c7328e4" in o and sha(c) in o, "chip.json: the new version and the chip's sha256")
     rc, o = b.sh("gzip -dc /var/lib/reimu-pns/backup-last.bin.gz | sha256sum")
     check(sha(orig) in o, "the chip before the write kept on the BMC flash (backup-last.bin.gz)")
     # the original back, as an image (not a restore)
