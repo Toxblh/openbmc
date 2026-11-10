@@ -16,6 +16,8 @@ if [ -n "${SSHPASS:-}" ]; then
     ap=$(mktemp); trap 'rm -f "$ap"' EXIT
     printf '#!/bin/sh\necho "%s"\n' "$SSHPASS" > "$ap"; chmod +x "$ap"
     export SSH_ASKPASS=$ap SSH_ASKPASS_REQUIRE=force DISPLAY=x
+    # the password only: no keys, no agent (a locked one makes every connection wait)
+    SSHO="$SSHO -o IdentityAgent=none -o PubkeyAuthentication=no"
 fi
 r() { ssh -p "$port" $SSHO "$host" "$@"; }
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
