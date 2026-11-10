@@ -836,7 +836,9 @@ int main(int argc, char **argv)
         char *name = NULL;
         int r = reimu_find_filename(0, d, &name);
         printf("find_filename %d %s\n", r, name ? name : "-");
-        return r || !name || strcmp(name, "hwmon7");
+        int bad = r || !name || strcmp(name, "hwmon7");
+        free(name);     /* the caller's: LSan sees a leak of the test's own otherwise */
+        return bad;
     }
     if (!strcmp(what, "readfile_text")) {
         /* without a size: NUL-terminated text (ASan fills malloc with 0xbe) */
@@ -846,6 +848,7 @@ int main(int argc, char **argv)
         int r = reimu_readfile(p, &buf, NULL);
         size_t n = r ? 0 : strnlen(buf, 4096);
         printf("readfile_text %d len %zu\n", r, n);
+        free(buf);
         return r || n != 6;
     }
     if (!strcmp(what, "readfile_error")) {
