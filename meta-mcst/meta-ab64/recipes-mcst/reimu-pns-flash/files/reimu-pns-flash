@@ -1,5 +1,6 @@
 #!/bin/sh
-# reimu-pns-flash: the host boot firmware (ПНС, Lintel unified-boot) flash.
+# reimu-pns-flash: the host boot firmware (ПНС, Lintel unified-boot) flash;
+# coreboot (the unofficial e2k port) on it too.
 #
 # The PNS flash (64 MiB SPI NOR on spi1, MTD partition "sys") is the host's;
 # a GPIO switch (GPIO_SPI_CONNECT, 1 = BMC, 0 = host) gives it to the BMC.
@@ -31,6 +32,7 @@
 #                                        The board must match the chip's
 #                                        device tree (--any-board: don't
 #                                        check), the chip must hold a Lintel
+#                                        (or coreboot)
 #                                        image (--blank-ok: or be erased).
 #                                        FILE may be gzipped (.gz).
 #                                        A restore (FILE's sha256 in its
@@ -54,6 +56,12 @@
 # its checksum as 8 hex digits at 0x48fff8), the boot area up to 0x490000,
 # the platform device tree (DTB) at 0x700000 (at most 1 MiB), nothing
 # after it. An image may stop after the boot area or after the DTB.
+#
+# coreboot (the e2k port, not MCST's): the same boot header at 0x0 (the
+# processor's), no unified-boot; a CBFS file "revision" with the
+# build's defines (#define COREBOOT_VERSION "..."), "build_info" with
+# MAINBOARD_PART_NUMBER, the platform device tree at 0x700000 as above (the
+# board is checked by it: a coreboot image without one is refused).
 #
 # Files: /run/reimu-pns/state.json (the job, its progress), /run/reimu-pns/lock,
 # /var/lib/reimu-pns/chip.json (versions last read from the chip),
@@ -441,7 +449,7 @@ fsize() { stat -L -c %s "$1"; }
 info() {
     local f=$1 len=${2:-$(fsize "$1")} t blocks s d
     I_SIZE=$len I_MAGIC= I_TRAILER= I_BOOT= I_TAG= I_CPU= I_VBIOS= I_DTB= I_DTBERR= I_DTBSIZE=
-    I_DTBVER= I_MODEL= I_COMPAT= I_EMPTY=
+    I_DTBVER= I_MODEL= I_COMPAT= I_EMPTY= I_CB= I_KIND= I_IMAGE= I_PART=
     [ "$(hexat "$f" 0 8)" = $MAGIC ] && I_MAGIC=1
     [ "$(hexat "$f" 0 16)" = ffffffffffffffffffffffffffffffff ] && I_EMPTY=1
     if [ "$len" -ge $BOOT_END ]; then
@@ -455,7 +463,21 @@ info() {
     I_TAG=$(printf '%s' "$I_BOOT" | sed -n 's/.*)(\([A-Za-z0-9_.-]*\))$/\1/p')
     I_CPU=$(printf '%s' "$I_BOOT" | sed -n 's/^[^ ]*-\([Ee][0-9][A-Za-z0-9]*\) :::::::.*/\1/p')
     I_VBIOS=$(grep -m1 -o 'VBIOS Version [0-9.]*' $s | sed 's/VBIOS Version //')
+    # coreboot: its "revision" file (the build's defines) and "build_info";
+    # its boot header is Lintel's (the processor's), no unified-boot in it
+    if [ -z "$I_BOOT" ]; then
+        t=$(sed -n 's/^#define COREBOOT_VERSION "\([^"]*\)"$/\1/p' $s | head -1)
+        if [ -n "$t" ]; then
+            I_CB=1
+            d=$(sed -n 's/^#define COREBOOT_BUILD "\([^"]*\)"$/\1/p' $s | head -1)
+            I_BOOT="coreboot $t${d:+ ($d)}"
+            I_PART=$(sed -n 's/^MAINBOARD_PART_NUMBER: *//p' $s | head -1)
+        fi
+    fi
     rm -f $s
+    if [ -n "$I_CB" ]; then I_KIND=coreboot I_MAGIC=
+    elif [ -n "$I_MAGIC" ]; then I_KIND=lintel; fi
+    I_IMAGE=$I_MAGIC$I_CB
     if [ "$len" -gt $DTB_OFF ]; then
         if [ "$(hexat "$f" $DTB_OFF 4)" != d00dfeed ]; then
             I_DTBERR="нет device tree (DTB) @0x700000"
@@ -482,10 +504,11 @@ info() {
     fi
 }
 
+# (magic: a boot image there, Lintel or coreboot; kind: which)
 info_json() {
-    printf '{"size":%d,"boot":%s,"board":%s,"cpu":%s,"vbios":%s,"magic":%s,"empty":%s,"dtb":' "$I_SIZE" \
-        "$(ja "$I_BOOT")" "$(ja "$I_TAG")" "$(ja "$I_CPU")" "$(ja "$I_VBIOS")" \
-        "$([ -n "$I_MAGIC" ] && echo true || echo false)" "$([ -n "$I_EMPTY" ] && echo true || echo false)"
+    printf '{"size":%d,"kind":%s,"boot":%s,"board":%s,"cpu":%s,"vbios":%s,"part":%s,"magic":%s,"empty":%s,"dtb":' "$I_SIZE" \
+        "$(ja "$I_KIND")" "$(ja "$I_BOOT")" "$(ja "$I_TAG")" "$(ja "$I_CPU")" "$(ja "$I_VBIOS")" "$(ja "$I_PART")" \
+        "$([ -n "$I_IMAGE" ] && echo true || echo false)" "$([ -n "$I_EMPTY" ] && echo true || echo false)"
     if [ -n "$I_DTB" ]; then
         printf '{"valid":true,"size":%d,"version":%s,"model":%s,"compatible":%s}}' "$I_DTBSIZE" \
             "$(ja "$I_DTBVER")" "$(ja "$I_MODEL")" "$(ja "$I_COMPAT")"
@@ -527,15 +550,28 @@ check_image() {
     [ "$sz" -gt 0 ] || { err "Пустой файл"; return 1; }
     [ "$sz" -le "$max" ] || err "Образ больше флеша: $sz байт, флеш $max"
     info "$f"
-    [ -n "$I_MAGIC" ] || err "Не образ ПНС: нет заголовка загрузчика Lintel в начале файла"
-    if [ "$sz" -lt $BOOT_END ]; then
-        err "Образ обрезан: область загрузчика 0x0-0x490000, в файле только $sz байт"
+    if [ -n "$I_CB" ]; then
+        # the board only by its device tree: there must be one
+        if [ "$sz" -le $DTB_OFF ]; then
+            err "Образ coreboot без device tree @0x700000: плату не проверить"
+        elif [ -z "$I_DTB" ]; then
+            err "Образ coreboot: ${I_DTBERR:-device tree повреждён}"
+        elif [ -n "$I_PART" ] && [ "${I_MODEL#"$I_PART"}" = "$I_MODEL" ]; then
+            b="Образ coreboot собран для платы $I_PART, а его device tree для $I_MODEL"
+            if [ "$any" = 1 ]; then warn "$b"; else err "$b"; fi
+        fi
+        warn "Неофициальная прошивка coreboot (не МЦСТ): $I_BOOT. Вернуть ПНС: резервная копия, которая делается перед записью"
     else
-        [ -n "$I_TRAILER" ] || err "Неизвестная разметка образа: нет контрольной суммы загрузчика @0x48fff8"
+        [ -n "$I_MAGIC" ] || err "Не образ ПНС: нет заголовка загрузчика Lintel в начале файла (и не coreboot)"
+        if [ "$sz" -lt $BOOT_END ]; then
+            err "Образ обрезан: область загрузчика 0x0-0x490000, в файле только $sz байт"
+        else
+            [ -n "$I_TRAILER" ] || err "Неизвестная разметка образа: нет контрольной суммы загрузчика @0x48fff8"
+        fi
+        [ -n "$I_BOOT" ] || err "Не найдена строка версии ПНС (unified-boot)"
+        [ "$sz" -gt $DTB_OFF ] && [ -z "$I_DTB" ] && err "${I_DTBERR:-device tree повреждён}"
+        [ "$sz" -le $DTB_OFF ] && [ "$sz" -ge $BOOT_END ] && warn "Образ без device tree: device tree на флеше (0x700000) не меняется"
     fi
-    [ -n "$I_BOOT" ] || err "Не найдена строка версии ПНС (unified-boot)"
-    [ "$sz" -gt $DTB_OFF ] && [ -z "$I_DTB" ] && err "${I_DTBERR:-device tree повреждён}"
-    [ "$sz" -le $DTB_OFF ] && [ "$sz" -ge $BOOT_END ] && warn "Образ без device tree: device tree на флеше (0x700000) не меняется"
     [ -n "$C_ERR" ] && return 1
     # the board
     b=
@@ -586,9 +622,9 @@ do_check() {
     else
         [ -n "$C_ERR" ] && printf '%s' "$C_ERR" | sed 's/^/ошибка: /'
         [ -n "$C_WARN" ] && printf '%s' "$C_WARN" | sed 's/^/внимание: /'
-        if [ -n "${I_SIZE:-}" ] && [ -n "$I_MAGIC" ]; then
-            say "ПНС: ${I_BOOT:-?}"
-            say "VBIOS: ${I_VBIOS:-?}"
+        if [ -n "${I_SIZE:-}" ] && [ -n "$I_IMAGE" ]; then
+            if [ -n "$I_CB" ]; then say "Загрузчик: $I_BOOT${I_PART:+, плата $I_PART}"
+            else say "ПНС: ${I_BOOT:-?}"; say "VBIOS: ${I_VBIOS:-?}"; fi
             [ -n "$I_DTB" ] && say "device tree: $I_DTBVER ($I_MODEL, $I_COMPAT)"
             say "покрывает: 0x0-$(printf '0x%x' $I_SIZE)"
         fi
@@ -599,6 +635,7 @@ do_check() {
 
 # ------------------------------------------------------------ version
 print_info() {
+    say "kind=$I_KIND"
     say "boot=$I_BOOT"
     say "board=$I_TAG"
     say "vbios=$I_VBIOS"
@@ -704,17 +741,17 @@ do_write() {
     bk=$(tmp chip)
     backup $bk 2 40 || die "Два чтения флеша ПНС не совпадают: запись отменена, флеш не изменён"
     info $bk; mark $bk.sha256
-    chip_magic=$I_MAGIC
+    chip_magic=$I_IMAGE
     name=backup-$(date +%Y%m%d-%H%M%S).bin
     pack $bk $name
     prune 4 "$f"
     S_BACKUP=$WORK/$name.gz
     # (before a refusal too: the page offers write-blank by what this says)
     save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
-    [ -n "$I_EMPTY" ] && [ -z "$I_MAGIC" ] && [ $blank = 0 ] &&
+    [ -n "$I_EMPTY" ] && [ -z "$I_IMAGE" ] && [ $blank = 0 ] &&
         die "Флеш ПНС читается пустым: он не подключился к BMC или пуст. Запись отменена (--blank-ok: писать в пустой)"
-    [ -z "$I_MAGIC" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
-        die "На флеше ПНС нет образа Lintel: он не подключился к BMC или повреждён. Запись отменена (--blank-ok: писать всё равно)"
+    [ -z "$I_IMAGE" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
+        die "На флеше ПНС нет образа (Lintel или coreboot): он не подключился к BMC или повреждён. Запись отменена (--blank-ok: писать всё равно)"
     ref_from_info "флеш"
     # no device tree on the chip to check the board against: only a backup
     # this BMC made of this chip is taken as this board's
@@ -804,13 +841,13 @@ do_write() {
     if [ $len -le $DTB_OFF ]; then
         b1=$I_BOOT b2=$I_TAG b3=$I_CPU b4=$I_VBIOS
         info $bk
-        I_BOOT=$b1 I_TAG=$b2 I_CPU=$b3 I_VBIOS=$b4 I_MAGIC=1 I_EMPTY=
+        I_BOOT=$b1 I_TAG=$b2 I_CPU=$b3 I_VBIOS=$b4 I_MAGIC=1 I_EMPTY= I_CB= I_KIND=lintel I_IMAGE=1 I_PART=
     fi
     I_SIZE=$CHIPSIZE
     # the whole chip now (both parts were read back above)
     csum=$( { cat $t; dd if=$bk bs=4096 skip=$((len / 4096)) 2>/dev/null; } | sha256sum | cut -d' ' -f1)
     save_chip write $csum
-    finish ok "Флеш ПНС записан и сверен: $(printf '0x0-0x%x' $len), изменено блоков: ${S_CHANGED:-?}; ПНС $I_BOOT$keep_warn"
+    finish ok "Флеш ПНС записан и сверен: $(printf '0x0-0x%x' $len), изменено блоков: ${S_CHANGED:-?}; $([ -n "$I_CB" ] || printf 'ПНС ')$I_BOOT$keep_warn"
     rm -f $WORK/.tmp.$$.target
     # RAM: an uploaded image is on the chip now
     [ "$f" = $WORK/upload.bin ] && rm -f "$f"

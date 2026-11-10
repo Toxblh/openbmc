@@ -95,6 +95,14 @@ async function downloadBackup(b, onProgress) {
   }, 1000);
 }
 
+// coreboot (the unofficial e2k port) instead of Lintel's unified-boot: its
+// version as the loader, none of the PNS rows it hasn't (build board, VBIOS)
+const isCoreboot = (i) => i && i.kind === "coreboot";
+const loaderRows = (i, none) =>
+  isCoreboot(i)
+    ? [["Загрузчик", `${i.boot}${i.part ? `, плата ${i.part}` : ""}`]]
+    : [["Версия ПНС", i.boot || none], ["Плата (сборка)", i.board], ["VBIOS", i.vbios]];
+
 function chipInfo(chip) {
   if (!chip) return h("div", { class: "muted" }, "Флеш ПНС ещё не читался: версия неизвестна. Она читается при загрузке BMC, если платформа выключена.");
   const i = chip.info || {};
@@ -103,9 +111,7 @@ function chipInfo(chip) {
     "div",
     {},
     kv([
-      ["Версия ПНС", i.boot || (i.empty ? "флеш пуст" : "не найдена")],
-      ["Плата (сборка)", i.board],
-      ["VBIOS", i.vbios],
+      ...loaderRows(i, i.empty ? "флеш пуст" : "не найдена"),
       ["Device tree", d.valid ? `${d.version || "без версии"} (${d.model || "?"})` : d.error],
       ["Совместимость", d.compatible],
       ["Прочитано", `${when(chip.time)}, ${SOURCES[chip.source] || chip.source}`],
@@ -121,9 +127,7 @@ function checkInfo(c) {
     "div",
     { class: "section" },
     kv([
-      ["Версия ПНС", i.boot],
-      ["Плата (сборка)", i.board],
-      ["VBIOS", i.vbios],
+      ...loaderRows(i),
       ["Device tree", d.valid ? `${d.version} (${d.model}, ${d.compatible})` : "нет (не меняется)"],
       ["Записывается", c.covers ? `${hex(c.covers[0])}–${hex(c.covers[1])} (${fmtBytes(c.covers[1])}), остальное не меняется` : undefined],
     ]),
@@ -299,6 +303,7 @@ export function pnsFlashCard() {
           "write",
           "upload",
           `Записать во флеш ПНС образ ${c.name} (${fmtBytes(up.size)})?\n\n${i.boot || ""}\nDevice tree: ${(i.dtb && i.dtb.version) || "не меняется"}\n\n` +
+            (isCoreboot(i) ? "Это coreboot — неофициальная прошивка, не МЦСТ. Вернуть ПНС можно из резервной копии, которая сейчас будет сделана.\n\n" : "") +
             "Перед записью весь флеш будет прочитан в резервную копию. Пишутся только отличающиеся блоки, каждый читается обратно; затем весь флеш сверяется. Платформу до конца записи (несколько минут) включить нельзя.",
         );
       });

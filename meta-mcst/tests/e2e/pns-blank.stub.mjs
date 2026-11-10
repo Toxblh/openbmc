@@ -31,7 +31,7 @@ const UPLOAD = { name: "upload", size: 4096, time: 1 };
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, job = null, answer = true }) {
+async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, job = null, answer = true, image = null, warnings = [] }) {
   const ctx = await browser.newContext({ locale: "ru-RU" });
   const page = await ctx.newPage();
   const s = { page, runs: [], dialogs: [], errors: [] };
@@ -46,7 +46,7 @@ async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, 
     if (p === `${PF}/action/Run`) {
       const [action, arg] = req.postDataJSON().data;
       s.runs.push([action, arg]);
-      const body = action === "check" ? { ok: checkOk, message: "x", check: { ok: checkOk, errors: [], warnings: [], image: { boot: "b", dtb: {} }, covers: [0, 4096] } } : { ok: true, message: "запущено" };
+      const body = action === "check" ? { ok: checkOk, message: "x", check: { ok: checkOk, errors: [], warnings, image: image || { boot: "b", dtb: {} }, covers: [0, 4096] } } : { ok: true, message: "запущено" };
       return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: JSON.stringify(body) }) });
     }
     const f = path.join(WWW, p);
@@ -118,6 +118,31 @@ for (const [what, o] of [
   const s = await open({ chip: EMPTY, ...o });
   if (!o.job) await checked(s);
   check((await btn(s).count()) === 0 || (await btn(s).isDisabled()), `${what}: not enabled`);
+  await s.page.context().close();
+}
+
+// coreboot (the unofficial e2k port) on the chip and as the image: shown as
+// such, no PNS rows it hasn't, a chip with it is a chip with an image
+const CB_BOOT = "coreboot 26.09-607-g367eda1a7d50 (Tue Nov 10 16:39:14 UTC 2026)";
+const CB_INFO = { kind: "coreboot", boot: CB_BOOT, board: "", cpu: "", vbios: "", part: "1E8SV-uATX", magic: true, empty: false,
+                  dtb: { valid: true, version: "2.0_2026-09-15", model: "1E8SV-uATX TVGI.469555.445", compatible: "mcst,e8c2_1e8sv-uatx_445" } };
+{
+  const s = await open({ chip: chip(CB_INFO), image: CB_INFO, warnings: ["Неофициальная прошивка coreboot (не МЦСТ): " + CB_BOOT] });
+  const rows = () => s.page.evaluate(() => [...document.querySelectorAll("#pns-flash dl.kv dt")].map((e) => e.textContent));
+  const t = await s.page.evaluate(() => document.querySelector("#pns-flash").textContent);
+  const r = await rows();
+  check(t.includes(CB_BOOT) && r.includes("Загрузчик") && !r.includes("Версия ПНС") && !r.includes("VBIOS") && !r.includes("Плата (сборка)"),
+        `a coreboot chip: "Загрузчик" coreboot, no PNS rows (${r.join(" | ")})`);
+  await checked(s);
+  const t2 = await s.page.evaluate(() => document.querySelector("#pns-flash").textContent);
+  check(/Неофициальная прошивка coreboot/.test(t2) && (await rows()).filter((x) => x === "Загрузчик").length === 2,
+        "a coreboot image checked: its loader row, the warning shown");
+  check((await btn(s).count()) === 0, "a coreboot chip: no write-onto-a-chip-without-an-image button");
+  await s.page.locator("button", { hasText: "Записать во флеш ПНС" }).click();
+  await s.page.waitForTimeout(200);
+  check(s.dialogs.length === 1 && s.dialogs[0].includes(CB_BOOT) && /неофициальн/i.test(s.dialogs[0]),
+        `the confirmation names coreboot, unofficial: ${s.dialogs[0].slice(0, 160)}`);
+  check(!s.errors.length, `coreboot: no page errors ${s.errors}`);
   await s.page.context().close();
 }
 
