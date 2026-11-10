@@ -1,0 +1,134 @@
+# The tests of a REIMU build (reimu-build.yml) in QEMU and a browser, one job
+# per test group (run-all.py --list), after each build, or by hand for a build
+# run's id. The suites that need the build's tree run in the build itself
+# (reimu-build-stage.yml, "Unit tests").
+#
+# Fixtures: the release ci-fixtures of this repository (pns.bin, pns-orig.bin,
+# pns-new.bin, fru.bin with a made-up identity, pns-fault.so, kernel-other.fit,
+# stock-kexec.tar); the stock firmware: the public REIMU 1.0.2 image
+# (tests/ab64/ci-stock.py).
+name: reimu tests
+on:
+  workflow_run:
+    workflows: ['reimu build']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id: {description: 'the reimu build run whose image to test', required: true}
+      only: {description: 'run-all.py --only REGEX (empty: all)', required: false, default: ''}
+permissions:
+  contents: read
+  actions: read
+env:
+  QEMU_VERSION: '11.1.2'
+  PLAYWRIGHT_VERSION: '1.64.1'
+  STOCK_URL: https://github.com/makise-homura/openbmc/releases/download/reimu-1.0.2/obmc-phosphor-image-reimu-5564.static.mtd
+jobs:
+  plan:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      jobs: ${{ steps.l.outputs.jobs }}
+      run_id: ${{ steps.l.outputs.run_id }}
+      sha: ${{ steps.l.outputs.sha }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+        run: echo "sha=$(gh api repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID -q .head_sha)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with: {ref: '${{ steps.r.outputs.sha }}'}
+      - id: l
+        env:
+          ONLY: ${{ inputs.only }}
+          RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+        run: |
+          # the container suites (test_*) are the build's own
+          jobs=$(REIMU_DOCKER= python3 meta-mcst/tests/ab64/run-all.py --list --only "$ONLY" | grep -v '^test_' | jq -R . | jq -cs .)
+          echo "$jobs"
+          echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "sha=${{ steps.r.outputs.sha }}" >> "$GITHUB_OUTPUT"
+
+  qemu:
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - id: c
+        uses: actions/cache@v4
+        with:
+          path: ~/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-arm-ubuntu24
+      - if: steps.c.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build libglib2.0-dev libpixman-1-dev libslirp-dev flex bison python3-venv >/dev/null
+          curl -sSfL "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz" | tar -xJ
+          cd "qemu-$QEMU_VERSION"
+          ./configure --prefix="$HOME/qemu" --target-list=arm-softmmu --enable-slirp --disable-docs --disable-werror >/dev/null
+          make -j"$(nproc)" >/dev/null && make install >/dev/null
+          ~/qemu/bin/qemu-system-arm --version
+
+  test:
+    needs: [plan, qemu]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.jobs) }}
+    env:
+      REIMU_WORK: ${{ github.workspace }}/../w
+      STOCK: ${{ github.workspace }}/../w/stock
+      REIMU_DOCKER: ''
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: '${{ needs.plan.outputs.sha }}'}
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/qemu
+          key: qemu-${{ env.QEMU_VERSION }}-arm-ubuntu24
+          fail-on-cache-miss: true
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libslirp0 libpixman-1-0 ipmitool sshpass socat device-tree-compiler \
+              squashfs-tools netcat-openbsd python3-requests python3-pyte >/dev/null
+          echo "$HOME/qemu/bin" >> "$GITHUB_PATH"
+          mkdir -p "$REIMU_WORK/e2e" "$REIMU_WORK/fixtures" "$REIMU_WORK/runs/image" "$STOCK"
+          cd "$REIMU_WORK/e2e" && npm init -y >/dev/null && npm i -s "playwright@$PLAYWRIGHT_VERSION"
+          npx playwright install --with-deps chromium >/dev/null
+          echo "CHROME=$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | head -1)" >> "$GITHUB_ENV"
+      - name: Fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$REIMU_WORK/fixtures"
+          gh release download ci-fixtures -R "$GITHUB_REPOSITORY"
+          mkdir stock-kexec && tar -xf stock-kexec.tar -C stock-kexec && rm stock-kexec.tar
+          curl -sSfL -o "$RUNNER_TEMP/stock.mtd" "$STOCK_URL"
+          python3 "$GITHUB_WORKSPACE/meta-mcst/tests/ab64/ci-stock.py" "$RUNNER_TEMP/stock.mtd" "$STOCK"
+      - uses: actions/download-artifact@v4
+        with:
+          name: reimu-test-image
+          path: ${{ env.REIMU_WORK }}/runs/image
+          run-id: ${{ needs.plan.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: The image as on a board
+        run: |
+          cd "$REIMU_WORK/runs/image"
+          mv obmc-phosphor-image-reimu-5564.ab.mtd ab-build.mtd
+          # the board's U-Boot (the stock one), as fetch.sh does
+          python3 -c "import sys; i = bytearray(open('ab-build.mtd', 'rb').read()); u = open(sys.argv[1], 'rb').read(); i[:len(u)] = u; open('ab.mtd', 'wb').write(i)" "$STOCK/u-boot.bin"
+          ls -la
+      - name: ${{ matrix.job }}
+        run: python3 meta-mcst/tests/ab64/run-all.py --no-fetch --jobs 1 --factor 2.5 --only "^$(printf '%s' '${{ matrix.job }}' | sed 's/\./\\./g')\$"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.job }}
+          path: |
+            ${{ env.REIMU_WORK }}/runs/2*/*.log
+            ${{ env.REIMU_WORK }}/runs/2*/summary.txt
+          retention-days: 14

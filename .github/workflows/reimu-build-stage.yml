@@ -76,3 +76,24 @@ jobs:
           path: ${{ runner.temp }}/out/*
           compression-level: 0
           retention-days: 30
+      - name: Keep the test image
+        if: steps.bb.outputs.done == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          # the whole 64 MiB flash, for the QEMU tests (reimu-tests.yml)
+          name: reimu-test-image
+          path: |
+            /mnt/work/build-ab/tmp/deploy/images/reimu-5564/obmc-phosphor-image-reimu-5564.ab.mtd
+            /mnt/work/build-ab/tmp/deploy/images/reimu-5564/reimu-ab-kexec.tar
+            /mnt/work/build-ab/tmp/deploy/images/reimu-5564/reimu-ab.tar
+          retention-days: 30
+      - name: Unit tests
+        # the suites that need the build tree (run-all.py --only ^test_); the
+        # QEMU and browser ones: reimu-tests.yml, after the build
+        if: steps.bb.outputs.done == 'true'
+        continue-on-error: true
+        run: |
+          docker run --rm -e UID_OUT="$(id -u)" -e GID_OUT="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work/openbmc" -v /mnt/work/sstate:/work/sstate \
+            -v /mnt/work/downloads:/work/downloads -v /mnt/work/build-ab:/work/build-ab \
+            ubuntu:20.04 sh /work/openbmc/meta-mcst/tests/ab64/ci-unit.sh

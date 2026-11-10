@@ -10,13 +10,20 @@ REIMU_WORK (default ~/git/new-reimu/work) also holds fixtures/ (copied into ever
 job's dir: pns.bin, fru.bin, pns-orig.bin of the board, pns-new.bin, pns-fault.so,
 kernel-other.fit, stock-kexec/) and e2e/node_modules. A missing fixture stops
 the run: a suite would quietly skip what needs it. The exit status is 0 only if all passed.
+
+On CI (reimu-tests.yml) without the build container: REIMU_DOCKER= (empty)
+runs the container suites right here (in a container like the build's, the
+tree at /work/openbmc), the tree is the one this file is in, CHROME names the
+browser. --list prints the job names (one CI job each) and stops.
 """
 import argparse, concurrent.futures as cf, json, os, re, shutil, signal, subprocess, sys, threading, time
 
 WORK = os.path.expanduser(os.environ.get("REIMU_WORK", "~/git/new-reimu/work"))
 STOCK = os.path.expanduser(os.environ.get("STOCK", "~/git/new-reimu/backup"))
 TREE = "/work/openbmc/meta-mcst"
-DOCKER = "reimu"
+DOCKER = os.environ.get("REIMU_DOCKER", "reimu")       # "": no build container, all here
+HERE = os.path.dirname(os.path.abspath(__file__))
+CP = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto"]    # a clone where it can
 BASE_PORT = 20000     # above the ports Chrome refuses (5060, 5061, 6000...)
 FIXTURES = ["pns.bin", "fru.bin", "pns-orig.bin", "pns-new.bin", "pns-fault.so", "kernel-other.fit", "stock-kexec"]
 SLOW = {"ab.restorecut": 120, "ipmi_redfish": 120}     # minutes, instead of --timeout
@@ -78,9 +85,9 @@ def run_job(job, slot, a, out, src, img):
             d = os.path.join(out, "w", job.name)
             os.makedirs(d, exist_ok=True)
             for n in ("ab.mtd", "ab-build.mtd", "reimu-ab.tar", "reimu-ab-kexec.tar"):
-                subprocess.check_call(["cp", "-c", os.path.join(img, n), d])
+                subprocess.check_call(CP + [os.path.join(img, n), d])
             for n in FIXTURES:
-                subprocess.check_call(["cp", "-Rc", os.path.join(WORK, "fixtures", n), d])
+                subprocess.check_call(CP + ["-R", os.path.join(WORK, "fixtures", n), d])
             port = a.port + 10 * slot
             rq = "/tmp/ra/%d" % port
             shutil.rmtree(rq, ignore_errors=True)
@@ -97,7 +104,7 @@ def run_job(job, slot, a, out, src, img):
             py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % job.suite)
             cmd = ["python3", "-u", py, d] + ([job.group] if job.group else [])
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=d, start_new_session=True)
-        limit, quiet = SLOW.get(job.name, a.timeout) * 60, a.quiet * 60
+        limit, quiet = SLOW.get(job.name, a.timeout) * 60 * a.factor, a.quiet * 60 * a.factor
         while job.rc is None:
             try:
                 job.rc = p.wait(timeout=5)
@@ -127,12 +134,32 @@ def run_job(job, slot, a, out, src, img):
 
 
 def chromium():
+    if os.environ.get("CHROME"):
+        return os.environ["CHROME"]
     root = os.path.expanduser("~/Library/Caches/ms-playwright")
     for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         p = os.path.join(root, d, "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
         if d.startswith("chromium-") and os.path.exists(p):
             return p
     return None
+
+
+def job_list(src, e2e, only):
+    """every job, by name; src: the tree holding meta-mcst/"""
+    jobs = []
+    for t, c in CONTAINER_SUITES.items():
+        jobs.append(Job(t, (["docker", "exec", DOCKER] if DOCKER else []) + c))
+    # no QEMU, on this machine: the web tree in a browser (PY: a python with pyte for real zsh, vim)
+    www = os.path.join(src, "meta-mcst", WWW)
+    for name, stub in (("console_size", "console-size"), ("pns_blank", "pns-blank"), ("ota_page", "ota"), ("map", "map"),
+                       ("login_page", "login"), ("kvm_h264", "kvm-h264"), ("host_usbnet", "host-usbnet"),
+                       ("power_policy", "power-policy"), ("fan_profile", "fan-profile"), ("console_jitter", "console-jitter")):
+        jobs.append(Job(name, ["env", "WWW=" + www, "CHROME=" + (chromium() or ""), "node", os.path.join(e2e, stub + ".stub.mjs")]))
+    for s in QEMU_SUITES:
+        py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
+        for g in groups_of(py):
+            jobs.append(Job(s + ("." + g if g else ""), suite=s, group=g))
+    return [j for j in jobs if re.search(only, j.name)] if only else jobs
 
 
 def main():
@@ -144,7 +171,13 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--timeout", type=int, default=40)
     ap.add_argument("--no-fetch", action="store_true", help="reuse the image in runs/image")
+    ap.add_argument("--factor", type=float, default=1, help="a slower machine: the time limits times this")
+    ap.add_argument("--list", action="store_true", help="the job names (after --only), one per line")
     a = ap.parse_args()
+    if a.list:
+        for j in job_list(os.path.join(HERE, "../../.."), "", a.only):
+            print(j.name)
+        return 0
 
     # the installers call it; a hung mount here would look like a hang of
     # theirs. A sync stuck in the kernel can't be killed (nor waited for): left
@@ -159,50 +192,26 @@ def main():
     src, img = os.path.join(out, "src"), os.path.join(WORK, "runs", "image")
     os.makedirs(src)
     # (+ the device trees the sensor tests give the BMC)
-    subprocess.check_call("docker exec %s tar -C %s/.. -cf - meta-mcst/tests meta-mcst/tools meta-mcst/%s meta-mcst/%s | tar -xf - -C %s"
-                          % (DOCKER, TREE, WWW, HWMON_TESTS, src), shell=True)
+    what = "meta-mcst/tests meta-mcst/tools meta-mcst/%s meta-mcst/%s" % (WWW, HWMON_TESTS)
+    if DOCKER:
+        subprocess.check_call("docker exec %s tar -C %s/.. -cf - %s | tar -xf - -C %s" % (DOCKER, TREE, what, src), shell=True)
+    else:
+        subprocess.check_call("tar -C %s/../../.. -cf - %s | tar -xf - -C %s" % (HERE, what, src), shell=True)
     os.makedirs(img, exist_ok=True)
-    gone = [n for n in FIXTURES if not os.path.exists(os.path.join(WORK, "fixtures", n))]
-    if gone or not chromium() or not os.path.isdir(os.path.join(WORK, "e2e/node_modules/playwright")):
-        sys.exit("missing: fixtures %s, chromium %s, e2e/node_modules/playwright" % (gone, chromium()))
     e2e = os.path.join(out, "e2e")      # the browser tests with their modules
-    shutil.copytree(os.path.join(src, "meta-mcst/tests/e2e"), e2e, ignore=shutil.ignore_patterns("node_modules"))
-    os.symlink(os.path.join(WORK, "e2e/node_modules"), os.path.join(e2e, "node_modules"))
-    if not a.no_fetch:
+    jobs = job_list(src, e2e, a.only)
+    web, qemu = any(j.cmd and j.cmd[0] == "env" for j in jobs), any(j.suite for j in jobs)
+    gone = [n for n in FIXTURES if not os.path.exists(os.path.join(WORK, "fixtures", n))] if qemu else []
+    if gone or (web or qemu) and (not chromium() or not os.path.isdir(os.path.join(WORK, "e2e/node_modules/playwright"))):
+        sys.exit("missing: fixtures %s, chromium %s, e2e/node_modules/playwright" % (gone, chromium()))
+    if web or qemu:
+        shutil.copytree(os.path.join(src, "meta-mcst/tests/e2e"), e2e, ignore=shutil.ignore_patterns("node_modules"))
+        os.symlink(os.path.join(WORK, "e2e/node_modules"), os.path.join(e2e, "node_modules"))
+    if qemu and not a.no_fetch:
         subprocess.check_call(["sh", os.path.join(src, "meta-mcst/tests/ab64/fetch.sh"), img],
                               stdout=subprocess.DEVNULL, env=dict(os.environ, STOCK=STOCK))
-    rev = subprocess.check_output(["docker", "exec", DOCKER, "git", "-C", TREE, "describe", "--always", "--dirty"], text=True).strip()
-
-    jobs = []
-    for t, c in CONTAINER_SUITES.items():
-        jobs.append(Job(t, ["docker", "exec", DOCKER] + c))
-    # no QEMU, on this machine: the web tree in a browser (PY: a python with pyte for real zsh, vim)
-    jobs.append(Job("console_size", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                     "node", os.path.join(e2e, "console-size.stub.mjs")]))
-    jobs.append(Job("pns_blank", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                  "node", os.path.join(e2e, "pns-blank.stub.mjs")]))
-    jobs.append(Job("ota_page", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                 "node", os.path.join(e2e, "ota.stub.mjs")]))
-    jobs.append(Job("map", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                            "node", os.path.join(e2e, "map.stub.mjs")]))
-    jobs.append(Job("login_page", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                   "node", os.path.join(e2e, "login.stub.mjs")]))
-    jobs.append(Job("kvm_h264", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                 "node", os.path.join(e2e, "kvm-h264.stub.mjs")]))
-    jobs.append(Job("host_usbnet", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                    "node", os.path.join(e2e, "host-usbnet.stub.mjs")]))
-    jobs.append(Job("power_policy", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                     "node", os.path.join(e2e, "power-policy.stub.mjs")]))
-    jobs.append(Job("fan_profile", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                    "node", os.path.join(e2e, "fan-profile.stub.mjs")]))
-    jobs.append(Job("console_jitter", ["env", "WWW=" + os.path.join(src, "meta-mcst", WWW), "CHROME=" + chromium(),
-                                       "node", os.path.join(e2e, "console-jitter.stub.mjs")]))
-    for s in QEMU_SUITES:
-        py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)
-        for g in groups_of(py):
-            jobs.append(Job(s + ("." + g if g else ""), suite=s, group=g))
-    if a.only:
-        jobs = [j for j in jobs if re.search(a.only, j.name)]
+    git = ["docker", "exec", DOCKER, "git", "-C", TREE] if DOCKER else ["git", "-C", HERE]
+    rev = subprocess.check_output(git + ["describe", "--always", "--dirty"], text=True).strip()
     tf = os.path.join(WORK, "runs", "timings.json")
     known = json.load(open(tf)) if os.path.exists(tf) else {}
     jobs.sort(key=lambda j: -known.get(j.name, 1e9))     # the longest first
@@ -239,7 +248,8 @@ def main():
     json.dump(known, open(tf, "w"), indent=0)
     print(text)
     shutil.rmtree(os.path.join(out, "w"), ignore_errors=True)
-    os.unlink(os.path.join(e2e, "node_modules"))
+    if os.path.islink(os.path.join(e2e, "node_modules")):
+        os.unlink(os.path.join(e2e, "node_modules"))
     return 1 if bad else 0
 
 
