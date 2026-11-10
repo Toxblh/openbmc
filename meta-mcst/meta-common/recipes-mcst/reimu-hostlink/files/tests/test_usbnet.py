@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 from test_disk import Agent, check, failed, free_port, wait  # noqa: E402
 
 STATUS = '{"enabled":%s,"internet":%s,"ifname":"usb0","port":"1e6a0000.usb-vhub:p5","state":"configured",' \
-         '"address":"172.31.83.1/29","mac":"98:a7:b0:06:0f:7e","host_mac":"9a:a7:b0:06:0f:7e","host_ipv4":"172.31.83.2","error":""}'
+         '"address":"172.31.83.1/29","mac":"98:a7:b0:12:34:7e","host_mac":"9a:a7:b0:12:34:7e","host_ipv4":"172.31.83.2","error":""}'
 
 # the fake reimu-usbnet: what it is asked into the log; the settings in a file;
 # "fail" there: a set fails as the real one says why

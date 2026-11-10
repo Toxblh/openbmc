@@ -1106,7 +1106,7 @@ def platform_run():
             "D-Bus %d temperatures, Redfish %s" % (n, rs))
         pin_sets("on")
         rc, o = fru()
-        rec("platform.on.fru_print", rc == 0 and "Пантес" in o and "0079-07.22" in o,
+        rec("platform.on.fru_print", rc == 0 and "Пантес" in o and "0000-00.00" in o,
             " | ".join(l.strip() for l in o.splitlines() if "Board" in l)[:150])
         rc, o = sdr()
         temps = [l for l in o.splitlines() if "degrees C" in l]

@@ -23,11 +23,11 @@ const HARNESS = `<!doctype html><html><head><meta charset="utf-8"><link rel="sty
 mount(document.getElementById("page"));</script></body></html>`;
 
 const USB = { enabled: true, internet: false, ifname: "usb0", port: "1e6a0000.usb-vhub:p5", state: "configured", address: "172.31.83.1/29",
-  mac: "98:a7:b0:06:0f:7e", host_mac: "9a:a7:b0:06:0f:7e", host_ipv4: "172.31.83.2", error: "" };
+  mac: "98:a7:b0:12:34:7e", host_mac: "9a:a7:b0:12:34:7e", host_ipv4: "172.31.83.2", error: "" };
 const state = (via) => ({
-  version: "1.0", port: 5564, iface: "eth0 usb0", fingerprint: "ab".repeat(32), mac: "98:a7:b0:06:0f:7e", ipv4: "192.168.10.79", paired: true,
+  version: "1.0", port: 5564, iface: "eth0 usb0", fingerprint: "ab".repeat(32), mac: "98:a7:b0:12:34:7e", ipv4: "192.168.10.79", paired: true,
   pairing: { active: false, left: 0 }, disk: { on: false, left: 0 },
-  agent: { connected: !!via, id: "x", host: "elbrus", version: "1.0", transport: "ipv6-ll", peer: via === "usb" ? "fe80::9aa7:b0ff:fe06:f7e%usb0" : "fe80::9aa7:b0ff:fe06:f7e%eth0",
+  agent: { connected: !!via, id: "x", host: "elbrus", version: "1.0", transport: "ipv6-ll", peer: via === "usb" ? "fe80::9aa7:b0ff:fe12:347e%usb0" : "fe80::9aa7:b0ff:fe12:347e%eth0",
     iface: via === "usb" ? "usb0" : "eth0", via: via || "", since: 1793880000, last_seen: 1793880100 },
   heartbeat: { state: via ? "ok" : "never", age: 3 }, policy: { gpu_fan: { mode: "auto" } }, fand_turbo: false, sensors: {}, thresholds: {},
   edac: { ce: 0, ue: 0 }, inventory: null, inventory_age: -1, metrics: null, metrics_age: -1, events: [], results: [],

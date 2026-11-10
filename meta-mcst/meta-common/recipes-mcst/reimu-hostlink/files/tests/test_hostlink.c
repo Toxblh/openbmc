@@ -373,7 +373,7 @@ static void t_auth(void)
 {
     fresh(NULL);
     write_key(KEY);
-    struct hl_conn *c = agent("fe80::9aa7:b0ff:fe06:f61%eth0");
+    struct hl_conn *c = agent("fe80::9aa7:b0ff:fe12:3461%eth0");
     CHECK(c->state == C_AUTHED && H.agent == c && !c->close_why[0], "authenticated (%s)", c->close_why);
     const char *w = last_of(c, "welcome");
     char msg[200], mac[65];

@@ -177,7 +177,7 @@ def board(t):
     t.put("/sys/devices/virtual/block/loop0/size", "0")
     t.link("/sys/block/loop0", "/sys/devices/virtual/block/loop0")
     # NICs: f0 down, f1 up (the board's internal LAN to the BMC), lo
-    for name, mac, state in (("enp1s1f0", "98:a7:b0:06:0f:60", "down"), ("enp1s1f1", "98:a7:b0:06:0f:61", "up")):
+    for name, mac, state in (("enp1s1f0", "98:a7:b0:12:34:60", "down"), ("enp1s1f1", "98:a7:b0:12:34:61", "up")):
         n = "/sys/devices/pci0000:00/0000:01:01.1/net/" + name
         t.put(n + "/address", mac)
         t.put(n + "/operstate", state)
@@ -192,7 +192,7 @@ def board(t):
     t.put("/sys/devices/virtual/net/lo/type", "772")
     t.link("/sys/class/net/lo", "/sys/devices/virtual/net/lo")
     usb_dev(t, "4-4", "1d6b", "0107")  # the BMC's virtual hub, autosuspend on (the kernel's default)
-    t.put("/proc/net/if_inet6", "fe800000000000009aa7b0fffe060f61 03 40 20 80 enp1s1f1\n"
+    t.put("/proc/net/if_inet6", "fe800000000000009aa7b0fffe123461 03 40 20 80 enp1s1f1\n"
           "00000000000000000000000000000001 01 80 10 80       lo\n")
 
 
@@ -324,11 +324,11 @@ class TestInventory(Base):
     def test_nics(self):
         n = {x["name"]: x for x in self.inv()["nics"]}
         self.assertEqual(sorted(n), ["enp1s1f0", "enp1s1f1"])
-        self.assertEqual(n["enp1s1f1"]["mac"], "98:a7:b0:06:0f:61")
+        self.assertEqual(n["enp1s1f1"]["mac"], "98:a7:b0:12:34:61")
         self.assertEqual(n["enp1s1f1"]["driver"], "l_e1000")
         self.assertEqual(n["enp1s1f1"]["state"], "up")
         self.assertEqual(n["enp1s1f1"]["speed"], 1000)
-        self.assertIn("fe80::9aa7:b0ff:fe06:f61", n["enp1s1f1"]["addrs"])
+        self.assertIn("fe80::9aa7:b0ff:fe12:3461", n["enp1s1f1"]["addrs"])
         self.assertIsNone(n["enp1s1f0"]["speed"])
 
     def test_os(self):
@@ -1891,27 +1891,27 @@ class TestOldSystems(SysvBase):
 
 class TestTransport(Base):
     def test_link_local_from_mac(self):
-        self.assertEqual(hd.ll_from_mac("98:a7:b0:06:0f:7e"), "fe80::9aa7:b0ff:fe06:f7e")
+        self.assertEqual(hd.ll_from_mac("98:a7:b0:12:34:7e"), "fe80::9aa7:b0ff:fe12:347e")
         self.assertEqual(hd.ll_from_mac("00:00:00:00:00:00"), "fe80::200:ff:fe00:0")
         self.assertIsNone(hd.ll_from_mac("zz"))
 
     def test_candidates_link_local_first(self):
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79\nBMC_PORT=5564")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79\nBMC_PORT=5564")
         c = hd.candidates(cfg, self.fs, [])
         self.assertEqual([(x["addr"], x["scope"], x["transport"]) for x in c],
-                         [("fe80::9aa7:b0ff:fe06:f7e", "enp1s1f1", "ipv6-ll"), ("192.168.10.79", None, "ipv4")])
+                         [("fe80::9aa7:b0ff:fe12:347e", "enp1s1f1", "ipv6-ll"), ("192.168.10.79", None, "ipv4")])
         self.assertTrue(all(x["port"] == 5564 for x in c))
 
     def test_candidates_down_interface_skipped_but_listed_iface_kept(self):
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nIFACES=enp1s1f0 enp1s1f1")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nIFACES=enp1s1f0 enp1s1f1")
         c = hd.candidates(cfg, self.fs, [])
         self.assertEqual([x["scope"] for x in c], ["enp1s1f1"])
 
     def test_candidates_discovered_and_last_good_first(self):
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79")
         disc = [{"addr": "fe80::1234", "scope": "enp1s1f1"}]
         c = hd.candidates(cfg, self.fs, disc, last={"addr": "192.168.10.79", "scope": None})
-        self.assertEqual([x["addr"] for x in c], ["fe80::9aa7:b0ff:fe06:f7e", "fe80::1234", "192.168.10.79"])
+        self.assertEqual([x["addr"] for x in c], ["fe80::9aa7:b0ff:fe12:347e", "fe80::1234", "192.168.10.79"])
 
     def test_candidates_explicit_address(self):
         cfg = hd.parse_config("BMC=127.0.0.1:3364")
@@ -1919,7 +1919,7 @@ class TestTransport(Base):
         self.assertEqual([(x["addr"], x["port"], x["transport"]) for x in c], [("127.0.0.1", 3364, "ipv4")])
 
     def test_connect_first_falls_back_to_ipv4(self):
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79")
         tried = []
 
         def conn(c):
@@ -1933,7 +1933,7 @@ class TestTransport(Base):
 
     def test_ipv4_disappears_stays_on_link_local(self):
         """the cable unplugged: no DHCP, the IPv4 address gone; link-local works"""
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79")
 
         def conn(c):
             if c["transport"] == "ipv4":
@@ -1944,7 +1944,7 @@ class TestTransport(Base):
         self.assertEqual((s, c["transport"], c["scope"]), ("ll", "ipv6-ll", "enp1s1f1"))
 
     def test_nothing_reachable(self):
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e")
 
         def conn(c):
             raise OSError("x")
@@ -1967,7 +1967,7 @@ import unittest.mock
 
 
 # ------------------------------------------------------------------ the BMC's USB network (CDC-NCM)
-USBNET = "enx9aa7b0060f7e"
+USBNET = "enx9aa7b012347e"
 USBNET_DEV = "/sys/devices/platform/ehci/usb4/4-4/4-4.5"
 
 
@@ -1983,7 +1983,7 @@ def bmc_usb_net(t, name=USBNET, state="up", product="REIMU BMC network", driver=
     t.put("/sys/bus/usb/drivers/%s/uevent" % driver, "")
     t.link(intf + "/driver", "/sys/bus/usb/drivers/" + driver)
     n = intf + "/net/" + name
-    t.put(n + "/address", "9a:a7:b0:06:0f:7e")
+    t.put(n + "/address", "9a:a7:b0:12:34:7e")
     t.put(n + "/operstate", state)
     t.put(n + "/carrier", "1" if state == "up" else "0")
     t.put(n + "/flags", "0x1003" if up else "0x1002")
@@ -2029,15 +2029,15 @@ class TestUsbNet(Base):
     def test_candidates_usb_first(self):
         """the switch's LAN sorts first by name (enp < enx): USB must come first anyway"""
         bmc_usb_net(self.t)
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79")
         c = hd.candidates(cfg, self.fs, [])
         self.assertEqual([(x["scope"], x["transport"], x.get("usb")) for x in c],
                          [(USBNET, "ipv6-ll", True), ("enp1s1f1", "ipv6-ll", False), (None, "ipv4", False)])
 
     def test_candidates_usb_first_even_after_a_lan_session(self):
         bmc_usb_net(self.t)
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79")
-        last = {"addr": "fe80::9aa7:b0ff:fe06:f7e", "scope": "enp1s1f1", "transport": "ipv6-ll"}
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79")
+        last = {"addr": "fe80::9aa7:b0ff:fe12:347e", "scope": "enp1s1f1", "transport": "ipv6-ll"}
         c = hd.candidates(cfg, self.fs, [], last=last)
         self.assertEqual([x["scope"] for x in c], [USBNET, "enp1s1f1", None])
 
@@ -2050,7 +2050,7 @@ class TestUsbNet(Base):
 
     def test_usb_down_not_a_candidate(self):
         bmc_usb_net(self.t, state="down")
-        cfg = hd.parse_config("BMC_MAC=98:a7:b0:06:0f:7e")
+        cfg = hd.parse_config("BMC_MAC=98:a7:b0:12:34:7e")
         self.assertEqual([x["scope"] for x in hd.candidates(cfg, self.fs, [])], ["enp1s1f1"])
 
     def test_allow_has_usb_net_by_default(self):
@@ -2058,12 +2058,12 @@ class TestUsbNet(Base):
         self.assertNotIn("usb_net", hd.parse_config("ALLOW=gpu_fan")["ALLOW"])
 
     # -- connected over the switch while the USB link is there: moved over
-    def agent(self, conf="BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79"):
+    def agent(self, conf="BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79"):
         ag = hd.Agent(hd.parse_config(conf), {"KEY": "aa" * 32, "FINGERPRINT": "bb" * 32}, self.fs, self.run)
         ag.discover = lambda ifaces: []
         return ag
 
-    LAN = {"addr": "fe80::9aa7:b0ff:fe06:f7e", "scope": "enp1s1f1", "port": 5564, "transport": "ipv6-ll", "usb": False}
+    LAN = {"addr": "fe80::9aa7:b0ff:fe12:347e", "scope": "enp1s1f1", "port": 5564, "transport": "ipv6-ll", "usb": False}
 
     def test_upgrade_to_usb_every_60_s(self):
         bmc_usb_net(self.t)
@@ -2269,7 +2269,7 @@ class TestKvm(Base):
     could give H.264 (2026-11-03: an old reimu-h264 without announcements, the
     KVM page silently on JPEG)"""
 
-    CFG = "BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79\n"
+    CFG = "BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79\n"
 
     def setUp(self):
         super().setUp()
@@ -2312,7 +2312,7 @@ class TestKvm(Base):
         self.assertEqual((st["h264"]["on"], st["mirror"]["on"]), (True, True), st)
         u = self.unit("reimu-h264")
         self.assertIn(hd.KVM_MARK, u)
-        self.assertRegex(u, r"ExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py .*--allow 192.168.10.79,fe80::9aa7:b0ff:fe06:f7e")
+        self.assertRegex(u, r"ExecStart=/usr/bin/python3 /usr/local/lib/reimu/reimu-h264.py .*--allow 192.168.10.79,fe80::9aa7:b0ff:fe12:347e")
         self.assertIn("--state /run/reimu-h264/state", u)
         self.assertIn("RuntimeDirectory=reimu-h264", u)
         self.assertIn("ProtectSystem=strict", u)
@@ -2517,7 +2517,7 @@ class TestH264(unittest.TestCase):
 
     def test_peer_link_local_scope_dropped(self):
         """Python gives a link-local peer with its %interface: it was never in --allow"""
-        self.assertEqual(self.m.peer_of(("fe80::9aa7:b0ff:fe06:f7e%enp1s1f1", 40000, 0, 2)), "fe80::9aa7:b0ff:fe06:f7e")
+        self.assertEqual(self.m.peer_of(("fe80::9aa7:b0ff:fe12:347e%enp1s1f1", 40000, 0, 2)), "fe80::9aa7:b0ff:fe12:347e")
         self.assertEqual(self.m.peer_of(("::ffff:192.168.10.79", 40000, 0, 0)), "192.168.10.79")
 
     def test_state_file(self):
@@ -2560,11 +2560,11 @@ class TestProtocol(unittest.TestCase):
         self.assertEqual(json.loads(b), {"v": 1, "t": "pong"})
 
     def test_pairing_string(self):
-        s = hd.make_pair_string({"token": "tok", "fp": "ab" * 32, "mac": "98:a7:b0:06:0f:7e", "v4": "192.168.10.79",
+        s = hd.make_pair_string({"token": "tok", "fp": "ab" * 32, "mac": "98:a7:b0:12:34:7e", "v4": "192.168.10.79",
                                  "port": 5564})
         p = hd.parse_pair_string(s)
         self.assertEqual(p["token"], "tok")
-        self.assertEqual(p["mac"], "98:a7:b0:06:0f:7e")
+        self.assertEqual(p["mac"], "98:a7:b0:12:34:7e")
         self.assertIsNone(hd.parse_pair_string("reimu1:@@@"))
 
     def test_secret_file_root_only(self):

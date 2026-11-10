@@ -19,7 +19,7 @@ VHUB = "1e6a0000.usb-vhub"
 
 
 def pair_string(n=32):
-    d = {"token": "ab" * (n // 2), "fp": "c" * 64, "mac": "98:a7:b0:06:0f:7e", "v4": "192.168.10.79", "port": 5564}
+    d = {"token": "ab" * (n // 2), "fp": "c" * 64, "mac": "98:a7:b0:12:34:7e", "v4": "192.168.10.79", "port": 5564}
     return "reimu1:" + base64.urlsafe_b64encode(json.dumps(d, separators=(",", ":")).encode()).decode().rstrip("=")
 
 

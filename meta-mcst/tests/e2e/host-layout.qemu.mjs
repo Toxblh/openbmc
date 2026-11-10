@@ -43,9 +43,9 @@ for (let i = 0; pci.length < 33; i++) {
     vendor: "1c1f", device: "8019", link: { speed: "8.0 GT/s PCIe", width: 4, max_speed: "16.0 GT/s PCIe", max_width: 16 }, numa: 0 });
 }
 const state = {
-  version: "1.0", port: 5564, iface: "eth0", fingerprint: "8b7ad2b089b953ea3faff61f854fdedb" + "0".repeat(32), mac: "98:a7:b0:06:0f:7e",
+  version: "1.0", port: 5564, iface: "eth0", fingerprint: "8b7ad2b089b953ea3faff61f854fdedb" + "0".repeat(32), mac: "98:a7:b0:12:34:7e",
   ipv4: "192.168.10.79", paired: true, pairing: { active: false, left: 0 }, disk: { on: false, left: 0 },
-  agent: { connected: true, id: "x", host: "elbrus", version: "1.0", transport: "ipv6-ll", peer: "fe80::9aa7:b0ff:fe06:f61%eth0", since: 1793000000, last_seen: 1793000100 },
+  agent: { connected: true, id: "x", host: "elbrus", version: "1.0", transport: "ipv6-ll", peer: "fe80::9aa7:b0ff:fe12:3461%eth0", since: 1793000000, last_seen: 1793000100 },
   heartbeat: { state: "ok", age: 3 }, policy: { gpu_fan: { mode: "auto", duty: null }, turbo_left: 0 }, fand_turbo: false,
   sensors: { Host_GPU_Edge: 52, Host_GPU_Junction: 61, Host_GPU_Memory: 64, Host_GPU_Fan: 0, Host_GPU_Fan_PWM: 0, Host_GPU_Power: 9, Host_Disk_Max: 41.85 },
   thresholds: { edge: [85, 95], junction: [95, 105], memory: [95, 105] }, edac: { ce: 2, ue: 0 },
@@ -60,8 +60,8 @@ const state = {
       { name: "sdb", model: "Ultra Fit", serial: "4C530001230105117044", size: 15376000000 },
     ],
     nics: [
-      { name: "enp1s1f0", state: "down", speed: null, mac: "98:a7:b0:06:0f:60", addrs: [] },
-      { name: "enp1s1f1", state: "up", speed: 1000, mac: "98:a7:b0:06:0f:61", addrs: ["192.168.10.50/24", "fd00:1234:5678:9abc:9aa7:b0ff:fe06:f61/64", "fe80::9aa7:b0ff:fe06:f61/64"] },
+      { name: "enp1s1f0", state: "down", speed: null, mac: "98:a7:b0:12:34:60", addrs: [] },
+      { name: "enp1s1f1", state: "up", speed: 1000, mac: "98:a7:b0:12:34:61", addrs: ["192.168.10.50/24", "fd00:1234:5678:9abc:9aa7:b0ff:fe12:3461/64", "fe80::9aa7:b0ff:fe12:3461/64"] },
     ],
     gpu: { name: "Radeon RX 5700 XT" },
   },

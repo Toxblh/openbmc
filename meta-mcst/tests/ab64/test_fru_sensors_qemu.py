@@ -67,7 +67,7 @@ from test_ab_qemu import check, failed, W, RQ, SSH, HTTPS  # noqa: E402
 ONLY = sys.argv[2:]
 PNS = os.environ.get("PNS", os.path.join(W, "pns.bin"))
 FRU = os.environ.get("FRU", os.path.join(W, "fru.bin"))
-FRU_MAC = "98:A7:B0:06:0F:7E"  # FRU base 98:A7:B0:06:0F:60 + 0x1E (set_mac)
+FRU_MAC = "98:A7:B0:12:34:7E"  # FRU base 98:A7:B0:12:34:60 + 0x1E (set_mac)
 EXPECT_SENSORS = {"CPU_FAN_Control_X37_Internal_Temp", "FAN_Control_X38_X39_X40_Internal_Temp",
                   "CPU0_Cores_0_1", "CPU0_Cores_2_3"}
 PLATFORM_DEVS = ["2-002c", "2-002e", "2-0058", "2-0059", "2-004c", "6-004c", "6-0060"] + ["5-%04x" % a for a in range(0x20, 0x27)]
@@ -582,7 +582,7 @@ def t_off():
         dt = time.time() - t0
         check(ok and dt > 110, "FRU ID read after the platform ran a while (%d s)" % dt)
         x = b.out("cat /var/volatile/motherboard_info.xml")
-        check("0x98, 0xA7, 0xB0, 0x06, 0x0F, 0x60" in x and "1E8CB-uATX" in x and "0079-07.22 PAN" in x, "motherboard_info.xml: MAC, board, serial")
+        check("0x98, 0xA7, 0xB0, 0x12, 0x34, 0x60" in x and "1E8CB-uATX" in x and "0000-00.00 PAN" in x, "motherboard_info.xml: MAC, board, serial")
         check(b.ssh("cmp /var/volatile/motherboard_info.xml /var/lib/reimu-pns/fru.xml").returncode == 0,
               "kept for reimu-pnsd while the platform is off")
         js = b.out("busctl get-property xyz.openbmc_project.Reimu.Pns /xyz/openbmc_project/reimu/pns xyz.openbmc_project.Reimu.Pns Json")
@@ -657,7 +657,7 @@ def view_vs_bmcweb():
 
 
 def t_hoston():
-    b = Platform("hoston", fresh_env("hoston", ethaddr=FRU_MAC.lower(), eth1addr="98:a7:b0:06:0f:7f"), power=True).start()
+    b = Platform("hoston", fresh_env("hoston", ethaddr=FRU_MAC.lower(), eth1addr="98:a7:b0:12:34:7f"), power=True).start()
     try:
         check(b.wait_ssh(), "up")
         check(b.load_lm(), "lm96163 stand-ins loaded")
@@ -666,7 +666,7 @@ def t_hoston():
         check(dtb_ok(b), "device tree read")
         check("FRU ID read:" in j, "FRU ID read at boot")
         x = b.out("cat /var/volatile/motherboard_info.xml")
-        check("0x98, 0xA7, 0xB0, 0x06, 0x0F, 0x60" in x and "1E8CB-uATX" in x, "motherboard_info.xml")
+        check("0x98, 0xA7, 0xB0, 0x12, 0x34, 0x60" in x and "1E8CB-uATX" in x, "motherboard_info.xml")
         # read before the platform leaves reset
         t = b.out("systemctl show -p ExecMainExitTimestampMonotonic --value mcst-fruid; "
                   "systemctl show -p ExecMainStartTimestampMonotonic --value allow_host_boot").split()
@@ -711,7 +711,7 @@ def t_macdiff():
         print("    " + sm.strip().replace("\n", "\n    "))
         check("no reboot" in sm, "set_mac: changed, no reboot while the platform is powered")
         e = ab.benv(b, "ethaddr", "eth1addr")
-        check(e.get("ethaddr", "").upper() == FRU_MAC and e.get("eth1addr", "").upper() == "98:A7:B0:06:0F:7F",
+        check(e.get("ethaddr", "").upper() == FRU_MAC and e.get("eth1addr", "").upper() == "98:A7:B0:12:34:7F",
               "the FRU's MACs in the environment for the next boot (%s)" % e)
         check(b.out("systemctl is-active set_mac").strip() == "active", "set_mac done")
         time.sleep(30)

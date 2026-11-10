@@ -492,10 +492,10 @@ class Network(Base):
             os.makedirs(os.path.join(sysd, "class/net", n))
             open(os.path.join(sysd, "class/net", n, "operstate"), "w").write(state + "\n")
             open(os.path.join(sysd, "class/net", n, "type"), "w").write(typ + "\n")
-        s = pair_string({"token": "0" * 32, "fp": "a" * 64, "mac": "98:a7:b0:06:0f:7e", "v4": "192.168.10.79", "port": 5564})
+        s = pair_string({"token": "0" * 32, "fp": "a" * 64, "mac": "98:a7:b0:12:34:7e", "v4": "192.168.10.79", "port": 5564})
         rc, out = sh(["sh", self.installed_script(), "--print-urls", "--pair", s], env=dict(self.env, REIMU_SYS=sysd))
         self.assertEqual(rc, 0, out)
-        self.assertEqual(out.split(), ["https://[fe80::9aa7:b0ff:fe06:f7e%25enp1s1f0]", "https://[fe80::9aa7:b0ff:fe06:f7e%25enp1s1f1]",
+        self.assertEqual(out.split(), ["https://[fe80::9aa7:b0ff:fe12:347e%25enp1s1f0]", "https://[fe80::9aa7:b0ff:fe12:347e%25enp1s1f1]",
                                        "https://192.168.10.79"])
 
 
@@ -579,7 +579,7 @@ class Kvm(Base):
         os.makedirs(os.path.dirname(self.secret()), exist_ok=True)
         open(self.secret(), "w").write("KEY=" + "a" * 64 + "\nFINGERPRINT=" + "b" * 64 + "\n")
         os.makedirs(os.path.dirname(self.conf()), exist_ok=True)
-        open(self.conf(), "w").write("BMC_MAC=98:a7:b0:06:0f:7e\nBMC_IPV4=192.168.10.79\n")
+        open(self.conf(), "w").write("BMC_MAC=98:a7:b0:12:34:7e\nBMC_IPV4=192.168.10.79\n")
 
     def h264_unit(self):
         p = os.path.join(self.root, "etc/systemd/system/reimu-h264.service")
@@ -607,7 +607,7 @@ class Kvm(Base):
         self.assertEqual(open(os.path.join(lib, "reimu-h264.py"), "rb").read(), open(os.path.join(TOOLS, "reimu-h264.py"), "rb").read())
         u = self.h264_unit()
         self.assertIsNotNone(u, out)
-        self.assertIn("--allow 192.168.10.79,fe80::9aa7:b0ff:fe06:f7e", u)
+        self.assertIn("--allow 192.168.10.79,fe80::9aa7:b0ff:fe12:347e", u)
         log = self.systemctl()
         self.assertIn("enable reimu-h264.service", log)
         self.assertIn("restart reimu-h264.service", log)

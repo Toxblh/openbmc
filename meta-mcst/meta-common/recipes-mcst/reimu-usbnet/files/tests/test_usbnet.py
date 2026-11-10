@@ -18,8 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "reimu-usbnet")
 SH = shlex.split(os.environ.get("SH", "sh"))
 VHUB = "1e6a0000.usb-vhub"
-MAC = "98:a7:b0:06:0f:7e"
-HOST_MAC = "9a:a7:b0:06:0f:7e"
+MAC = "98:a7:b0:12:34:7e"
+HOST_MAC = "9a:a7:b0:12:34:7e"
 
 STUB = """#!/bin/sh
 echo "$(basename "$0") $*" >> "%(log)s"
@@ -221,7 +221,7 @@ class T(unittest.TestCase):
         open(self.neigh, "w").write("172.31.83.3 lladdr %s STALE\n" % HOST_MAC)
         open(self.arp, "w").write(
             "IP address       HW type     Flags       HW address            Mask     Device\n"
-            "192.168.10.50    0x1         0x0         98:a7:b0:06:0f:61     *        eth0\n"
+            "192.168.10.50    0x1         0x0         98:a7:b0:12:34:61     *        eth0\n"
             "172.31.83.4      0x1         0x0         %s     *        usb0\n"
             "172.31.83.2      0x1         0x2         %s     *        usb0\n"
             "192.168.10.1     0x1         0x2         50:ff:20:d4:72:67     *        eth0\n" % (HOST_MAC, HOST_MAC))

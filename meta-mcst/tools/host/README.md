@@ -22,7 +22,7 @@ the BMC may ask it for a few fixed things.
  ┌──────────────────────────────┐   board LAN, no cable   ┌────────────────────────────────────────┐
  │ reimu-hostd.py (root,python3)│   needed (IPv6 link-     │ reimu-hostlink (C, sd-bus, OpenSSL)    │
  │  /sys /proc: CPU NUMA PCIe   │   local fe80::9aa7:b0ff: │  TLS [::]:5564 bound to eth0           │
- │  EDAC disks NICs amdgpu      │   fe06:f7e%enp1s1f1,     │  UDP [::]:5564 discovery (link-local)  │
+ │  EDAC disks NICs amdgpu      │   fe12:347e%enp1s1f1,     │  UDP [::]:5564 discovery (link-local)  │
  │  GpuFan: policy, floor 30 %, │   IPv4 fallback)         │  hl-proto: auth, limits, state, events │
  │   re-apply after GPU reset,  │ ── TLS 1.2+/1.3 ───────► │  /var/lib/reimu-hostlink: key cert.pem │
  │   auto when link lost/exit   │    cert pinned (SHA-256) │     policy edac          (rwfs, 0700)  │
