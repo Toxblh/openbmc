@@ -467,7 +467,9 @@ def g_fruid():
     """[17] mcst-fruid: the PNS flash only read, an EEPROM that fails the header
     check (all zeros) no crash; red: the mcst-fruid of the image before the fixes"""
     import test_fru_sensors_qemu as F
-    so = cross(open(os.path.join(HERE, "openlog.c"), "rb").read(), "-shared -fPIC -ldl")
+    # built already (openlog.so here: the CI fixtures, no build container), or now
+    so = open("openlog.so", "rb").read() if os.path.exists("openlog.so") else \
+        cross(open(os.path.join(HERE, "openlog.c"), "rb").read(), "-shared -fPIC -ldl")
     b = F.Platform("reg-fruid", image("reg-fruid")).start()
     try:
         if not check(b.wait_ssh(600), "up") or not check(so is not None and put(b, so, "/tmp/openlog.so"), "open() logger"):

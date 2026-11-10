@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CP = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto"]    # a clone where it can
 BASE_PORT = 20000     # above the ports Chrome refuses (5060, 5061, 6000...)
 FIXTURES = ["pns.bin", "fru.bin", "pns-orig.bin", "pns-new.bin", "pns-fault.so", "kernel-other.fit", "stock-kexec"]
+OPTIONAL = ["openlog.so"]      # built by the test with the build container if not there
 SLOW = {"ab.restorecut": 120, "ipmi_redfish": 120}     # minutes, instead of --timeout
 AB = "/work/openbmc/meta-mcst/tests/ab64"
 FLASH_SRC = "/work/openbmc/meta-mcst/meta-ab64/recipes-mcst/reimu-ab/files/reimu-flash.c"
@@ -86,7 +87,7 @@ def run_job(job, slot, a, out, src, img):
             os.makedirs(d, exist_ok=True)
             for n in ("ab.mtd", "ab-build.mtd", "reimu-ab.tar", "reimu-ab-kexec.tar"):
                 subprocess.check_call(CP + [os.path.join(img, n), d])
-            for n in FIXTURES:
+            for n in FIXTURES + [n for n in OPTIONAL if os.path.exists(os.path.join(WORK, "fixtures", n))]:
                 subprocess.check_call(CP + ["-R", os.path.join(WORK, "fixtures", n), d])
             port = a.port + 10 * slot
             rq = "/tmp/ra/%d" % port
