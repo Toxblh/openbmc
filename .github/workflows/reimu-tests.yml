@@ -16,6 +16,7 @@ on:
     inputs:
       run_id: {description: 'the reimu build run whose image to test', required: true}
       only: {description: 'run-all.py --only REGEX (empty: all)', required: false, default: ''}
+      ref: {description: 'the tests of this commit or branch (empty: the build''s own)', required: false, default: ''}
 permissions:
   contents: read
   actions: read
@@ -36,7 +37,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
-        run: echo "sha=$(gh api repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID -q .head_sha)" >> "$GITHUB_OUTPUT"
+          REF: ${{ inputs.ref }}
+        run: echo "sha=${REF:-$(gh api repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID -q .head_sha)}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with: {ref: '${{ steps.r.outputs.sha }}'}
       - id: l
@@ -98,8 +100,10 @@ jobs:
           echo "$HOME/qemu/bin" >> "$GITHUB_PATH"
           mkdir -p "$REIMU_WORK/e2e" "$REIMU_WORK/fixtures" "$REIMU_WORK/runs/image" "$STOCK"
           cd "$REIMU_WORK/e2e" && npm init -y >/dev/null && npm i -s "playwright@$PLAYWRIGHT_VERSION"
-          npx playwright install --with-deps chromium >/dev/null
-          echo "CHROME=$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | head -1)" >> "$GITHUB_ENV"
+          # Google Chrome (the runner's): Chromium has no H.264/H.265 decoders
+          npx playwright install-deps chromium >/dev/null
+          echo "CHROME=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
       - name: Fixtures
         env:
           GH_TOKEN: ${{ github.token }}
