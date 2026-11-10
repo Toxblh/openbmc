@@ -79,8 +79,8 @@ jobs:
       matrix:
         job: ${{ fromJSON(needs.plan.outputs.jobs) }}
     env:
-      REIMU_WORK: ${{ github.workspace }}/../w
-      STOCK: ${{ github.workspace }}/../w/stock
+      REIMU_WORK: ${{ github.workspace }}/w
+      STOCK: ${{ github.workspace }}/w/stock
       REIMU_DOCKER: ''
     steps:
       - uses: actions/checkout@v4
@@ -124,6 +124,9 @@ jobs:
           ls -la
       - name: ${{ matrix.job }}
         run: python3 meta-mcst/tests/ab64/run-all.py --no-fetch --jobs 1 --factor 2.5 --only "^$(printf '%s' '${{ matrix.job }}' | sed 's/\./\\./g')\$"
+      - name: The failure's log
+        if: failure()
+        run: for f in "$REIMU_WORK"/runs/2*/*.log; do echo "=== $f"; tail -80 "$f"; done
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
