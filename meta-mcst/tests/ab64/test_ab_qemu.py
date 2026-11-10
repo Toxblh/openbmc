@@ -750,16 +750,22 @@ def spam_console(b, secs):
     """bytes on the BMC's console (a stray character, line noise) from power-on
     until U-Boot starts a kernel or SECS pass"""
     s = socket.socket(socket.AF_UNIX)
-    for _ in range(50):
+    for _ in range(300):
         try:
             s.connect("%s/%s.con" % (RQ, b.name))
             break
         except OSError:
             time.sleep(0.1)
+    # never blocking: a slow machine's guest reads less than we send, and a
+    # blocking send waited for it forever
+    s.setblocking(False)
     end = time.time() + secs
     try:
         while time.time() < end and "Starting kernel" not in b.console():
-            s.sendall(b"x")
+            try:
+                s.send(b"x")
+            except (BlockingIOError, InterruptedError):
+                pass
             time.sleep(0.05)
     finally:
         s.close()
