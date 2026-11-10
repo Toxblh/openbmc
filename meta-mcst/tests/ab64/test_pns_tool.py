@@ -19,6 +19,7 @@ META = os.path.join(HERE, "..", "..")
 TOOL = os.path.join(META, "meta-ab64/recipes-mcst/reimu-pns-flash/files/reimu-pns-flash")
 FLASH_C = os.path.join(META, "meta-ab64/recipes-mcst/reimu-ab/files/reimu-flash.c")
 PNS_DIR = os.path.join(META, "meta-common/recipes-mcst/reimu-pns/files")
+COMMON_DIR = os.path.join(META, "meta-common/recipes-mcst/reimu-common/files")    # rbuf.h
 SH = os.environ.get("SH", "sh")
 ONLY = sys.argv[1:]
 CHIP = 0x800000
@@ -112,7 +113,7 @@ def build(d):
     real = os.path.join(d, "reimu-flash")
     subprocess.check_call(["gcc", "-O2", "-o", real, FLASH_C])
     h = os.path.join(d, "harness")
-    subprocess.check_call(["gcc", "-w", "-O1", "-g", "-I" + PNS_DIR, "-I" + os.path.join(HERE, "unit/pnsflash-stubs"),
+    subprocess.check_call(["gcc", "-w", "-O1", "-g", "-I" + PNS_DIR, "-I" + COMMON_DIR, "-I" + os.path.join(HERE, "unit/pnsflash-stubs"),
                            "-o", h, os.path.join(HERE, "unit/pnsflash_harness.c")])
     return real, h
 
