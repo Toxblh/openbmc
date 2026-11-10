@@ -60,6 +60,9 @@ export const h264Supported = () => typeof VideoDecoder === "function" && typeof 
 // only where the browser decodes it (a hardware decoder, mostly)
 const HEVC = "hev1.1.6.L123.B0";
 let hevcOk = null;
+// the video decoder: hardware first; software once hardware failed on this page
+let videoAccel = "prefer-hardware";
+
 export async function hevcSupported() {
   if (hevcOk === null) {
     hevcOk = h264Supported()
@@ -200,6 +203,7 @@ export class DirectKvm extends EventTarget {
     this._needKey = true;
     this._ts = 0;
     const hevc = /^(hev1|hvc1)/.test(m.codec);
+    const accel = videoAccel;
     let shown = 0;
     const dec = (this._dec = new VideoDecoder({
       output: (frame) => {
@@ -224,6 +228,13 @@ export class DirectKvm extends EventTarget {
         // a broken frame: wait for the next key frame (one a second)
         console.warn(`${hevc ? "H.265" : "H.264"} decoder:`, e.message);
         if (this._dec !== dec) return;
+        // no hardware decoder for it (a VM, Linux without VAAPI): Chrome takes
+        // "prefer-hardware" as hardware only. The same codec in software then,
+        // for this page (it was said supported: isConfigSupported asks either)
+        if (!shown && accel === "prefer-hardware") {
+          videoAccel = "no-preference";
+          return this._h264Start(m);
+        }
         // H.265 said to be decodable, but not a frame came out: H.264 then
         if (hevc && !shown) {
           hevcOk = Promise.resolve(false);
@@ -235,7 +246,7 @@ export class DirectKvm extends EventTarget {
     }));
     this._t0 = [];
     // Annex B input: no description
-    dec.configure({ codec: m.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+    dec.configure({ codec: m.codec, optimizeForLatency: true, hardwareAcceleration: accel });
     directStats.codec = /^(hev1|hvc1)/.test(m.codec) ? "h265" : "h264";
   }
 

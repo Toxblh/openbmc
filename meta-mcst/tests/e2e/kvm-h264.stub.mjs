@@ -40,10 +40,15 @@ const FAKE_WS = () => {
   // it really decodes: window.__realHevc)
   if (window.VideoDecoder && !window.__realHevc) {
     VideoDecoder.isConfigSupported = async (c) => ({ supported: /^avc1/.test(c.codec) || (!!window.__hevc && /^(hev1|hvc1)/.test(c.codec)), config: c });
-    // no real frames come: configure() must not fail on a codec this machine lacks
+    // no real frames come: configure() must not fail on a codec this machine lacks.
+    // window.__noHw: a machine without a hardware decoder (a VM, Linux without
+    // VAAPI): Chrome takes "prefer-hardware" as hardware only, it fails there
     const configure = VideoDecoder.prototype.configure;
+    window.__accel = [];
     VideoDecoder.prototype.configure = function (c) {
-      return configure.call(this, { ...c, codec: /^(hev1|hvc1)/.test(c.codec) ? "avc1.640028" : c.codec });
+      window.__accel.push(c.hardwareAcceleration || "no-preference");
+      const noHw = window.__noHw && c.hardwareAcceleration === "prefer-hardware";
+      return configure.call(this, { ...c, codec: noHw ? "bogus" : /^(hev1|hvc1)/.test(c.codec) ? "avc1.640028" : c.codec });
     };
   }
   const watch = () => new MutationObserver((ms) => ms.forEach((m) => m.addedNodes.forEach((n) => window.__toasts.push(n.textContent))))
@@ -83,7 +88,7 @@ const FAKE_WS = () => {
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open({ prefs = {}, stat = {}, answer = null, hevc = false, realHevc = false, frame = null } = {}) {
+async function open({ prefs = {}, stat = {}, answer = null, hevc = false, realHevc = false, frame = null, noHw = false } = {}) {
   const ctx = await browser.newContext({ locale: "ru-RU" });
   const page = await ctx.newPage();
   const s = { page, errors: [], prompts: [] };
@@ -100,7 +105,7 @@ async function open({ prefs = {}, stat = {}, answer = null, hevc = false, realHe
     const types = { ".js": "text/javascript", ".css": "text/css" };
     return route.fulfill({ contentType: types[path.extname(f)] || "application/octet-stream", body: fs.readFileSync(f) });
   });
-  await page.addInitScript((r) => { window.__realHevc = r; }, realHevc);
+  await page.addInitScript(({ r, n }) => { window.__realHevc = r; window.__noHw = n; }, { r: realHevc, n: noHw });
   await page.addInitScript(FAKE_WS);
   await page.addInitScript(({ prefs, stat, answer, hevc, realHevc, frame }) => {
     localStorage.setItem("reimu-kvm", JSON.stringify(prefs));
@@ -150,6 +155,20 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const s = await open({ hevc: true, stat: { host: "10.0.2.2:8555" }, answer: { t: "h264", codec: "avc1.640028", w: 1920, h: 1080, fps: 60 } });
   await wait(1500);
   check(/H\.264 с хоста/.test(await s.page.$eval("#kvm-src", (e) => e.textContent)), "an older agent's H.264: the source shown: H.264 с хоста");
+  await s.page.context().close();
+}
+// 1g. no hardware video decoder (a VM, Linux without VAAPI): the same codec
+// in software, H.265 kept (not taken for "no H.265" and dropped to H.264)
+for (const [codec, name, ask, hevc] of [["hev1.1.6.L123.B0", "H.265", "\nhevc", true], ["avc1.640028", "H.264", "", false]]) {
+  const s = await open({ hevc, noHw: true, stat: { host: "10.0.2.2:8555" }, answer: { t: "h264", codec, w: 1920, h: 1080, fps: 60 } });
+  await wait(2500);
+  const a = await asked(s);
+  const accel = await s.page.evaluate(() => window.__accel);
+  check(a.length === 1 && a[0] === ask, `no hardware decoder, the host sends ${name}: asked for once (${JSON.stringify(a)})`);
+  check(new RegExp(`${name.replace(".", "\\.")} с хоста`).test(await s.page.$eval("#kvm-src", (e) => e.textContent)), `no hardware decoder: ${name} с хоста shown`);
+  const hw = accel.indexOf("prefer-hardware");
+  check(hw >= 0 && accel.slice(hw + 1).length >= 1 && accel.slice(hw + 1).every((x) => x === "no-preference") && accel.length <= 4,
+        `no hardware decoder: hardware tried, then software, no loop (${accel})`);
   await s.page.context().close();
 }
 // 1d. JPEG shown (no host): the quality items there, the host address item
