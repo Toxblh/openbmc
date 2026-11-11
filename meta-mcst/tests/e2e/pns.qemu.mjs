@@ -63,17 +63,18 @@ if (mode === "on") {
   check(/годен/.test(t) && !/не годен/.test(t) && t.includes("c0c7328e4"), `uploaded and checked: ${t.match(/Загружен[^]*?Записать/)?.[0]?.slice(0, 200)}`);
   await page.screenshot({ path: `${OUT}/pns-checked.png`, fullPage: true });
   await card.locator("button", { hasText: "Записать во флеш ПНС" }).click();
-  t = await waitJob(/Запись флеша: выполняется/, 60000);
-  check(/Запись флеша: выполняется/.test(t), "the write runs, progress shown");
-  t = await waitJob(/Запись флеша: (готово|ошибка)/, 900000);
+  t = await waitJob(/Запись флеша:?\s*выполняется/, 60000);
+  check(/Запись флеша:?\s*выполняется/.test(t), "the write runs, progress shown");
+  t = await waitJob(/Запись флеша:?\s*(готово|ошибка)/, 900000);
   await page.screenshot({ path: `${OUT}/pns-written.png`, fullPage: true });
   check(dialogs.some((d) => d.includes("Записать во флеш ПНС образ")), "a confirmation was asked");
-  check(/Запись флеша: готово/.test(t) && /Версия ПНС release-2\.30\.5\.0-E8C2 ::::::: \( unified-boot\/release-2\.30\.5\.0-E8C2 commit c0c7328e4/.test(t), `written, the new version shown: ${t.slice(0, 200)}`);
+  check(/Запись флеша:?\s*готово/.test(t) && /Версия ПНС release-2\.30\.5\.0-E8C2 ::::::: \( unified-boot\/release-2\.30\.5\.0-E8C2 commit c0c7328e4/.test(t), `written, the new version shown: ${t.slice(0, 200)}`);
 } else if (mode === "restore") {
-  await card.locator("tr", { hasText: "backup-" }).first().locator("button", { hasText: "Записать обратно" }).click();
-  await waitJob(/Запись флеша: выполняется/, 60000);
-  const t = await waitJob(/Запись флеша: (готово|ошибка)/, 900000);
-  check(/Запись флеша: готово/.test(t) && /Версия ПНС release-2\.30\.13\.1-E8C2/.test(t), `backup written back: ${t.slice(0, 200)}`);
+  // the backup list: what each holds; the original PNS back (not "текущая")
+  await card.locator(".backup", { hasText: "ПНС 2.30.13.1" }).filter({ has: page.locator("button", { hasText: "Записать обратно" }) }).first().locator("button", { hasText: "Записать обратно" }).click();
+  await waitJob(/Запись флеша:?\s*выполняется/, 60000);
+  const t = await waitJob(/Запись флеша:?\s*(готово|ошибка)/, 900000);
+  check(/Запись флеша:?\s*готово/.test(t) && /Версия ПНС release-2\.30\.13\.1-E8C2/.test(t), `backup written back: ${t.slice(0, 200)}`);
 }
 check(errors.length === 0, `no JS errors ${errors.slice(0, 3).join(" | ")}`);
 await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);

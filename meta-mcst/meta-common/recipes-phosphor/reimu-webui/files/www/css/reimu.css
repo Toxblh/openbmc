@@ -132,6 +132,13 @@ label.inline > input, label.inline > select { display: inline-block; width: auto
 .dropdown.open::after { content: ""; position: fixed; inset: 0; z-index: 49; cursor: pointer; }
 .dropdown-menu button, .dropdown-menu a { display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text);
   padding: 7px 10px; border-radius: 4px; font: inherit; cursor: pointer; }
+.dropdown-note { padding: 8px 12px; max-width: 280px; font-size: 12px; color: var(--muted); white-space: normal; border-bottom: 1px solid var(--border); }
+.dropdown-menu button:disabled { opacity: .45; cursor: not-allowed; background: none; }
+/* a job of the PNS card: what, the step, its progress, a note */
+.job { display: flex; flex-direction: column; gap: 8px; }
+.job-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-progress { display: flex; align-items: center; gap: 10px; }
+.job-progress .progress { flex: 1; }
 .dropdown-menu button:hover, .dropdown-menu a:hover { background: var(--accent); text-decoration: none; }
 .dropdown-menu .danger { color: #ff7b7c; }
 

@@ -84,6 +84,7 @@ KEEP=${REIMU_PNS_KEEP:-/var/lib/reimu-pns}
 FLASH=${REIMU_FLASH:-reimu-flash}
 TRIES=${REIMU_PNS_TRIES:-5}
 KEEP_MAX=${REIMU_PNS_KEEP_MAX:-4194304}
+RAM_MAX=${REIMU_PNS_RAM_MAX:-67108864}   # the backups in RAM (WORK): bytes
 LOCK=$RUN/lock
 STATE=$RUN/state.json
 CHIP=$KEEP/chip.json
@@ -406,9 +407,44 @@ backup() {
 }
 
 # keep the N newest backups in RAM, and EXCEPT (the image being written)
-prune() {
-    ls -t $WORK/backup-*.bin.gz 2>/dev/null | grep -vxF "${2:-/}" | sed "1,${1}d" |
-        while read -r f; do rm -f "$f" "${f%.gz}.sha256"; done
+sha_of() { head -1 "$1" 2>/dev/null | cut -d' ' -f1; }
+mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+# One copy per content (the chip's sha256): the BMC flash's (backup-last),
+# else the newest in RAM - its time the latest it was taken. Then RAM under
+# RAM_MAX: the oldest go first, the newest always stays.
+tidy() {
+    local ks f s seen=" " total=0 n=0 sz
+    ks=$(sha_of $KEEP/backup-last.bin.sha256)
+    for f in $(ls -t $WORK/backup-*.bin.gz 2>/dev/null); do
+        s=$(sha_of "${f%.gz}.sha256")
+        if [ -n "$s" ] && [ "$s" = "$ks" ]; then
+            [ "$(mtime "$f")" -gt "$(mtime $KEEP/backup-last.bin.gz)" ] && touch -r "$f" $KEEP/backup-last.bin.gz
+            rm -f "$f" "${f%.gz}.sha256"
+            continue
+        fi
+        case "$seen" in *" $s "*) [ -n "$s" ] && { rm -f "$f" "${f%.gz}.sha256"; continue; } ;; esac
+        seen="$seen$s "
+        sz=$(fsize "$f"); n=$((n + 1)); total=$((total + sz))
+        if [ $n -gt 1 ] && [ $total -gt "$RAM_MAX" ]; then
+            rm -f "$f" "${f%.gz}.sha256"
+            total=$((total - sz))
+        fi
+    done
+    return 0
+}
+# the copy on the BMC flash, about to be replaced: to RAM first, unless RAM
+# has its content (named and timed as when it was taken)
+kept_to_ram() {
+    local ks f d nm
+    [ -f $KEEP/backup-last.bin.gz ] || return 0
+    ks=$(sha_of $KEEP/backup-last.bin.sha256)
+    [ -n "$ks" ] || return 0
+    for f in $WORK/backup-*.bin.sha256; do [ "$(sha_of "$f")" = "$ks" ] && return 0; done
+    d=$(sed -n 's/.* date=\([0-9]*\)-\([0-9]*\)-\([0-9]*\)T\([0-9]*\):\([0-9]*\):\([0-9]*\).*/\1\2\3-\4\5\6/p' $KEEP/backup-last.bin.sha256 | head -1)
+    nm=backup-${d:-$(date -r $KEEP/backup-last.bin.gz +%Y%m%d-%H%M%S 2>/dev/null || date +%Y%m%d-%H%M%S)}.bin
+    cp -p $KEEP/backup-last.bin.gz $WORK/$nm.gz.tmp && mv $WORK/$nm.gz.tmp $WORK/$nm.gz &&
+        sed "1s#  .*#  $nm#" $KEEP/backup-last.bin.sha256 > $WORK/$nm.sha256 ||
+        { rm -f $WORK/$nm.gz.tmp; log "the BMC flash's backup not moved to RAM"; }
 }
 
 # room in WORK (RAM, tmpfs: shared with BMC updates) for N chip-sized files
@@ -470,6 +506,7 @@ own_backup() {
 hexat() { od -A n -t x1 -j $2 -N $3 "$1" 2>/dev/null | tr -d ' \n'; }
 be32() { h=$(hexat "$1" $2 4); [ ${#h} = 8 ] && printf '%d' 0x$h; }
 fsize() { stat -L -c %s "$1"; }
+human() { [ "$1" -ge 1048576 ] && echo "$(( ($1 + 524288) / 1048576 )) МиБ" || echo "$(( ($1 + 512) / 1024 )) КиБ"; }
 
 # I_*: what FILE (BYTES of it, default all) holds
 info() {
@@ -712,8 +749,9 @@ do_read() {
     if [ -z "$f" ]; then
         name=backup-$(date +%Y%m%d-%H%M%S).bin
         pack $raw $name
-        prune 4
+        tidy
         f=$WORK/$name.gz
+        [ -f "$f" ] || f=$KEEP/backup-last.bin.gz     # the same as the BMC flash's
     fi
     S_BACKUP=$f
     save_chip read $(head -1 $raw.sha256 | cut -d' ' -f1)
@@ -771,7 +809,6 @@ do_write() {
     chip_magic=$I_IMAGE
     name=backup-$(date +%Y%m%d-%H%M%S).bin
     pack $bk $name
-    prune 4 "$f"
     S_BACKUP=$WORK/$name.gz
     # (before a refusal too: the page offers write-blank by what this says)
     save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
@@ -807,6 +844,8 @@ do_write() {
         unfinished_clear
         switch 0 && connected=
         [ "$f" = $WORK/upload.bin ] && rm -f "$f"
+        tidy
+        [ -f "$S_BACKUP" ] || S_BACKUP=$KEEP/backup-last.bin.gz
         finish ok "Флеш ПНС уже содержит этот образ: ничего не записано"
         say "$S_MSG"
         return 0
@@ -825,10 +864,16 @@ do_write() {
     elif ! keep_backup $WORK/$name; then
         log "the backup wasn't saved to the BMC flash: only $WORK/$name.gz, in RAM"
         keep_warn="; резервная копия на флеш BMC не сохранена"
-        S_WARN="${S_WARN:+$S_WARN }Резервная копия не сохранена на флеш BMC: она только в памяти ($WORK/$name.gz) и пропадёт при его перезагрузке"
+        if [ "$(fsize $WORK/$name.gz)" -gt "$KEEP_MAX" ]; then
+            why="$(human $(fsize $WORK/$name.gz)), на флеш BMC помещается до $(human $KEEP_MAX)"
+        else why="на флеш BMC её записать не удалось"; fi
+        S_WARN="${S_WARN:+$S_WARN }Копия чипа до записи не сохранена на флеш BMC, она только в памяти BMC ($why). Скачайте её, если нужна."
     fi
     # (nothing written yet: without the marker a failed write here could cost
     # the good copy on the next try)
+    # one copy of each content: the one just made may be the BMC flash's now
+    tidy
+    [ -f "$S_BACKUP" ] || S_BACKUP=$KEEP/backup-last.bin.gz
     unfinished_set || die "Не удалось записать отметку о начале записи ($UNFINISHED): запись отменена, флеш не изменён"
 
     # erase + write the blocks that differ, every one read back (reimu-flash);
@@ -889,8 +934,9 @@ do_write() {
 # 1 if it isn't there now
 keep_backup() {
     mkdir -p $KEEP
-    [ "$(fsize $1.gz)" -le "$KEEP_MAX" ] &&
-        cp $1.gz $KEEP/backup-last.bin.gz.tmp && cp $1.sha256 $KEEP/backup-last.bin.sha256.tmp &&
+    [ "$(fsize $1.gz)" -le "$KEEP_MAX" ] || return 1
+    kept_to_ram
+    cp $1.gz $KEEP/backup-last.bin.gz.tmp && cp $1.sha256 $KEEP/backup-last.bin.sha256.tmp &&
         mv $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.gz &&
         mv $KEEP/backup-last.bin.sha256.tmp $KEEP/backup-last.bin.sha256 && return 0
     rm -f $KEEP/backup-last.bin.gz.tmp $KEEP/backup-last.bin.sha256.tmp

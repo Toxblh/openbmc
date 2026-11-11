@@ -62,9 +62,32 @@ async function pollPower() {
     $("power-led").className = "led err";
     $("power-text").textContent = "нет связи";
   }
+  await refreshPowerLock();
+}
+
+// While a PNS flash job runs the BMC holds the platform's power-on (the lock
+// server_ctl honours): the power menu says so and its power-on items are off
+const LOCKED_BY_PNS = ["On", "GracefulRestart", "ForceRestart"];
+export async function refreshPowerLock() {
+  let why = "";
+  try {
+    const r = await api.get("/xyz/openbmc_project/reimu/pns_flash", { noAuthEvent: true });
+    const st = JSON.parse(r.data.Json);
+    const j = st.state;
+    if (j && j.state === "running" && !st.stale)
+      why = `Идёт ${j.job === "write" ? "запись" : "чтение"} флеша ПНС: включить платформу можно будет после её окончания`;
+  } catch (e) {
+    /* no PNS service (an older BMC firmware): nothing held */
+  }
+  appState.powerLock = why;
+  for (const b of $("power-menu").querySelectorAll("button[data-reset]")) b.disabled = !!why && LOCKED_BY_PNS.includes(b.dataset.reset);
+  const n = $("power-lock");
+  n.hidden = !why;
+  n.textContent = why;
 }
 
 export async function powerAction(kind) {
+  if (appState.powerLock && LOCKED_BY_PNS.includes(kind)) return toast(appState.powerLock, "err");
   const names = {
     On: "включить",
     GracefulShutdown: "выключить (ACPI)",
@@ -191,6 +214,7 @@ function setupDropdowns() {
     },
     { passive: false },
   );
+  document.addEventListener("reimu-pns-job", refreshPowerLock);
   $("power-menu").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-reset]");
     if (b) powerAction(b.dataset.reset);

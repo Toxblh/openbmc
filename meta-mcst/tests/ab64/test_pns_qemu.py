@@ -334,7 +334,8 @@ def t_tool(b):
     check(c[len(new):] == orig[len(new):], "write: nothing else changed (0x%x-0x4000000 as before)" % len(new))
     check(not b.gpio.o0_now() and any(x[1] for x in b.gpio.since(t0)), "write: O0 back to 0")
     st = b.state()
-    check(st.get("state") == "ok" and st.get("backup", "").startswith("/tmp/reimu-pns/backup-"), "state: write ok, backup %s" % st.get("backup"))
+    rc, o = b.sh("gzip -dc %s | sha256sum" % st.get("backup", "/nonexistent"))
+    check(st.get("state") == "ok" and sha(orig) in o, "state: write ok, its backup (the chip before) at %s" % st.get("backup"))
     rc, o = b.sh("cat /var/lib/reimu-pns/chip.json")
     check('"source":"write"' in o and "c0c7328e4" in o and sha(c) in o, "chip.json: the new version and the chip's sha256")
     rc, o = b.sh("gzip -dc /var/lib/reimu-pns/backup-last.bin.gz | sha256sum")
@@ -361,8 +362,10 @@ done
 """
 
 
-def restore(b, orig, what):
-    rc, o = b.sh("ls -t /tmp/reimu-pns/backup-*.bin.gz | head -1")
+def restore(b, orig, what, path=None):
+    # the backup of the last job (or PATH), where the tool says it is (RAM,
+    # or the BMC flash's copy: one copy per content)
+    o = path or b.state().get("backup", "?")
     rc, o2 = b.sh("reimu-pns-flash write %s" % o.strip())
     check(rc == 0 and b.chip() == orig, "%s: restored from the backup %s" % (what, o.strip()))
     if rc:
@@ -383,14 +386,14 @@ def t_faults(b):
     check(rc == 0 and "3 blocks differ after writing, writing them again" in o and b.chip()[:len(new)] == new,
           "3 writes lost: detected, rewritten, verified")
     check(not b.gpio.o0_now(), "O0 = 0 after")
-    rc, o = b.sh("reimu-pns-flash write /tmp/reimu-pns/$(ls -t /tmp/reimu-pns | grep -m1 'backup-.*bin.gz$')")
+    rc, o = b.sh("reimu-pns-flash write %s" % b.state().get("backup", "?"))
     check(rc == 0 and b.chip() == orig, "restored (a backup of this chip: restore)")
 
     # a chip that can't be written
     rc, o = b.sh(pre + "PNS_FAULT=flipall REIMU_PNS_TRIES=2 reimu-pns-flash write /tmp/new.bin")
     st = b.state()
     check(rc != 0 and st.get("state") == "failed" and "Запись не удалась" in st.get("message", "")
-          and "Резервная копия флеша: /tmp/reimu-pns/backup-" in st.get("message", ""),
+          and "Резервная копия флеша: /" in st.get("message", ""),
           "every write lost: failed, reported with the backup (%s)" % st.get("message", "")[:120])
     check(not b.gpio.o0_now(), "O0 = 0 after the failure")
     rc, o = b.sh("gzip -dc %s | sha256sum" % st.get("backup"))
@@ -426,9 +429,10 @@ def t_faults(b):
     rc, o = b.sh("ps | grep -c '[r]eimu-flash write'")
     check(o.strip() == "0", "no reimu-flash left writing")
     check(b.ssh("ls %s" % st.get("backup")).returncode == 0, "backup there: %s" % st.get("backup"))
+    killed = st.get("backup")
     rc, o = b.sh("reimu-pns-flash read /tmp/reimu-pns/after-kill.bin >/dev/null; reimu-pns-flash version /tmp/reimu-pns/after-kill.bin; rm -f /tmp/reimu-pns/after-kill.bin*")
     check(rc == 0, "the next job runs (lock free): chip is a mix now")
-    restore(b, orig, "after kill -9")
+    restore(b, orig, "after kill -9", killed)
 
     # everything killed (the guard too): the next power-on switches it back
     b.ssh(pre + "PNS_FAULT=slow:40 setsid nohup reimu-pns-flash write /tmp/new.bin >/tmp/w.log 2>&1 &", timeout=30)
@@ -579,7 +583,7 @@ def t_power(b):
     s = b.gpio.since(t0)
     check("rc=0" in o and any(x[2] for x in s) and not any(x[1] for x in s),
           "after the write: power-on works, O0 = 0 (%s)" % o.replace("\n", " "))
-    rc, o = b.sh("reimu-pns-flash write /tmp/reimu-pns/$(ls -t /tmp/reimu-pns | grep -m1 'backup-.*bin.gz$')")
+    rc, o = b.sh("reimu-pns-flash write %s" % b.state().get("backup", "?"))
     check(rc == 0 and b.chip() == orig, "restored")
 
 
@@ -612,11 +616,13 @@ def t_web(b):
     check(s.get("state") == "ok" and b.chip()[:len(new)] == new and b.chip()[len(new):] == orig[len(new):],
           "written and verified: %s" % s.get("message", "")[:100])
     j = pf_json()
-    bk = j.get("backups") or []
-    check(bk and bk[0].get("sha256") == sha(orig), "the backup before the write is listed with its sha256")
+    # the chip before the write: once, the BMC flash's copy ("last"), not again in RAM
+    kept, bk = j.get("kept") or {}, j.get("backups") or []
+    check(kept.get("sha256") == sha(orig) and not any(x.get("sha256") == sha(orig) for x in bk),
+          "the backup before the write is listed with its sha256, once (on the BMC flash)")
     # download it like the page: chunks, the erased ones without data
-    name, size = bk[0]["name"], None
-    check(name.endswith(".bin.gz") and bk[0]["size"] < 4 << 20, "kept gzipped in RAM: %s, %d KiB" % (name, bk[0]["size"] >> 10))
+    name, size = "last", None
+    check(kept.get("size", 1 << 30) < 4 << 20, "kept gzipped: %d KiB" % (kept.get("size", 0) >> 10))
     out = bytearray()
     n_ff = 0
     off = 0
@@ -647,10 +653,15 @@ def t_web(b):
     check(s.get("state") == "ok" and b.chip() == new + orig[len(new):],
           "write \"last\" (the gzip copy on the BMC flash): the chip before the last write (%s; %s)"
           % (r.get("message"), s.get("message", "")[:120]))
+    # (that write's own "before": the original, the BMC flash's copy now; the
+    # new image's copy moved to RAM before it was replaced)
+    j = pf_json()
+    check((j.get("kept") or {}).get("sha256") == sha(orig) and any(x.get("sha256") == sha(new + orig[len(new):]) for x in j.get("backups") or []),
+          "each content once: the original on the BMC flash, the new image's copy moved to RAM")
     t0 = pf_job()
-    r = pf_call("Run", "write", (pf_json().get("backups") or [{}])[0].get("name", "?"))
+    r = pf_call("Run", "write", "last")
     s = pf_wait(t0)
-    check(s.get("state") == "ok" and b.chip() == orig, "and the newest backup back: the original")
+    check(s.get("state") == "ok" and b.chip() == orig, "and \"last\" again: the original")
     check(b.power(True), "platform on")
     # (the upload is gone: written; a backup instead)
     r = pf_call("Run", "write", (pf_json().get("backups") or [{}])[0].get("name", "?"))
@@ -829,9 +840,10 @@ def t_sidecar(b):
     # (a copy: the backups in RAM are pruned to the newest 4)
     b.sh("cp %s %s/own.bin.gz && cp %s %s/own.bin.sha256" % (bk, SC, side, SC))
     bk, side = SC + "/own.bin.gz", SC + "/own.bin.sha256"
-    check(rc == 0 and len(lines) == 2 and lines[0].startswith(sha(orig))
+    check(rc == 0 and len(lines) == 3 and lines[0].startswith(sha(orig))
           and re.match(r"# reimu-pns-flash: bmc=98:a7:b0:00:00:01 jedec=20ba20 size=67108864 date=\S+ "
-                       r"board=mcst,e8c2_1e8sv-uatx_445$", lines[1]),
+                       r"board=mcst,e8c2_1e8sv-uatx_445$", lines[1])
+          and lines[2].startswith("# image: kind=lintel boot=release-2.30.13.1-E8C2"),
           "a backup's .sha256 records who made it, of what: %s" % " | ".join(lines))
     for kind in ("blank", "half"):
         check(chip_to(b, kind, orig, bad), "chip -> %s" % kind)

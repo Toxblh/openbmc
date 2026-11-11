@@ -154,7 +154,8 @@ def job_list(src, e2e, only):
     www = os.path.join(src, "meta-mcst", WWW)
     for name, stub in (("console_size", "console-size"), ("pns_blank", "pns-blank"), ("ota_page", "ota"), ("map", "map"),
                        ("login_page", "login"), ("kvm_h264", "kvm-h264"), ("host_usbnet", "host-usbnet"),
-                       ("power_policy", "power-policy"), ("fan_profile", "fan-profile"), ("console_jitter", "console-jitter")):
+                       ("power_policy", "power-policy"), ("fan_profile", "fan-profile"), ("console_jitter", "console-jitter"),
+                       ("power_lock", "power-lock")):
         jobs.append(Job(name, ["env", "WWW=" + www, "CHROME=" + (chromium() or ""), "node", os.path.join(e2e, stub + ".stub.mjs")]))
     for s in QEMU_SUITES:
         py = os.path.join(src, "meta-mcst/tests/ab64/test_%s_qemu.py" % s)

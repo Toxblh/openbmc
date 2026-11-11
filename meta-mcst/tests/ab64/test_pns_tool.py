@@ -17,7 +17,11 @@ interrupt or lie; the real C file through unit/pnsflash_harness.c.
          its .sha256 has "# image: kind=... boot=..."; older ones get it
          from "describe" (and from every job); the status JSON has it
 
-    test_pns_tool.py [keep|pin|warn|blank|format|coreboot|describe ...]     (SH: the shell, default sh)
+  tidy   one copy per content (the BMC flash's, else the newest in RAM),
+         the copy the BMC flash had moved to RAM before it is replaced,
+         RAM kept under REIMU_PNS_RAM_MAX bytes (the oldest go first)
+
+    test_pns_tool.py [keep|pin|warn|blank|format|coreboot|describe|tidy ...]     (SH: the shell, default sh)
 """
 import base64, gzip, hashlib, json, os, re, shutil, signal, struct, subprocess, sys, tempfile
 
@@ -672,8 +676,9 @@ def t_coreboot():
     # the restore of the backup the coreboot write made: PNS again
     e = Env(chip=A)
     e.tool_write(e.put("cb.rom", CB))
-    bk = sorted(x for x in os.listdir(e.work) if x.startswith("backup-") and x.endswith(".bin.gz"))
-    rc, o = e.tool_write(os.path.join(e.work, bk[-1])) if bk else (1, "no backup")
+    # (the chip before the write: one copy, the BMC flash's - "tidy")
+    bk = [os.path.join(e.keep, "backup-last.bin.gz")] if os.path.exists(os.path.join(e.keep, "backup-last.bin.gz")) else []
+    rc, o = e.tool_write(bk[0]) if bk else (1, "no backup")
     check(rc == 0 and e.chip() == chipped(A), "[coreboot] the backup before coreboot written back: the chip as it was (%s)" % o.strip()[-200:])
     e.done()
 
@@ -694,9 +699,11 @@ def t_describe():
     rc, o = e.tool_write(e.put("cb.rom", CB))            # backup of A (PNS), kept as last
     rc2, o2 = e.tool_write(e.put("b.bin", B))            # backup of the coreboot chip
     sc = sidecars(e)
-    work = sorted(k for k in sc if k.startswith(e.work))
-    check(rc == 0 and rc2 == 0 and len(work) == 2, "[describe] two writes, two backups (%s)" % [os.path.basename(k) for k in work])
-    first, second = (sc[k] for k in work) if len(work) == 2 else ("", "")
+    # each content once, in RAM or on the BMC flash ("tidy"): found by its sha256
+    by = {v.split()[0]: v for v in sc.values()}
+    sa, scb = sha(chipped(A)), sha(chipped(CB))
+    check(rc == 0 and rc2 == 0 and sa in by and scb in by, "[describe] two writes: a copy of each chip (%s)" % sorted(os.path.basename(k) for k in sc))
+    first, second = by.get(sa, ""), by.get(scb, "")
     check("# image: kind=lintel boot=lintel-E8C2 ::::::: ( unified-boot/rel-1 )(E8C2)" in first,
           "[describe] the backup of the PNS chip: kind lintel, its version (%s)" % first.strip().splitlines()[-1:])
     check("# image: kind=coreboot boot=coreboot 26.09-607-g367eda1a7d50" in second,
@@ -705,7 +712,7 @@ def t_describe():
     check("kind=coreboot" in kept, "[describe] backup-last (the chip before the last write): coreboot")
     j = e.call("json")
     bk = {b.get("name"): b for b in (j.get("backups") or [])}
-    kinds = sorted((b.get("kind"), (b.get("boot") or "")[:12]) for b in bk.values())
+    kinds = sorted((b.get("kind"), (b.get("boot") or "")[:12]) for b in list(bk.values()) + [j.get("kept") or {}])
     check(kinds == [("coreboot", "coreboot 26."), ("lintel", "lintel-E8C2 ")] and (j.get("kept") or {}).get("kind") == "coreboot",
           "[describe] the status JSON: each backup's kind and version (%s; kept %s)" % (kinds, (j.get("kept") or {}).get("kind")))
     # a backup of an older firmware: no "# image" line; describe adds it
@@ -716,10 +723,76 @@ def t_describe():
     check(rc == 0 and all("# image: kind=" in v for v in sc2.values()) and
           all(sc2[k].count("# image:") == 1 for k in sc2),
           "[describe] older backups described afterwards, once each (%s)" % o.strip().replace("\n", " | "))
-    check(sorted(v.split("# image: kind=")[1].split()[0] for v in sc2.values()) == ["coreboot", "coreboot", "lintel"],
+    check(sorted(v.split("# image: kind=")[1].split()[0] for v in sc2.values()) == ["coreboot", "lintel"],
           "[describe] ... with the right kinds")
     rc, o = tool(e, "describe")
     check(all(v.count("# image:") == 1 for v in sidecars(e).values()), "[describe] again: nothing added twice")
+    e.done()
+
+
+# ------------------------------------------------------------------ tidy
+def ram(e):
+    """the RAM backups: {sha256 of the chip: name}"""
+    out = {}
+    for n in sorted(os.listdir(e.work)):
+        if n.startswith("backup-") and n.endswith(".bin.gz"):
+            out.setdefault(open(os.path.join(e.work, n[:-3] + ".sha256")).read().split()[0], []).append(n)
+    return out
+
+
+def kept_sha(e):
+    try:
+        return open(os.path.join(e.keep, "backup-last.bin.sha256")).read().split()[0]
+    except OSError:
+        return None
+
+
+def t_tidy():
+    import time
+    sA, sB, sC = sha(chipped(A)), sha(chipped(B)), sha(chipped(C))
+    # the same chip read twice: one copy, the newer
+    e = Env(chip=A)
+    tool(e, "read")
+    time.sleep(1.1)
+    rc, o = tool(e, "read")
+    r = ram(e)
+    check(rc == 0 and list(r) == [sA] and len(r[sA]) == 1, "[tidy] the same chip read twice: one copy in RAM (%s)" % r)
+    e.done()
+    # writes: the chip before each write once, wherever it is
+    e = Env(chip=A)
+    rc, o = e.tool_write(e.put("b.bin", B))
+    r, k = ram(e), kept_sha(e)
+    check(rc == 0 and k == sA and sA not in r, "[tidy] write B over A: A on the BMC flash, not again in RAM (kept %s, RAM %s)" % (k and k[:8], {x[:8]: v for x, v in r.items()}))
+    time.sleep(1.1)
+    rc, o = e.tool_write(e.put("c.bin", C))
+    r, k = ram(e), kept_sha(e)
+    check(rc == 0 and k == sB and list(r) == [sA], "[tidy] then C over B: B on the BMC flash, A moved to RAM before it was replaced (kept %s, RAM %s)" % (k and k[:8], {x[:8]: v for x, v in r.items()}))
+    sc = open(os.path.join(e.work, r.get(sA, ["x"])[0][:-3] + ".sha256")).read() if sA in r else ""
+    check("# image: kind=lintel" in sc and "rel-1" in sc, "[tidy] the moved copy still says what it holds")
+    time.sleep(1.1)
+    rc, o = e.tool_write(e.put("a.bin", A))          # back to A: the chip was C
+    r, k = ram(e), kept_sha(e)
+    check(rc == 0 and k == sC and sorted(r) == sorted([sA, sB]) and all(len(v) == 1 for v in r.values()),
+          "[tidy] then A again: C on the BMC flash, A and B once each in RAM (kept %s, RAM %s)" % (k and k[:8], {x[:8]: v for x, v in r.items()}))
+    e.done()
+    # the RAM budget: the oldest go, the newest always stays
+    e = Env(chip=A)
+    one = len(gzip.compress(chipped(A)))
+    e.env["REIMU_PNS_RAM_MAX"] = str(int(one * 2.5))
+    for img in (B, C, image(5), image(6)):
+        time.sleep(1.1)
+        e.tool_write(e.put("x.bin", img))
+    r = ram(e)
+    names = sorted(n for v in r.values() for n in v)
+    total = sum(os.path.getsize(os.path.join(e.work, n)) for n in names)
+    check(1 <= len(names) <= 2 and total <= int(one * 2.5) + one, "[tidy] RAM under its budget: %d copies, %d bytes (budget %d)" % (len(names), total, int(one * 2.5)))
+    newest = max(names) if names else ""
+    check(sha(chipped(C)) in r and newest in r[sha(chipped(C))] if sha(chipped(C)) in r else False,
+          "[tidy] the newest RAM copy (the chip C, moved from the BMC flash) kept (%s)" % {x[:8]: v for x, v in r.items()})
+    e.env["REIMU_PNS_RAM_MAX"] = "1"
+    time.sleep(1.1)
+    e.tool_write(e.put("y.bin", image(7)))
+    check(len([n for v in ram(e).values() for n in v]) == 1, "[tidy] a budget smaller than one copy: still the newest one")
     e.done()
 
 
@@ -740,7 +813,7 @@ TOP = tempfile.mkdtemp(prefix="pnstool-", dir=os.environ.get("TMPDIR"))
 REAL, HARNESS = build(TOP)
 try:
     for name, fn in (("keep", t_keep), ("pin", t_pin), ("warn", t_warn), ("blank", t_blank), ("format", t_format),
-                     ("coreboot", t_coreboot), ("describe", t_describe)):
+                     ("coreboot", t_coreboot), ("describe", t_describe), ("tidy", t_tidy)):
         if not ONLY or name in ONLY:
             fn()
 finally:

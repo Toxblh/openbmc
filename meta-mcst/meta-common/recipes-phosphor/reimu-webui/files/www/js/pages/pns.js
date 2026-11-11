@@ -203,6 +203,8 @@ export function pnsFlashCard() {
     last = st;
     if (!busy) card.replaceChildren(...render(st));
     const running = st.state && st.state.state === "running" && !st.stale;
+    // the power menu of every page: held while a job runs, back when it ends
+    if (running || wasRunning) document.dispatchEvent(new CustomEvent("reimu-pns-job"));
     if (running) timer = setTimeout(refresh, 1500);
     else if (wasRunning) timer = setTimeout(refresh, 1000);
     else timer = setTimeout(refresh, 15000);
@@ -242,13 +244,15 @@ export function pnsFlashCard() {
       out.push(
         h(
           "div",
-          { class: "section" },
-          h("div", { class: "small" }, `${JOBS[job.job] || job.job}: `, h("span", { class: `badge ${cls}` }, label), " ", h("span", { class: "muted" }, when(job.finished || job.started))),
-          h("div", { class: "small" }, job.message),
-          job.warning ? h("div", { class: "alert warn" }, job.warning) : null,
+          { class: "section job" },
+          h("div", { class: "job-head" }, h("b", {}, JOBS[job.job] || job.job), h("span", { class: `badge ${cls}` }, label), h("span", { class: "muted small" }, when(job.finished || job.started))),
+          h("div", {}, job.message),
+          running
+            ? h("div", { class: "job-progress" }, h("div", { class: "progress" }, h("div", { style: { width: `${job.progress || 0}%` } })), h("span", { class: "muted small" }, `${job.progress || 0}%`))
+            : null,
+          // (a note, not an alarm: the backup list says where each copy is)
+          job.warning ? h("div", { class: "muted small" }, job.warning) : null,
           st.stale ? h("div", { class: "alert err" }, "Операция прервалась, не завершившись. Если шла запись, запишите обратно резервную копию (ниже) до включения платформы.") : null,
-          running ? h("div", { class: "progress" }, h("div", { style: { width: `${job.progress || 0}%` } })) : null,
-          running ? h("div", { class: "muted small" }, `${job.progress || 0}%: включение платформы заблокировано до конца операции`) : null,
         ),
       );
     }
