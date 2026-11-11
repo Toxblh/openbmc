@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CP = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto"]    # a clone where it can
 BASE_PORT = 20000     # above the ports Chrome refuses (5060, 5061, 6000...)
 FIXTURES = ["pns.bin", "fru.bin", "pns-orig.bin", "pns-new.bin", "pns-fault.so", "kernel-other.fit", "stock-kexec"]
-OPTIONAL = ["openlog.so"]      # built by the test with the build container if not there
+OPTIONAL = ["openlog.so", "p2a-devmem"]      # built by the test with the build container if not there
 SLOW = {"ab.restorecut": 120, "ipmi_redfish": 120}     # minutes, instead of --timeout
 AB = "/work/openbmc/meta-mcst/tests/ab64"
 FLASH_SRC = "/work/openbmc/meta-mcst/meta-ab64/recipes-mcst/reimu-ab/files/reimu-flash.c"

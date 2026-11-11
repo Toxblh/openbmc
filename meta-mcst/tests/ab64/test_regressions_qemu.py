@@ -58,7 +58,7 @@ Groups (all by default):
   net      (a guard, no bug) eth0 asks DHCP again when networkd restarts
            with no lease: the board's missing lease of 2026-11-08 was its RX
 """
-import os, re, subprocess, sys, time
+import struct, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -72,7 +72,7 @@ W, check = T.W, T.check
 IMAGE = os.environ.get("REG_IMAGE", os.path.join(W, "ab.mtd"))
 RED = os.environ.get("REG_RED") == "1"
 DOCKER = os.environ.get("REIMU_DOCKER", "reimu")
-GROUPS = GROUPS_ARG or ["base", "kexec", "platform", "fruid", "hwmon", "pns", "wdt", "net"]
+GROUPS = GROUPS_ARG or ["base", "kexec", "platform", "fruid", "hwmon", "pns", "wdt", "net", "p2aflash"]
 red_missing = []
 
 
@@ -668,12 +668,74 @@ def g_net():
         b.stop()
 
 
+def g_p2aflash():
+    """p2a's flash commands (tools/ab64/p2a/p2a.c, the way back without a
+    programmer: from the host over the P2A bridge) built -DDEVMEM: the same
+    FMC user mode from the BMC over /dev/mem. The JEDEC ID, the U-Boot read
+    through the memory window = /dev/mtd1; U-Boot without the platform reset
+    (uboot-noreset.py) written by it: read back, the BMC reboots through it
+    with the platform on and never holds it in reset; the stock U-Boot back"""
+    import importlib.util
+    import test_fru_sensors_qemu as F
+    tools = os.path.join(HERE, "..", "..", "tools", "ab64")
+    exe = open("p2a-devmem", "rb").read() if os.path.exists("p2a-devmem") else \
+        cross(open(os.path.join(tools, "p2a", "p2a.c"), "rb").read(), "-DDEVMEM")
+    spec = importlib.util.spec_from_file_location("noreset", os.path.join(tools, "uboot-noreset.py"))
+    nr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nr)
+    b = F.Platform("reg-p2a", image("reg-p2a"), power=True).start()
+    try:
+        if not check(b.wait_ssh(600), "up") or not check(exe is not None and put(b, exe, "/tmp/p2a") and
+                                                         b.ssh("chmod +x /tmp/p2a").returncode == 0, "p2a (-DDEVMEM) on the BMC"):
+            return
+        o = b.out("/tmp/p2a flash-id")
+        check("JEDEC ID c2201a" in o, "flash-id: the QEMU chip, mx66l51235f (%s)" % o.strip())
+        r = b.ssh("/tmp/p2a flash-read 0 0xe0000 /tmp/ub.bin && dd if=/dev/mtd1 of=/tmp/mtd1.bin bs=4096 2>/dev/null && cmp /tmp/ub.bin /tmp/mtd1.bin")
+        check(r.returncode == 0, "flash-read through the memory window = /dev/mtd1 (U-Boot)")
+        cur = open(IMAGE, "rb").read()[:0xe0000]
+        was_noreset = all(cur[o:o + 4] == struct.pack("<I", new) for o, _, new, _ in nr.PATCH)
+        stock = cur
+        for o, old, _, _ in nr.PATCH:
+            stock = stock[:o] + struct.pack("<I", old) + stock[o + 4:]
+        noreset = nr.patch(stock)
+        # the other one than the image has: the reset taken out, or put back
+        target, other = (stock, noreset) if was_noreset else (noreset, stock)
+        put(b, target, "/tmp/target.bin")
+        o = b.out("/tmp/p2a flash-write 0 /tmp/target.bin --yes --force 2>&1")
+        print("    " + o.strip().replace("\n", "\n    "))
+        check("1 of 224 blocks of 4 KiB differ" in o, "flash-write: one block of 4 KiB to write (0x4000)")
+        r = b.ssh("dd if=/dev/mtd1 bs=4096 2>/dev/null | cmp - /tmp/target.bin")
+        check("written and read back" in o and r.returncode == 0, "written, /dev/mtd1 = the %s U-Boot" % ("stock" if was_noreset else "no-reset"))
+        o = b.out("/tmp/p2a flash-write 0 /tmp/target.bin --yes --force 2>&1")
+        check("nothing to write" in o, "the same again: nothing written")
+        # QEMU boots from a copy of the flash made at its start (a reboot runs
+        # the old U-Boot): a new QEMU on the same flash file boots what was written
+        img = b.img
+        b.stop()
+        b = F.Platform("reg-p2a", img, power=True).start()
+        check(b.wait_ssh(600), "the BMC booted the U-Boot just written (a new QEMU on that flash)")
+        st = b.state()
+        if was_noreset:
+            check(st.get("reset_held", 0) > 0, "... the stock one held the platform in reset (%s)" % st)
+        else:
+            check(st.get("reset_held") == 0 and st.get("power") and st.get("offs") == 0,
+                  "... the platform on, never held in reset (%s)" % st)
+        put(b, exe, "/tmp/p2a")
+        b.ssh("chmod +x /tmp/p2a")
+        put(b, other, "/tmp/other.bin")
+        o = b.out("/tmp/p2a flash-write 0 /tmp/other.bin --yes --force 2>&1")
+        r = b.ssh("dd if=/dev/mtd1 bs=4096 2>/dev/null | cmp - /tmp/other.bin")
+        check("written and read back" in o and r.returncode == 0, "the image's U-Boot back (%s)" % o.strip().splitlines()[-1:])
+    finally:
+        b.stop()
+
+
 if __name__ == "__main__":
     t0 = time.time()
     for g in GROUPS:
         print("== %s (%s%s)" % (g, os.path.basename(IMAGE), ", red runs" if RED else ""), flush=True)
         t = time.time()
-        {"base": g_base, "kexec": g_kexec, "platform": g_platform, "fruid": g_fruid, "hwmon": g_hwmon, "pns": g_pns, "wdt": g_wdt, "net": g_net}[g]()
+        {"base": g_base, "kexec": g_kexec, "platform": g_platform, "fruid": g_fruid, "hwmon": g_hwmon, "pns": g_pns, "wdt": g_wdt, "net": g_net, "p2aflash": g_p2aflash}[g]()
         print("   (%d s)" % (time.time() - t), flush=True)
     print("%d failed%s (%d s)" % (len(T.failed), ", %d red runs that passed" % len(red_missing) if RED else "",
                                   time.time() - t0))

@@ -31,3 +31,17 @@ the primary flash (WDT1 has the second-flash bit: never use it for this).
 2026-10-21: BMC reboots and WDT resets hard-reset the host (twice).
 2026-11-08: the host survived the BMC's reboot into beta6. Not settled:
 expect the host may go down.
+
+## Writing the BMC flash (a broken U-Boot, no programmer)
+
+    sudo ~/bmc-rescue/p2a flash-id                         # the chip answers: 20ba20 (N25Q512)
+    sudo ~/bmc-rescue/p2a flash-read 0 0xe0000 uboot.bin   # read (the memory window, nothing switched)
+    sudo rmmod ast 2>/dev/null                             # the host's ast driver moves the bridge's window
+    sudo ~/bmc-rescue/p2a flash-write 0 u-boot.bin         # only the 4 KiB blocks that differ, read back
+
+FMC user mode as Linux does it (CE0 control 0x7/0x3, bytes through the CE0
+window 0x20000000), 21h erase and 12h program with 4-byte addresses, Micron
+flag status (70h). Refused while the BMC runs (WDT1 counting) or the ast
+driver is loaded, unless --force. The same code built -DDEVMEM runs on the
+BMC over /dev/mem: test_regressions_qemu p2aflash writes a U-Boot with it and
+boots QEMU from the result.
