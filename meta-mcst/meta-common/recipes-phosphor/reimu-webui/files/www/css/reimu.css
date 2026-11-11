@@ -162,6 +162,13 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .badge.ok { background: #2d5a3a; color: #b9f0c8; }
 .badge.warn { background: #6b5214; color: #ffe39a; }
 .badge.err { background: #6b2122; color: #ffc1c1; }
+/* PNS backups: what it holds, when it was taken, where it is kept; actions */
+.backups { display: flex; flex-direction: column; }
+.backup { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.backup-main { flex: 1; min-width: 200px; }
+.backup-what { font-weight: 600; }
+.backup-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
+.backup-actions { flex-wrap: nowrap; }
 .section { margin-bottom: 18px; }
 .empty { color: var(--muted); padding: 20px; text-align: center; }
 

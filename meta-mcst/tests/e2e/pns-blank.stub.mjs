@@ -146,23 +146,35 @@ const CB_INFO = { kind: "coreboot", boot: CB_BOOT, board: "", cpu: "", vbios: ""
   await s.page.context().close();
 }
 
-// each backup says what it holds: PNS (its release) or coreboot (its version);
-// one made before that was recorded: says so
+// each backup says what it holds (PNS release / coreboot version), when it
+// was taken, where it is kept (RAM: gone with a BMC reboot / the BMC flash),
+// whether the chip holds it now; no hash, no file name in the row
 {
-  const bk = (name, o) => ({ name, size: 1, time: 1794350000, sha256: "a".repeat(64), ...o });
-  const s = await open({ chip: good, upload: null, backups: [
-    bk("backup-20261111-142740.bin.gz", { kind: "lintel", boot: "release-2.32.5.0-E8C2 ::::::: ( unified-boot/release-2.32.5.0-E8C2 commit d98f2551, 202610221027 )(uatx_445)" }),
-    bk("backup-20261111-141558.bin.gz", { kind: "coreboot", boot: "coreboot 26.09-607-g367eda1a7d50 (Tue Nov 10 16:39:14 UTC 2026)" }),
+  const bk = (name, o) => ({ name, size: 1, time: 1794421687, sha256: "a".repeat(64), ...o });
+  const NOW = "c".repeat(64);
+  const s = await open({ chip: { ...good, sha256: NOW }, upload: null, backups: [
+    bk("backup-20261111-142740.bin.gz", { sha256: NOW, kind: "lintel", boot: "release-2.32.5.0-E8C2 ::::::: ( unified-boot/release-2.32.5.0-E8C2 commit d98f2551, 202610221027 )(uatx_445)" }),
+    bk("backup-20261111-141558.bin.gz", { kind: "coreboot", boot: "coreboot 26.09-608-gbcbcf8fed8f1 (Wed Nov 11 09:57:34 UTC 2026)" }),
     bk("backup-20261111-065705.bin.gz", { kind: "-", boot: "" }),
     bk("backup-20261110-223635.bin.gz", {}),
-  ], kept: { name: "last", size: 1, time: 1794350000, sha256: "b".repeat(64), kind: "lintel", boot: "release-2.30.13.1-E8C2 ::::::: ( unified-boot/release-2.30.13.1-E8C2 commit 93b5ba330, 202506171738 )(uatx_445)" } });
-  const rows = await s.page.evaluate(() => [...document.querySelectorAll("#pns-flash table.tbl tr")].map((r) => r.textContent));
-  const has = (i, re) => rows[i] && re.test(rows[i]);
-  check(has(0, /ПНС 2\.32\.5\.0/) && has(1, /coreboot 26\.09-607-g367eda1a7d50/) && has(2, /нет образа/) && has(3, /не записано/) && has(4, /ПНС 2\.30\.13\.1/),
-        `the backups: PNS 2.32.5.0, coreboot 26.09-607, no image, not recorded, kept PNS 2.30.13.1 (${rows.map((r) => r.slice(0, 70)).join(" | ")})`);
-  await s.page.locator("tr", { hasText: "coreboot 26.09" }).locator("button", { hasText: "Записать обратно" }).click();
+  ], kept: { name: "last", size: 1, time: 1794421698, sha256: "b".repeat(64), kind: "lintel", boot: "release-2.30.13.1-E8C2 ::::::: ( unified-boot/release-2.30.13.1-E8C2 commit 93b5ba330, 202506171738 )(uatx_445)" } });
+  const rows = await s.page.evaluate(() => [...document.querySelectorAll("#pns-flash .backup")].map((r) => ({
+    t: r.textContent, title: r.querySelector(".backup-what") && r.querySelector(".backup-what").textContent,
+    wr: (() => { const b = [...r.querySelectorAll("button")].find((x) => x.textContent === "Записать обратно"); return b ? b.disabled : null; })() })));
+  const titles = rows.map((r) => r.title);
+  check(JSON.stringify(titles) === JSON.stringify(["ПНС 2.32.5.0", "coreboot 26.09-608", "нет образа", "неизвестно", "ПНС 2.30.13.1"]),
+        `each row titled by what it holds (${titles.join(" | ")})`);
+  check(rows.length === 5 && rows.every((r) => !/[0-9a-f]{12}/.test(r.t) && !/backup-2026|\.bin\.gz/.test(r.t)), `no hash, no file name in the rows (${rows.map((r) => r.t.slice(0, 60)).join(" | ")})`);
+  check(rows.slice(0, 4).every((r) => /в памяти BMC/.test(r.t)) && /на флеше BMC/.test(rows[4].t) && !/в памяти/.test(rows[4].t),
+        "where each is kept: the four in RAM, the last one on the BMC flash");
+  check(rows.every((r) => /\b\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}\b/.test(r.t)) && !rows.some((r) => /AM|PM/.test(r.t)), `the date taken, as 11.11.2026, 17:28 (${rows[0].t.match(/\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}/)})`);
+  check(/сейчас на флеше ПНС/.test(rows[0].t) && rows[0].wr === null && rows.slice(1).every((r) => !/сейчас на флеше ПНС/.test(r.t) && r.wr === false),
+        "the one the chip holds now: said, no write-back for it; the others can be written back");
+  await s.page.locator(".backup", { hasText: "coreboot 26.09-608" }).locator("button", { hasText: "Записать обратно" }).click();
   await s.page.waitForTimeout(200);
-  check(s.dialogs.length === 1 && /coreboot 26\.09-607/.test(s.dialogs[0]), `writing a backup back: the confirmation names what it holds (${(s.dialogs[0] || "").slice(0, 120)})`);
+  check(s.dialogs.length === 1 && /coreboot 26\.09-608/.test(s.dialogs[0]) && /11\.11\.2026/.test(s.dialogs[0]),
+        `writing a backup back: the confirmation names what and when (${(s.dialogs[0] || "").slice(0, 140)})`);
+  check(!s.errors.length, `backups: no page errors ${s.errors}`);
   await s.page.context().close();
 }
 

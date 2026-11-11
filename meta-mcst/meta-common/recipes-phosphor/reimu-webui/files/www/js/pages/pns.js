@@ -12,7 +12,7 @@ const CHUNK = 512 * 1024;
 const MAGIC = [0x12, 0x50, 0x00, 0x00, 0x20, 0x00, 0x00, 0xc0];
 
 const kv = (pairs) => h("dl", { class: "kv" }, pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)]));
-const when = (s) => (s ? new Date(s * 1000).toLocaleString() : "—");
+const when = (s) => (s ? new Date(s * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "—");
 const hex = (n) => "0x" + Number(n).toString(16);
 const SOURCES = { boot: "при загрузке BMC", read: "чтение из веб-интерфейса или консоли", write: "после записи", backup: "перед записью" };
 const JOBS = { read: "Чтение флеша", write: "Запись флеша", version: "Чтение версии" };
@@ -106,10 +106,13 @@ const loaderRows = (i, none) =>
 // what a backup holds, short: "ПНС 2.32.5.0", "coreboot 26.09-607-g…"; a
 // backup made before reimu-pns-flash recorded it: said so
 function holds(b) {
-  if (!b.kind) return "что внутри — не записано";
+  if (!b.kind) return "неизвестно";
   if (b.kind === "-") return "нет образа";
   const v = b.boot || "";
-  if (b.kind === "coreboot") return v.replace(/ \(.*\)$/, "") || "coreboot";
+  if (b.kind === "coreboot") {
+    const m = v.match(/^coreboot ([0-9][0-9.]*-[0-9]+)/);
+    return m ? `coreboot ${m[1]}` : v.replace(/ \(.*\)$/, "") || "coreboot";
+  }
   const m = v.match(/release-([0-9][0-9.]*)/);
   return `ПНС ${m ? m[1] : v.split(" ")[0] || "?"}`;
 }
@@ -262,42 +265,52 @@ export function pnsFlashCard() {
         h("h3", {}, "Резервные копии"),
         backups.length
           ? h(
-              "table",
-              { class: "tbl" },
-              h(
-                "tbody",
-                {},
-                backups.map((b) => {
-                  const dl = h("button", { class: "btn small", disabled: busy }, "Скачать");
-                  dl.addEventListener("click", async () => {
-                    busy = true;
-                    dl.disabled = true;
-                    try {
-                      await downloadBackup(b, (p) => setBar(p, `Скачивание ${b.name}: ${Math.round(p * 100)}%`));
-                      toast("Резервная копия скачана и сверена (sha256)", "ok");
-                    } catch (e) {
-                      toast(`Скачивание не удалось: ${e.message}`, "err");
-                    } finally {
-                      busy = false;
-                      bar.classList.add("hidden");
-                      barText.textContent = "";
-                      refresh();
-                    }
-                  });
-                  const wr = h("button", { class: "btn small danger", disabled: running || on || busy }, "Записать обратно");
-                  wr.addEventListener("click", () =>
-                    act("write", b.name, `Записать во флеш ПНС резервную копию ${b.kept ? "(сделанную перед последней записью)" : b.name} от ${when(b.time)} (${holds(b)})?\n\nФлеш будет сначала прочитан (новая копия), затем записаны только отличающиеся блоки, и весь флеш сверен с копией.`),
-                  );
-                  return h(
-                    "tr",
-                    {},
-                    h("td", {}, b.kept ? "до последней записи (хранится на флеше BMC)" : b.name, h("div", { class: "small muted" }, holds(b))),
-                    h("td", { class: "muted" }, when(b.time)),
-                    h("td", { class: "mono small muted" }, b.sha256 ? `${b.sha256.slice(0, 12)}…` : ""),
-                    h("td", { class: "row end" }, dl, wr),
-                  );
-                }),
-              ),
+              "div",
+              { class: "backups" },
+              backups.map((b) => {
+                const dl = h("button", { class: "btn small", disabled: busy }, "Скачать");
+                dl.addEventListener("click", async () => {
+                  busy = true;
+                  dl.disabled = true;
+                  try {
+                    await downloadBackup(b, (p) => setBar(p, `Скачивание ${holds(b)}: ${Math.round(p * 100)}%`));
+                    toast("Резервная копия скачана и сверена (sha256)", "ok");
+                  } catch (e) {
+                    toast(`Скачивание не удалось: ${e.message}`, "err");
+                  } finally {
+                    busy = false;
+                    bar.classList.add("hidden");
+                    barText.textContent = "";
+                    refresh();
+                  }
+                });
+                // the chip holds it now: nothing to write back
+                const current = !!(b.sha256 && st.chip && st.chip.sha256 === b.sha256);
+                const wr = h("button", { class: "btn small danger", disabled: running || on || busy }, "Записать обратно");
+                wr.addEventListener("click", () =>
+                  act("write", b.name, `Записать во флеш ПНС резервную копию: ${holds(b)}, снята ${when(b.time)}${b.kept ? " (перед последней записью)" : ""}?\n\nФлеш будет сначала прочитан (новая копия), затем записаны только отличающиеся блоки, и весь флеш сверен с копией.`),
+                );
+                const where = b.kept
+                  ? h("span", { class: "badge ok", title: "Хранится на флеше BMC: переживает его перезагрузку. Это флеш ПНС перед последней записью." }, "на флеше BMC")
+                  : h("span", { class: "badge warn", title: "В оперативной памяти BMC: пропадёт при его перезагрузке. Скачайте, если нужна." }, "в памяти BMC");
+                return h(
+                  "div",
+                  { class: "backup", title: [b.boot, b.kept ? "backup-last.bin.gz" : b.name, b.sha256 && `sha256 ${b.sha256}`].filter(Boolean).join("\n") },
+                  h(
+                    "div",
+                    { class: "backup-main" },
+                    h("div", { class: "backup-what" }, holds(b)),
+                    h(
+                      "div",
+                      { class: "backup-meta muted small" },
+                      `снята ${when(b.time)}`,
+                      where,
+                      current ? h("span", { class: "badge" }, "сейчас на флеше ПНС") : null,
+                    ),
+                  ),
+                  h("div", { class: "row end backup-actions" }, dl, current ? null : wr),
+                );
+              }),
             )
           : h("div", { class: "muted small" }, "Нет: копия делается перед каждой записью, или кнопкой ниже. Копии в памяти BMC пропадают при его перезагрузке — скачайте нужную."),
         h("div", { class: "row" }, read),
