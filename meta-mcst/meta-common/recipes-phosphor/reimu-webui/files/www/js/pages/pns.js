@@ -305,7 +305,7 @@ export function pnsFlashCard() {
                       { class: "backup-meta muted small" },
                       `снята ${when(b.time)}`,
                       where,
-                      current ? h("span", { class: "badge" }, "сейчас на флеше ПНС") : null,
+                      current ? h("span", { class: "badge", title: "Сейчас на флеше ПНС" }, "текущая") : null,
                     ),
                   ),
                   h("div", { class: "row end backup-actions" }, dl, current ? null : wr),

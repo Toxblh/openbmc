@@ -168,7 +168,7 @@ const CB_INFO = { kind: "coreboot", boot: CB_BOOT, board: "", cpu: "", vbios: ""
   check(rows.slice(0, 4).every((r) => /в памяти BMC/.test(r.t)) && /на флеше BMC/.test(rows[4].t) && !/в памяти/.test(rows[4].t),
         "where each is kept: the four in RAM, the last one on the BMC flash");
   check(rows.every((r) => /\b\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}\b/.test(r.t)) && !rows.some((r) => /AM|PM/.test(r.t)), `the date taken, as 11.11.2026, 17:28 (${rows[0].t.match(/\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}/)})`);
-  check(/сейчас на флеше ПНС/.test(rows[0].t) && rows[0].wr === null && rows.slice(1).every((r) => !/сейчас на флеше ПНС/.test(r.t) && r.wr === false),
+  check(/текущая/.test(rows[0].t) && rows[0].wr === null && rows.slice(1).every((r) => !/текущая/.test(r.t) && r.wr === false),
         "the one the chip holds now: said, no write-back for it; the others can be written back");
   await s.page.locator(".backup", { hasText: "coreboot 26.09-608" }).locator("button", { hasText: "Записать обратно" }).click();
   await s.page.waitForTimeout(200);
