@@ -424,6 +424,9 @@ def noreset_image(name):
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     data = bytearray(open(img, "rb").read())
+    import struct
+    if all(struct.unpack_from("<I", data, o)[0] == new for o, _, new, _ in m.PATCH):
+        return img          # the image has it already (fetch.sh REIMU_UBOOT_NORESET=1)
     data[:0xe0000] = m.patch(bytes(data[:0xe0000]))
     open(img, "wb").write(data)
     return img
