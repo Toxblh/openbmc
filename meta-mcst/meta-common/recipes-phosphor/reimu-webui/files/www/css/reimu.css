@@ -288,7 +288,10 @@ table.tbl { width: 100%; border-collapse: collapse; }
   .toasts { left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom)); }
   .toast { max-width: none; }
 
-  .login-box { width: auto; flex: 1; max-width: 380px; margin: 16px; }
+  /* not centred: the keyboard (its suggestion strip, the address bar) changes
+     the visible height as one types, and a centred form moved with it */
+  .login { align-items: flex-start; padding-top: calc(40px + env(safe-area-inset-top)); }
+  .login-box { width: auto; flex: 1; max-width: 380px; margin: 0 16px; }
   input[type=file] { max-width: 100%; min-width: 0; width: 100%; }
   select { max-width: 100%; }
   select:empty, select:has(> option:only-child) { min-width: 160px; }

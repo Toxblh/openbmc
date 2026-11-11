@@ -45,6 +45,22 @@ check(phone.active !== "login-pass", `phone: the password field not focused by t
 await phone.page.locator("#login-pass").tap();
 await phone.page.keyboard.type("0penBmc");
 check((await phone.page.locator("#login-pass").inputValue()) === "0penBmc", "phone: tapped and typed");
+// the keyboard on a phone: the visible height drops and then jumps as its
+// suggestion strip and the address bar come and go (a video of Chrome on
+// Android, 2026-11-11). Centred in the screen, the form moved with every
+// change; it stays where it is, its password field above the keyboard
+{
+  const full = phone.page.viewportSize();
+  const tops = [], bottoms = [];
+  for (const hgt of [full.height, 480, 440, 480, 430, 480, full.height]) {
+    await phone.page.setViewportSize({ width: full.width, height: hgt });
+    await phone.page.waitForTimeout(80);
+    tops.push(Math.round(await phone.page.evaluate(() => document.getElementById("login-form").getBoundingClientRect().top)));
+    bottoms.push([hgt, Math.round(await phone.page.evaluate(() => document.getElementById("login-pass").getBoundingClientRect().bottom))]);
+  }
+  check(new Set(tops).size === 1, `phone, the keyboard opening and its height jumping: the form stays put (top ${tops.join(", ")})`);
+  check(bottoms.every(([hgt, b]) => b <= hgt), `phone: the password field above the keyboard at every height (${bottoms.map(([hgt, b]) => b + "/" + hgt).join(", ")})`);
+}
 await phone.ctx.close();
 
 const pc = await open({ viewport: { width: 1400, height: 1000 } });
