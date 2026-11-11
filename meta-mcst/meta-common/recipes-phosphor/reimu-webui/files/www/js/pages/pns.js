@@ -145,6 +145,32 @@ export function pnsFlashCard() {
   let last = null;
   const bar = h("div", { class: "progress hidden" }, h("div", {}));
   const barText = h("div", { class: "muted small" });
+  // the image to upload: made once, not by render() - a new input would drop
+  // the file chosen (the card is re-rendered by its poll and on the power)
+  const file = h("input", { type: "file", accept: ".bin,.rom,.img,application/octet-stream" });
+  const send = h("button", { class: "btn", disabled: true }, "Загрузить и проверить");
+  file.addEventListener("change", () => (send.disabled = !file.files.length));
+  send.addEventListener("click", async () => {
+    const f = file.files[0];
+    if (!f) return;
+    if (f.size > 64 * 1024 * 1024) return toast("Файл больше флеша ПНС (64 МиБ)", "err");
+    const head = new Uint8Array(await f.slice(0, 8).arrayBuffer());
+    if (!MAGIC.every((x, i) => head[i] === x)) return toast("Это не образ ПНС и не coreboot: нет заголовка загрузчика Эльбруса в начале файла", "err");
+    busy = true;
+    send.disabled = file.disabled = true;
+    try {
+      const r = await uploadImage(f, (p) => setBar(p, `Загрузка ${f.name}: ${Math.round(p * 100)}%`));
+      check = { ...(r.check || {}), name: f.name, size: f.size, ok: r.ok, message: r.message };
+      toast(r.message, r.ok ? "ok" : "err");
+    } catch (e) {
+      toast(`Загрузка не удалась: ${e.message}`, "err");
+    } finally {
+      busy = false;
+      bar.classList.add("hidden");
+      barText.textContent = "";
+      refresh();
+    }
+  });
 
   async function refresh() {
     clearTimeout(timer);
@@ -267,31 +293,10 @@ export function pnsFlashCard() {
       ),
     );
 
-    // a new image
-    const file = h("input", { type: "file", accept: ".bin,.rom,.img,application/octet-stream", disabled: running || busy });
-    const send = h("button", { class: "btn", disabled: true }, "Загрузить и проверить");
-    file.addEventListener("change", () => (send.disabled = !file.files.length));
-    send.addEventListener("click", async () => {
-      const f = file.files[0];
-      if (!f) return;
-      if (f.size > 64 * 1024 * 1024) return toast("Файл больше флеша ПНС (64 МиБ)", "err");
-      const head = new Uint8Array(await f.slice(0, 8).arrayBuffer());
-      if (!MAGIC.every((x, i) => head[i] === x)) return toast("Это не образ ПНС: нет заголовка загрузчика Lintel в начале файла", "err");
-      busy = true;
-      send.disabled = file.disabled = true;
-      try {
-        const r = await uploadImage(f, (p) => setBar(p, `Загрузка ${f.name}: ${Math.round(p * 100)}%`));
-        check = { ...(r.check || {}), name: f.name, size: f.size, ok: r.ok, message: r.message };
-        toast(r.message, r.ok ? "ok" : "err");
-      } catch (e) {
-        toast(`Загрузка не удалась: ${e.message}`, "err");
-      } finally {
-        busy = false;
-        bar.classList.add("hidden");
-        barText.textContent = "";
-        refresh();
-      }
-    });
+    // a new image (the file input and its button live as long as the card: a
+    // re-render keeps what was chosen)
+    file.disabled = running || busy;
+    send.disabled = running || busy || !file.files.length;
     const up = st.upload;
     const section = h("div", { class: "section" }, h("h3", {}, "Новый образ"), h("div", { class: "row" }, file, send), bar, barText);
     if (up) {
@@ -344,7 +349,14 @@ export function pnsFlashCard() {
     return out;
   }
 
-  const onPower = () => last && !busy && card.replaceChildren(...render(last));
+  // app.js says it every 5 s, changed or not: only a change re-renders
+  let power = appState.power;
+  const onPower = (e) => {
+    const now = (e && e.detail && e.detail.PowerState) || appState.power;
+    if (now === power) return;
+    power = now;
+    if (last && !busy) card.replaceChildren(...render(last));
+  };
   document.addEventListener("reimu-power", onPower);
   refresh();
   card.stop = () => {

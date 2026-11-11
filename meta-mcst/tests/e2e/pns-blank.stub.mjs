@@ -146,6 +146,29 @@ const CB_INFO = { kind: "coreboot", boot: CB_BOOT, board: "", cpu: "", vbios: ""
   await s.page.context().close();
 }
 
+// a file chosen stays chosen: app.js says "reimu-power" every 5 s (the power
+// polled, changed or not), and the card re-rendered on it made a new, empty
+// file input - the choice was gone before "Загрузить и проверить"
+{
+  const s = await open({ chip: good, upload: null });
+  const input = s.page.locator('#pns-flash input[type="file"]');
+  await input.setInputFiles({ name: "coreboot.rom", mimeType: "application/octet-stream", buffer: Buffer.alloc(4096, 1) });
+  for (let i = 0; i < 3; i++) {
+    await s.page.evaluate(() => document.dispatchEvent(new CustomEvent("reimu-power", { detail: { PowerState: "Off" } })));
+    await s.page.waitForTimeout(100);
+  }
+  const kept = await s.page.evaluate(() => { const f = document.querySelector('#pns-flash input[type="file"]'); return f && f.files.length ? f.files[0].name : null; });
+  const send = s.page.locator("button", { hasText: "Загрузить и проверить" });
+  check(kept === "coreboot.rom" && !(await send.isDisabled()), `the power polled 3 times: the chosen file kept, upload enabled (${kept})`);
+  // and over the card's own refresh (its 15 s poll, here: a power change re-renders)
+  await s.page.evaluate(() => document.dispatchEvent(new CustomEvent("reimu-power", { detail: { PowerState: "On" } })));
+  await s.page.waitForTimeout(100);
+  const kept2 = await s.page.evaluate(() => { const f = document.querySelector('#pns-flash input[type="file"]'); return f && f.files.length ? f.files[0].name : null; });
+  check(kept2 === "coreboot.rom", `re-rendered (the power changed): the chosen file still there (${kept2})`);
+  check(!s.errors.length, `the file kept: no page errors ${s.errors}`);
+  await s.page.context().close();
+}
+
 await Promise.race([browser.close(), new Promise((r) => setTimeout(r, 10000))]);
 console.log("RESULT:", failed ? `FAILED ${failed}` : "ALL PASSED");
 process.exit(failed ? 1 : 0);
