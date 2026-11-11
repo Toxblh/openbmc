@@ -49,6 +49,9 @@
 #                                        same way as a read: for other readers
 #                                        (reimu-pns-scan)
 #   reimu-pns-flash status               the last job and the chip (JSON)
+#   reimu-pns-flash describe             what each backup holds, for those
+#                                        made before it was recorded (every
+#                                        job does it too)
 #   reimu-pns-flash disconnect           give the flash back to the host
 #
 # Image layout (unified-boot 2.x, seen in release-2.30.13.1-E8C2 and
@@ -71,7 +74,8 @@
 # /var/lib/reimu-pns/write-unfinished (a write began and wasn't proven: what
 # the chip holds now is no backup, backup-last stays what it is).
 # A backup's .sha256: "SHA256  NAME", then "# reimu-pns-flash: bmc=MAC
-# jedec=ID size=BYTES date=... board=COMPATIBLE" (who read it, from what).
+# jedec=ID size=BYTES date=... board=COMPATIBLE" (who read it, from what),
+# then "# image: kind=lintel|coreboot|- boot=VERSION" (what it holds).
 set -u
 me=reimu-pns-flash
 RUN=${REIMU_PNS_RUN:-/run/reimu-pns}
@@ -430,6 +434,28 @@ made_here() { printf 'bmc=%s jedec=%s size=%s' "$(bmc_id)" "${JEDEC:--}" "$CHIPS
 mark() {
     printf '# %s: %s date=%s board=%s\n' $me "$(made_here)" "$(date +%Y-%m-%dT%H:%M:%S)" \
         "$(printf '%s' "${I_COMPAT:--}" | tr -cd ' -~')" >> "$1"
+    describe_line >> "$1"
+}
+# what the chip read holds (the I_* of info): PNS or coreboot, its version
+describe_line() {
+    printf '# image: kind=%s boot=%s\n' "${I_KIND:--}" "$(printf '%s' "${I_BOOT:-}" | tr -cd ' -~' | cut -c1-200)"
+}
+# the backups without "# image:" (made by an older firmware): unpacked as far
+# as info looks, described
+describe_backups() {
+    local g sc h
+    for g in $WORK/backup-*.bin.gz $KEEP/backup-last.bin.gz; do
+        [ -f "$g" ] || continue
+        sc=${g%.gz}.sha256
+        [ -f "$sc" ] || continue
+        grep -q '^# image:' "$sc" && continue
+        h=$(tmp describe)
+        gzip -dc "$g" 2>/dev/null | head -c $((DTB_OFF + DTB_MAX)) > $h
+        info $h $(fsize $h)
+        rm -f $h
+        describe_line >> "$sc"
+    done
+    return 0
 }
 # SIDECAR: of a backup this tool made on this BMC, of this chip
 own_backup() {
@@ -691,6 +717,7 @@ do_read() {
     fi
     S_BACKUP=$f
     save_chip read $(head -1 $raw.sha256 | cut -d' ' -f1)
+    ( describe_backups ) || true
     finish ok "Флеш ПНС прочитан ($CHIPSIZE байт, sha256 $(head -1 $raw.sha256 | cut -c1-16)…): $f"
     say "$f"
 }
@@ -748,6 +775,8 @@ do_write() {
     S_BACKUP=$WORK/$name.gz
     # (before a refusal too: the page offers write-blank by what this says)
     save_chip backup $(head -1 $bk.sha256 | cut -d' ' -f1)
+    # older backups described (a subshell: the I_* of this chip stay)
+    ( describe_backups ) || true
     [ -n "$I_EMPTY" ] && [ -z "$I_IMAGE" ] && [ $blank = 0 ] &&
         die "Флеш ПНС читается пустым: он не подключился к BMC или пуст. Запись отменена (--blank-ok: писать в пустой)"
     [ -z "$I_IMAGE" ] && [ -z "$I_EMPTY" ] && [ $blank = 0 ] &&
@@ -912,6 +941,7 @@ case ${1:-} in
     read) shift; do_read "$@" ;;
     write) shift; do_write "$@" ;;
     status) do_status ;;
+    describe) describe_backups; say "Резервные копии описаны" ;;
     disconnect) do_disconnect ;;
     with-chip) shift; do_with_chip "$@" ;;
     *) sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$0"; exit 2 ;;

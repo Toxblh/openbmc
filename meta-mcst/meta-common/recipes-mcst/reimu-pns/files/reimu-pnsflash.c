@@ -159,11 +159,26 @@ static void add_file_info(struct buf *b, const char *path, const char *name)
     if (pl > 3 && !strcmp(path + pl - 3, ".gz")) pl -= 3;
     snprintf(sp, sizeof(sp), "%.*s.sha256", (int)pl, path);
     size_t n;
-    char *s = slurp(sp, 200, &n);
+    char *s = slurp(sp, 2048, &n);
     if (s && n >= 64)
     {
         buf_str(b, ",\"sha256\":");
         buf_json(b, s, 64);
+        /* what it holds (reimu-pns-flash: "# image: kind=K boot=VERSION") */
+        char *im = strstr(s, "\n# image: kind=");
+        if (im)
+        {
+            char *k = im + 15, *ke = k + strcspn(k, " \n");
+            buf_str(b, ",\"kind\":");
+            buf_json(b, k, (size_t)(ke - k));
+            char *bt = strstr(ke, " boot=");
+            if (bt && bt < ke + 1 + strcspn(ke, "\n"))
+            {
+                bt += 6;
+                buf_str(b, ",\"boot\":");
+                buf_json(b, bt, strcspn(bt, "\n"));
+            }
+        }
     }
     free(s);
     buf_str(b, "}");

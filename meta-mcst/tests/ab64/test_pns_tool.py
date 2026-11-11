@@ -13,8 +13,11 @@ interrupt or lie; the real C file through unit/pnsflash_harness.c.
          "build_info", the board's device tree at 0x700000) is told apart,
          checked against the board and written; a Lintel image goes back
          onto a coreboot chip as onto any image
+  describe  every backup says what it holds (PNS or coreboot, its version):
+         its .sha256 has "# image: kind=... boot=..."; older ones get it
+         from "describe" (and from every job); the status JSON has it
 
-    test_pns_tool.py [keep|pin|warn|blank|format|coreboot ...]     (SH: the shell, default sh)
+    test_pns_tool.py [keep|pin|warn|blank|format|coreboot|describe ...]     (SH: the shell, default sh)
 """
 import base64, gzip, hashlib, json, os, re, shutil, signal, struct, subprocess, sys, tempfile
 
@@ -675,6 +678,51 @@ def t_coreboot():
     e.done()
 
 
+# ------------------------------------------------------------------ describe
+def sidecars(e):
+    out = {}
+    for d in (e.work, e.keep):
+        for n in os.listdir(d):
+            if n.endswith(".sha256") and n.startswith("backup-"):
+                out[os.path.join(d, n)] = open(os.path.join(d, n)).read()
+    return out
+
+
+def t_describe():
+    CB = coreboot()
+    e = Env(chip=A)
+    rc, o = e.tool_write(e.put("cb.rom", CB))            # backup of A (PNS), kept as last
+    rc2, o2 = e.tool_write(e.put("b.bin", B))            # backup of the coreboot chip
+    sc = sidecars(e)
+    work = sorted(k for k in sc if k.startswith(e.work))
+    check(rc == 0 and rc2 == 0 and len(work) == 2, "[describe] two writes, two backups (%s)" % [os.path.basename(k) for k in work])
+    first, second = (sc[k] for k in work) if len(work) == 2 else ("", "")
+    check("# image: kind=lintel boot=lintel-E8C2 ::::::: ( unified-boot/rel-1 )(E8C2)" in first,
+          "[describe] the backup of the PNS chip: kind lintel, its version (%s)" % first.strip().splitlines()[-1:])
+    check("# image: kind=coreboot boot=coreboot 26.09-607-g367eda1a7d50" in second,
+          "[describe] the backup of the coreboot chip: kind coreboot, its version (%s)" % second.strip().splitlines()[-1:])
+    kept = sc.get(os.path.join(e.keep, "backup-last.bin.sha256"), "")
+    check("kind=coreboot" in kept, "[describe] backup-last (the chip before the last write): coreboot")
+    j = e.call("json")
+    bk = {b.get("name"): b for b in (j.get("backups") or [])}
+    kinds = sorted((b.get("kind"), (b.get("boot") or "")[:12]) for b in bk.values())
+    check(kinds == [("coreboot", "coreboot 26."), ("lintel", "lintel-E8C2 ")] and (j.get("kept") or {}).get("kind") == "coreboot",
+          "[describe] the status JSON: each backup's kind and version (%s; kept %s)" % (kinds, (j.get("kept") or {}).get("kind")))
+    # a backup of an older firmware: no "# image" line; describe adds it
+    for k in sc:
+        open(k, "w").write("".join(l for l in sc[k].splitlines(True) if not l.startswith("# image:")))
+    rc, o = tool(e, "describe")
+    sc2 = sidecars(e)
+    check(rc == 0 and all("# image: kind=" in v for v in sc2.values()) and
+          all(sc2[k].count("# image:") == 1 for k in sc2),
+          "[describe] older backups described afterwards, once each (%s)" % o.strip().replace("\n", " | "))
+    check(sorted(v.split("# image: kind=")[1].split()[0] for v in sc2.values()) == ["coreboot", "coreboot", "lintel"],
+          "[describe] ... with the right kinds")
+    rc, o = tool(e, "describe")
+    check(all(v.count("# image:") == 1 for v in sidecars(e).values()), "[describe] again: nothing added twice")
+    e.done()
+
+
 # ------------------------------------------------------------------ format
 def t_format():
     """the "while read" in do_write does arithmetic on what reimu-flash prints:
@@ -692,7 +740,7 @@ TOP = tempfile.mkdtemp(prefix="pnstool-", dir=os.environ.get("TMPDIR"))
 REAL, HARNESS = build(TOP)
 try:
     for name, fn in (("keep", t_keep), ("pin", t_pin), ("warn", t_warn), ("blank", t_blank), ("format", t_format),
-                     ("coreboot", t_coreboot)):
+                     ("coreboot", t_coreboot), ("describe", t_describe)):
         if not ONLY or name in ONLY:
             fn()
 finally:

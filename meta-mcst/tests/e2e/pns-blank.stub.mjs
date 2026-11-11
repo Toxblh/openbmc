@@ -31,7 +31,7 @@ const UPLOAD = { name: "upload", size: 4096, time: 1 };
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 
-async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, job = null, answer = true, image = null, warnings = [] }) {
+async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, job = null, answer = true, image = null, warnings = [], backups = [], kept = null }) {
   const ctx = await browser.newContext({ locale: "ru-RU" });
   const page = await ctx.newPage();
   const s = { page, runs: [], dialogs: [], errors: [] };
@@ -42,7 +42,7 @@ async function open({ chip: ch, upload = UPLOAD, power = "Off", checkOk = true, 
     const p = new URL(req.url()).pathname;
     if (p === "/harness.html") return route.fulfill({ contentType: "text/html", body: HARNESS(power) });
     if (p === "/js/app.js") return route.fulfill({ contentType: "text/javascript", body: `export const appState = { power: ${JSON.stringify(power)} };` });
-    if (p === PF) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { Json: JSON.stringify({ version: 1, now: 2, tool: true, state: job, chip: ch, upload, kept: null, backups: [] }) } }) });
+    if (p === PF) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { Json: JSON.stringify({ version: 1, now: 2, tool: true, state: job, chip: ch, upload, kept, backups }) } }) });
     if (p === `${PF}/action/Run`) {
       const [action, arg] = req.postDataJSON().data;
       s.runs.push([action, arg]);
@@ -143,6 +143,26 @@ const CB_INFO = { kind: "coreboot", boot: CB_BOOT, board: "", cpu: "", vbios: ""
   check(s.dialogs.length === 1 && s.dialogs[0].includes(CB_BOOT) && /неофициальн/i.test(s.dialogs[0]),
         `the confirmation names coreboot, unofficial: ${s.dialogs[0].slice(0, 160)}`);
   check(!s.errors.length, `coreboot: no page errors ${s.errors}`);
+  await s.page.context().close();
+}
+
+// each backup says what it holds: PNS (its release) or coreboot (its version);
+// one made before that was recorded: says so
+{
+  const bk = (name, o) => ({ name, size: 1, time: 1794350000, sha256: "a".repeat(64), ...o });
+  const s = await open({ chip: good, upload: null, backups: [
+    bk("backup-20261111-142740.bin.gz", { kind: "lintel", boot: "release-2.32.5.0-E8C2 ::::::: ( unified-boot/release-2.32.5.0-E8C2 commit d98f2551, 202610221027 )(uatx_445)" }),
+    bk("backup-20261111-141558.bin.gz", { kind: "coreboot", boot: "coreboot 26.09-607-g367eda1a7d50 (Tue Nov 10 16:39:14 UTC 2026)" }),
+    bk("backup-20261111-065705.bin.gz", { kind: "-", boot: "" }),
+    bk("backup-20261110-223635.bin.gz", {}),
+  ], kept: { name: "last", size: 1, time: 1794350000, sha256: "b".repeat(64), kind: "lintel", boot: "release-2.30.13.1-E8C2 ::::::: ( unified-boot/release-2.30.13.1-E8C2 commit 93b5ba330, 202506171738 )(uatx_445)" } });
+  const rows = await s.page.evaluate(() => [...document.querySelectorAll("#pns-flash table.tbl tr")].map((r) => r.textContent));
+  const has = (i, re) => rows[i] && re.test(rows[i]);
+  check(has(0, /ПНС 2\.32\.5\.0/) && has(1, /coreboot 26\.09-607-g367eda1a7d50/) && has(2, /нет образа/) && has(3, /не записано/) && has(4, /ПНС 2\.30\.13\.1/),
+        `the backups: PNS 2.32.5.0, coreboot 26.09-607, no image, not recorded, kept PNS 2.30.13.1 (${rows.map((r) => r.slice(0, 70)).join(" | ")})`);
+  await s.page.locator("tr", { hasText: "coreboot 26.09" }).locator("button", { hasText: "Записать обратно" }).click();
+  await s.page.waitForTimeout(200);
+  check(s.dialogs.length === 1 && /coreboot 26\.09-607/.test(s.dialogs[0]), `writing a backup back: the confirmation names what it holds (${(s.dialogs[0] || "").slice(0, 120)})`);
   await s.page.context().close();
 }
 

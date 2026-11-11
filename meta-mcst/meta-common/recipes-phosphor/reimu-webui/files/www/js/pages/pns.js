@@ -103,6 +103,17 @@ const loaderRows = (i, none) =>
     ? [["Загрузчик", `${i.boot}${i.part ? `, плата ${i.part}` : ""}`]]
     : [["Версия ПНС", i.boot || none], ["Плата (сборка)", i.board], ["VBIOS", i.vbios]];
 
+// what a backup holds, short: "ПНС 2.32.5.0", "coreboot 26.09-607-g…"; a
+// backup made before reimu-pns-flash recorded it: said so
+function holds(b) {
+  if (!b.kind) return "что внутри — не записано";
+  if (b.kind === "-") return "нет образа";
+  const v = b.boot || "";
+  if (b.kind === "coreboot") return v.replace(/ \(.*\)$/, "") || "coreboot";
+  const m = v.match(/release-([0-9][0-9.]*)/);
+  return `ПНС ${m ? m[1] : v.split(" ")[0] || "?"}`;
+}
+
 function chipInfo(chip) {
   if (!chip) return h("div", { class: "muted" }, "Флеш ПНС ещё не читался: версия неизвестна. Она читается при загрузке BMC, если платформа выключена.");
   const i = chip.info || {};
@@ -275,12 +286,12 @@ export function pnsFlashCard() {
                   });
                   const wr = h("button", { class: "btn small danger", disabled: running || on || busy }, "Записать обратно");
                   wr.addEventListener("click", () =>
-                    act("write", b.name, `Записать во флеш ПНС резервную копию ${b.kept ? "(сделанную перед последней записью)" : b.name} от ${when(b.time)}?\n\nФлеш будет сначала прочитан (новая копия), затем записаны только отличающиеся блоки, и весь флеш сверен с копией.`),
+                    act("write", b.name, `Записать во флеш ПНС резервную копию ${b.kept ? "(сделанную перед последней записью)" : b.name} от ${when(b.time)} (${holds(b)})?\n\nФлеш будет сначала прочитан (новая копия), затем записаны только отличающиеся блоки, и весь флеш сверен с копией.`),
                   );
                   return h(
                     "tr",
                     {},
-                    h("td", {}, b.kept ? "до последней записи (хранится на флеше BMC)" : b.name),
+                    h("td", {}, b.kept ? "до последней записи (хранится на флеше BMC)" : b.name, h("div", { class: "small muted" }, holds(b))),
                     h("td", { class: "muted" }, when(b.time)),
                     h("td", { class: "mono small muted" }, b.sha256 ? `${b.sha256.slice(0, 12)}…` : ""),
                     h("td", { class: "row end" }, dl, wr),
