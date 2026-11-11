@@ -412,6 +412,23 @@ def fresh_env(name, **env):
     return img
 
 
+def noreset_image(name):
+    """the board's U-Boot without its platform reset (tools/ab64/uboot-noreset.py),
+    REG_STOCK_UBOOT=1: as it was (the red run)"""
+    img = fresh_env(name)
+    if os.environ.get("REG_STOCK_UBOOT"):
+        return img
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("uboot_noreset", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "..", "..", "tools", "ab64", "uboot-noreset.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    data = bytearray(open(img, "rb").read())
+    data[:0xe0000] = m.patch(bytes(data[:0xe0000]))
+    open(img, "wb").write(data)
+    return img
+
+
 def journal(b, unit):
     return b.out("journalctl -b -o cat -u %s" % unit)
 
@@ -898,7 +915,50 @@ def t_offearly():
         b.stop()
 
 
-TESTS = [("resetcause", t_resetcause), ("freeze", t_freeze), ("slowbind", t_slowbind), ("off", t_off), ("offearly", t_offearly), ("hoston", t_hoston), ("macdiff", t_macdiff), ("nopns", t_nopns), ("noeeprom", t_noeeprom)]
+def t_hostkeep():
+    """the platform running through a BMC boot and a BMC reboot, U-Boot
+    without its reset: RST_BTN# (P3) never driven low, the platform never
+    powered off, the PNS flash never switched to the BMC while it runs"""
+    b = Platform("hostkeep", noreset_image("hostkeep"), power=True).start()
+    try:
+        check(b.wait_ssh(), "up")
+        st = b.state()
+        check(st.get("reset_held") == 0 and st.get("power") and st.get("offs") == 0,
+              "BMC boot, the platform on: never held in reset, never off (%s)" % st)
+        check(st.get("o0_on") == 0, "the PNS flash never the BMC's while the platform runs (%s)" % st.get("o0_on"))
+        n = len(b.console())
+        b.ssh("reboot")
+        check(b.wait_console(r"Starting kernel", 300, n) is not None, "the BMC rebooted (through U-Boot)")
+        check(b.wait_ssh(500), "up again")
+        st = b.state()
+        check(st.get("reset_held") == 0 and st.get("power") and st.get("offs") == 0,
+              "BMC reboot, the platform on: never held in reset, never off (%s)" % st)
+        check(st.get("o0_on") == 0, "... the PNS flash still the host's (%s)" % st.get("o0_on"))
+        j = journal(b, "mcst-fruid") + journal(b, "allow_host_boot")
+        check(b.out("systemctl is-active allow_host_boot").strip() == "active", "allow_host_boot done as before")
+        # U-Boot leaves the PNS flash to the host: no /dev/mtd/sys at the BMC's
+        # boot (QEMU always has it: spi1 unbound to make it so). The platform
+        # on: the copy kept, the flash not touched
+        flash = "/sys/bus/platform/drivers/spi-aspeed-smc"
+        b.ssh("echo 1e630000.spi > %s/unbind; rm -f /var/volatile/motherboard_devtree.dtb" % flash)
+        o = b.out("/usr/libexec/reimu-fru boot 2>&1")
+        check("read before" in o and "read from the PNS flash" not in o and b.state().get("o0_on") == 0,
+              "no PNS flash at boot, the platform on: the copy kept, the flash left alone (%s)" % o.strip().replace("\n", " | ")[:200])
+        # the platform off: read through reimu-pns-flash (it switches the
+        # flash to the BMC, power-on held), the copy refreshed
+        power_off(b)
+        b.ssh("echo 1e630000.spi > %s/unbind 2>/dev/null; rm -f /var/volatile/motherboard_devtree.dtb /var/lib/reimu-fru/motherboard_devtree.dtb" % flash)
+        o = b.out("/usr/libexec/reimu-fru boot 2>&1")
+        check("read from the PNS flash" in o and dtb_ok(b) and
+              b.ssh("cmp /var/volatile/motherboard_devtree.dtb /var/lib/reimu-fru/motherboard_devtree.dtb").returncode == 0,
+              "no PNS flash at boot, the platform off: read through reimu-pns-flash, kept (%s)" % o.strip().replace("\n", " | ")[:200])
+        check(b.ssh("flock -n /run/reimu-pns/lock true").returncode == 0 and b.state().get("o0_on") == 0,
+              "the PNS lock free after it, the flash the host's")
+    finally:
+        b.stop()
+
+
+TESTS = [("resetcause", t_resetcause), ("freeze", t_freeze), ("slowbind", t_slowbind), ("off", t_off), ("offearly", t_offearly), ("hoston", t_hoston), ("macdiff", t_macdiff), ("nopns", t_nopns), ("noeeprom", t_noeeprom), ("hostkeep", t_hostkeep)]
 
 if __name__ == "__main__":
     for f in (PNS, FRU, os.path.join(W, "ab.mtd")):

@@ -21,7 +21,11 @@ interrupt or lie; the real C file through unit/pnsflash_harness.c.
          the copy the BMC flash had moved to RAM before it is replaced,
          RAM kept under REIMU_PNS_RAM_MAX bytes (the oldest go first)
 
-    test_pns_tool.py [keep|pin|warn|blank|format|coreboot|describe|tidy ...]     (SH: the shell, default sh)
+  dtb    a write of an image with a device tree refreshes the copy reimu-fru
+         boots with (the flash is the host's at a BMC boot with U-Boot
+         without the reset): the image's DTB, not a stale one
+
+    test_pns_tool.py [keep|pin|warn|blank|format|coreboot|describe|tidy|dtb ...]     (SH: the shell, default sh)
 """
 import base64, gzip, hashlib, json, os, re, shutil, signal, struct, subprocess, sys, tempfile
 
@@ -172,6 +176,7 @@ class Env:
                         REIMU_PNS_KEEP=self.keep, REIMU_FLASH=self.bin + "/flash", REIMU_PNS_DEV=self.chip_f,
                         REIMU_PNS_SWITCH=self.bin + "/switch", REIMU_PNS_POWER=self.bin + "/power",
                         REIMU_PNS_FLASH=self.tool, H_SYSTEMCTL=self.bin + "/systemctl",
+                        REIMU_FRU_KEEP=self.p("fru"),
                         H_SYSTEMD_RUN=self.bin + "/systemd-run", PATH=self.bin + ":" + os.environ["PATH"])
         self.job_state("inactive")
 
@@ -796,6 +801,29 @@ def t_tidy():
     e.done()
 
 
+# ------------------------------------------------------------------ dtb
+def t_dtb():
+    e = Env(chip=A)
+    os.makedirs(e.p("fru"))
+    open(e.p("fru", "motherboard_devtree.dtb"), "wb").write(b"old")
+    rc, o = e.tool_write(e.put("b.bin", B))
+    got = open(e.p("fru", "motherboard_devtree.dtb"), "rb").read()
+    want = B[0x700000:0x700000 + 0x1000]
+    check(rc == 0 and got == want, "[dtb] a write with a device tree: reimu-fru's copy is the image's (%d bytes, %s)" % (len(got), got[:12]))
+    # an image without one (the device tree on the chip unchanged): left alone
+    open(e.p("fru", "motherboard_devtree.dtb"), "wb").write(b"kept")
+    rc, o = e.tool_write(e.put("nodtb.bin", image(9, size=0x600000, dtb=False)))
+    check(rc == 0 and open(e.p("fru", "motherboard_devtree.dtb"), "rb").read() == b"kept", "[dtb] an image without a device tree: the copy left alone")
+    e.done()
+    # coreboot carries one too
+    e = Env(chip=A)
+    os.makedirs(e.p("fru"))
+    CB = coreboot()
+    rc, o = e.tool_write(e.put("cb.rom", CB))
+    check(rc == 0 and open(e.p("fru", "motherboard_devtree.dtb"), "rb").read() == CB[0x700000:0x701000], "[dtb] coreboot: its device tree")
+    e.done()
+
+
 # ------------------------------------------------------------------ format
 def t_format():
     """the "while read" in do_write does arithmetic on what reimu-flash prints:
@@ -813,7 +841,7 @@ TOP = tempfile.mkdtemp(prefix="pnstool-", dir=os.environ.get("TMPDIR"))
 REAL, HARNESS = build(TOP)
 try:
     for name, fn in (("keep", t_keep), ("pin", t_pin), ("warn", t_warn), ("blank", t_blank), ("format", t_format),
-                     ("coreboot", t_coreboot), ("describe", t_describe), ("tidy", t_tidy)):
+                     ("coreboot", t_coreboot), ("describe", t_describe), ("tidy", t_tidy), ("dtb", t_dtb)):
         if not ONLY or name in ONLY:
             fn()
 finally:

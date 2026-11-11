@@ -912,6 +912,14 @@ do_write() {
     # what is on the chip now: the image; the device tree of the backup when
     # the image doesn't reach it
     info $t
+    # its device tree for reimu-fru (it boots with this copy when the flash is
+    # the host's: U-Boot without the reset)
+    if [ -n "$I_DTB" ]; then
+        fk=${REIMU_FRU_KEEP:-/var/lib/reimu-fru}
+        mkdir -p $fk && dd if=$t bs=4096 skip=$((DTB_OFF / 4096)) count=$(( (I_DTBSIZE + 4095) / 4096 )) 2>/dev/null |
+            head -c $I_DTBSIZE > $fk/motherboard_devtree.dtb.tmp && mv $fk/motherboard_devtree.dtb.tmp $fk/motherboard_devtree.dtb ||
+            log "the device tree not kept for reimu-fru"
+    fi
     if [ $len -le $DTB_OFF ]; then
         b1=$I_BOOT b2=$I_TAG b3=$I_CPU b4=$I_VBIOS
         info $bk

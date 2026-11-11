@@ -2,12 +2,15 @@
 # The platform's device tree (from the PNS flash) and FRU ID (from its
 # EEPROM) for the BMC, read with mcst-fruid's get-devtree and get-fruid:
 #
-#   reimu-fru boot   mcst-fruid.service, at BMC boot, before allow_host_boot
-#                    lets the platform out of reset. The device tree from the
-#                    PNS flash if the BMC found it (/dev/mtd/sys: a cold boot,
-#                    the flash switched to the BMC), else the copy kept from
-#                    the last read (a kexec while the platform runs: the flash
-#                    is the host's then). The FRU ID only at a cold boot of a
+#   reimu-fru boot   mcst-fruid.service, at BMC boot, before allow_host_boot.
+#                    The device tree from the PNS flash if the BMC found it
+#                    (/dev/mtd/sys: the stock U-Boot switched it to the BMC
+#                    and held the platform in reset); else, the platform off,
+#                    read through reimu-pns-flash (it switches the flash to
+#                    the BMC with power-on held, and back: U-Boot without
+#                    the reset, uboot-noreset.py, leaves it to the host);
+#                    else the copy kept from the last read (the platform runs:
+#                    the flash is the host's). The FRU ID only at a cold boot of a
 #                    powered platform: unpowered, the EEPROM doesn't answer and
 #                    stalls the bus, and a running platform uses that bus.
 #   reimu-fru power  reimu-fru-power.service, pulled in by
@@ -55,8 +58,31 @@ powered() {
       done )
 }
 
+# the DTB at 0x700000 of the PNS flash, through reimu-pns-flash: $DTB
+pns_dtb() {
+    [ -x /usr/sbin/reimu-pns-flash ] || return 1
+    rm -f $DTB
+    OUT=$DTB timeout 120 /usr/sbin/reimu-pns-flash with-chip sh -c '
+        h=$(dd if=$PNS_DEV bs=4096 skip=1792 count=1 2>/dev/null | od -A n -t x1 -N 8 | tr -d " \n")
+        case $h in d00dfeed*) ;; *) exit 1 ;; esac
+        n=$((0x${h#d00dfeed}))
+        [ $n -ge 64 ] && [ $n -le 1048576 ] || exit 1
+        dd if=$PNS_DEV bs=4096 skip=1792 count=$(( (n + 4095) / 4096 )) 2>/dev/null | head -c $n > $OUT' >/dev/null 2>&1 &&
+        [ -s $DTB ] && fdtget $DTB / compatible >/dev/null 2>&1
+}
+
 devtree() {
-    if [ -e /dev/mtd/sys ]
+    if [ ! -e /dev/mtd/sys ] && [ "$(powered)" = 0 ]
+    then
+        if pns_dtb && dtc -I dtb -O dts -o $DTS.tmp $DTB 2>/dev/null
+        then
+            mv $DTS.tmp $DTS
+            keep $DTB $KEEP/motherboard_devtree.dtb
+            echo "Platform device tree read from the PNS flash (the platform off, through reimu-pns-flash): $(fdtget $DTB / model 2>/dev/null), $(fdtget $DTB / version 2>/dev/null)"
+            return
+        fi
+        echo "Can't read the platform device tree from the PNS flash (through reimu-pns-flash)"
+    elif [ -e /dev/mtd/sys ]
     then
         rm -f $DTB
         timeout 60 /usr/sbin/get-devtree
@@ -69,7 +95,7 @@ devtree() {
         fi
         echo "Can't read the platform device tree from the PNS flash"
     else
-        echo "No PNS flash (switched to the host at a kexec)"
+        echo "No PNS flash: the host's (the platform runs)"
     fi
     rm -f $DTB $DTS.tmp
     if [ -s $KEEP/motherboard_devtree.dtb ] && cp $KEEP/motherboard_devtree.dtb $DTB.tmp &&

@@ -42,11 +42,11 @@ diff --git a/board/aspeed/ast-g4/ast-g4.c b/board/aspeed/ast-g4/ast-g4.c
 +	// Set BMC_ACTIVE# (O6) to 0
 +	ast_gpio_set('o', 6, 1);
 +
-+	// Set SPI_CONNECT (O0) to 1
-+	ast_gpio_set('o', 0, 1);
-+
-+	// Set RST_BTN# (P3) to 0
-+	ast_gpio_set('p', 3, 0);
++	// SPI_CONNECT (O0) to 0: the PNS flash stays the host's (reimu-fru
++	// reads it through reimu-pns-flash with the platform off). RST_BTN# (P3)
++	// left alone: a BMC boot doesn't reset a running platform
++	// (tools/ab64/uboot-noreset.py does the same to the boards' U-Boot)
++	ast_gpio_set('o', 0, 0);
 +
 +	writel(0x77744303, 0x1e78a0c4); // Set correct speed for I2C3
 +	writel(0x77744303, 0x1e78a144); // Set correct speed for I2C5
@@ -98,11 +98,11 @@ diff --git a/board/aspeed/ast-g5/ast-g5.c b/board/aspeed/ast-g5/ast-g5.c
 +	// Set BMC_ACTIVE# (O6) to 0
 +	ast_gpio_set('o', 6, 1);
 +
-+	// Set SPI_CONNECT (O0) to 1
-+	ast_gpio_set('o', 0, 1);
-+
-+	// Set RST_BTN# (P3) to 0
-+	ast_gpio_set('p', 3, 0);
++	// SPI_CONNECT (O0) to 0: the PNS flash stays the host's (reimu-fru
++	// reads it through reimu-pns-flash with the platform off). RST_BTN# (P3)
++	// left alone: a BMC boot doesn't reset a running platform
++	// (tools/ab64/uboot-noreset.py does the same to the boards' U-Boot)
++	ast_gpio_set('o', 0, 0);
 +
 +	writel(0x77744303, 0x1e78a0c4); // Set correct speed for I2C3
 +	writel(0x77744303, 0x1e78a144); // Set correct speed for I2C5
